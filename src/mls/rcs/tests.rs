@@ -23,10 +23,11 @@ use super::super::{
     Ciphersuite, CommitOutput, Credential, CredentialValidator, ErrorKind, IncomingMessage,
     MlsClient, MlsConfig, MlsConversation,
 };
+use super::heal::SelfHealProgress;
 use super::proto::{
     client_mls_rcs_message, server_mls_rcs_message, AcceptedMlsRcsMessage, ClientMlsRcsMessage,
-    EpochIdentifier, FileEncryptionInfo, FileInfo, FileMetadata, MlsGroupInfo, ServerCommitBundle,
-    ServerMlsRcsMessage,
+    EpochControlMessages, EpochIdentifier, FileEncryptionInfo, FileInfo, FileMetadata,
+    MlsEnhancedGroupInfo, MlsGroupInfo, ServerCommitBundle, ServerMlsRcsMessage,
 };
 use super::wire::{
     AuthenticatedData, DeliveryNotificationStatus, DisplayNotificationStatus, SecretPayload,
@@ -1771,4 +1772,237 @@ fn commit_bundles_apply_whole() {
         .encrypt_cpim(&alice, b"hi", b"msg-1", b"")
         .unwrap();
     assert!(bob_conversation.decrypt(&bob, &message, b"msg-1").is_ok());
+}
+
+fn control_messages(rcs_message_id: &str, output: &CommitOutput) -> EpochControlMessages {
+    EpochControlMessages {
+        rcs_message_id: rcs_message_id.to_string(),
+        server_mls_rcs_message: Some(ServerMlsRcsMessage {
+            payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(accept(
+                output,
+            ))),
+        }),
+    }
+}
+
+#[test]
+fn enhanced_self_heal() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    // bob misses three Commits
+    let request = bob_conversation.enhanced_group_info_request();
+    assert_eq!(
+        proto::decode::<EpochIdentifier>(&request).unwrap(),
+        bob_conversation.epoch_identifier()
+    );
+
+    let mut outputs = Vec::new();
+    let mut epochs = Vec::new();
+    for i in 0..3 {
+        let output = if i == 2 {
+            alice_conversation
+                .set_group_subject(&alice, "Missed", b"msg-subject")
+                .unwrap()
+                .0
+        } else {
+            alice_conversation.update_keys(&alice).unwrap()
+        };
+        deliver((&mut alice_conversation, &alice), vec![], &output);
+        epochs.push(alice_conversation.epoch_identifier());
+        outputs.push(output);
+    }
+    let group_info = MlsGroupInfo {
+        group_info: outputs[2].group_info.clone(),
+        ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+        pending_proposals: Vec::new(),
+    };
+
+    // first page
+    let page = MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(epochs[2].clone()),
+        mls_group_info: Some(group_info.clone()),
+        committed_control_messages: vec![
+            control_messages("cpim-1", &outputs[0]),
+            control_messages("cpim-2", &outputs[1]),
+        ],
+        paginated_epoch_identifier: Some(epochs[1].clone()),
+    };
+    let healed = bob_conversation
+        .process_enhanced_group_info(&bob, &proto::encode(&page))
+        .unwrap();
+    assert_eq!(healed.progress, SelfHealProgress::NextPage);
+    assert_eq!(healed.applied.len(), 2);
+    assert_eq!(healed.applied[0].0, "cpim-1");
+    assert!(matches!(
+        healed.applied[1].1.as_slice(),
+        [IncomingMessage::Commit { .. }]
+    ));
+    assert_eq!(bob_conversation.epoch_identifier(), epochs[1]);
+
+    // second page, repeating a message bob already applied
+    let page = MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(epochs[2].clone()),
+        mls_group_info: Some(group_info.clone()),
+        committed_control_messages: vec![
+            control_messages("cpim-2", &outputs[1]),
+            control_messages("cpim-3", &outputs[2]),
+        ],
+        paginated_epoch_identifier: Some(epochs[2].clone()),
+    };
+    let healed = bob_conversation
+        .process_enhanced_group_info(&bob, &proto::encode(&page))
+        .unwrap();
+    assert_eq!(healed.progress, SelfHealProgress::UpToDate);
+    assert!(matches!(
+        healed.applied[0].1.as_slice(),
+        [IncomingMessage::Duplicate]
+    ));
+    assert!(matches!(
+        healed.applied[1].1.as_slice(),
+        [
+            IncomingMessage::Commit { .. },
+            IncomingMessage::GroupMetadataKeys { subject: true, .. }
+        ]
+    ));
+    assert!(bob_conversation.group_metadata_in_sync(&bob).unwrap());
+
+    // the Commits applied that way, delivered late over MSRP
+    for output in &outputs {
+        assert!(matches!(
+            bob_conversation
+                .process_commit_bundle(&bob, &accept(output))
+                .unwrap()
+                .as_slice(),
+            [IncomingMessage::Duplicate]
+        ));
+    }
+
+    // nothing left to catch up on
+    let page = MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(epochs[2].clone()),
+        mls_group_info: Some(group_info),
+        committed_control_messages: Vec::new(),
+        paginated_epoch_identifier: None,
+    };
+    let healed = bob_conversation
+        .process_enhanced_group_info(&bob, &proto::encode(&page))
+        .unwrap();
+    assert_eq!(healed.progress, SelfHealProgress::UpToDate);
+    assert!(healed.applied.is_empty());
+
+    let message = alice_conversation
+        .encrypt_cpim(&alice, b"caught up", b"msg-1", b"")
+        .unwrap();
+    assert_eq!(
+        bob_conversation
+            .decrypt(&bob, &message, b"msg-1")
+            .unwrap()
+            .payload
+            .as_deref(),
+        Some(&b"caught up"[..])
+    );
+}
+
+#[test]
+fn enhanced_self_heal_falls_back() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    let first = alice_conversation.update_keys(&alice).unwrap();
+    deliver((&mut alice_conversation, &alice), vec![], &first);
+    let second = alice_conversation.update_keys(&alice).unwrap();
+    deliver((&mut alice_conversation, &alice), vec![], &second);
+    let group_info = MlsGroupInfo {
+        group_info: second.group_info.clone(),
+        ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+        pending_proposals: Vec::new(),
+    };
+    let latest = alice_conversation.epoch_identifier();
+
+    // the Conversation Focus does not offer the control messages
+    let page = MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(latest.clone()),
+        mls_group_info: Some(group_info.clone()),
+        committed_control_messages: Vec::new(),
+        paginated_epoch_identifier: None,
+    };
+    let healed = bob_conversation
+        .process_enhanced_group_info(&bob, &proto::encode(&page))
+        .unwrap();
+    assert_eq!(
+        healed.progress,
+        SelfHealProgress::Rejoin(group_info.clone())
+    );
+
+    // one of them fails: the ones before stay applied
+    let mut broken = control_messages("cpim-2", &second);
+    if let Some(ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(bundle)),
+    }) = &mut broken.server_mls_rcs_message
+    {
+        let last = bundle.commit_list.len() - 1;
+        bundle.commit_list[last] ^= 1;
+    }
+    let page = MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(latest.clone()),
+        mls_group_info: Some(group_info.clone()),
+        committed_control_messages: vec![control_messages("cpim-1", &first), broken],
+        paginated_epoch_identifier: Some(latest),
+    };
+    let healed = bob_conversation
+        .process_enhanced_group_info(&bob, &proto::encode(&page))
+        .unwrap();
+    assert_eq!(
+        healed.progress,
+        SelfHealProgress::Rejoin(group_info.clone())
+    );
+    assert_eq!(healed.applied.len(), 1);
+    assert_eq!(bob_conversation.epoch(), 2);
+
+    // which the External Commit takes care of
+    bob_conversation.delete(&bob).unwrap();
+    let (mut bob_conversation, output) = bob.rejoin_conversation(&group_info).unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap();
+    assert_eq!(
+        bob_conversation.epoch_authenticator(),
+        alice_conversation.epoch_authenticator()
+    );
+    let message = bob_conversation
+        .encrypt_cpim(&bob, b"back", b"msg-1", b"")
+        .unwrap();
+    assert!(alice_conversation
+        .decrypt(&alice, &message, b"msg-1")
+        .is_ok());
+}
+
+#[test]
+fn repeated_proposals() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    let proposal = bob_conversation.leave(&bob).unwrap();
+    assert!(matches!(
+        alice_conversation.process(&alice, &proposal).unwrap(),
+        IncomingMessage::Proposal { .. }
+    ));
+    assert!(matches!(
+        alice_conversation.process(&alice, &proposal).unwrap(),
+        IncomingMessage::Duplicate
+    ));
+
+    let output = alice_conversation.commit_pending_proposals(&alice).unwrap();
+    deliver((&mut alice_conversation, &alice), vec![], &output);
+    assert_eq!(alice_conversation.members().len(), 1);
+
+    // once committed, it belongs to a past epoch
+    assert!(matches!(
+        alice_conversation.process(&alice, &proposal).unwrap(),
+        IncomingMessage::Duplicate
+    ));
 }

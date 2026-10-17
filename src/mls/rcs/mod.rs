@@ -20,6 +20,7 @@
 
 pub mod certificate;
 pub mod file;
+pub mod heal;
 pub mod imdn;
 pub mod messaging;
 pub mod metadata;
