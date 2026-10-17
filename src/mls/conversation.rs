@@ -142,6 +142,10 @@ pub enum IncomingMessage {
     /// A message sent by this client itself, delivered back to it, which needs no
     /// further handling
     Own,
+    /// A Commit or Proposal handled before, e.g. through enhanced self-healing,
+    /// delivered again; it needs no further handling, and counts as delivered
+    /// (RCC.16 section 10.1.2)
+    Duplicate,
 }
 
 /// Local state of one MLS group
@@ -518,6 +522,10 @@ impl MlsConversation {
     /// Commits are validated and applied right away; a Commit introducing a
     /// credential the validator refuses is rejected as a whole. Handshake
     /// messages have to be PublicMessages (RCC.16 section 6.2.6).
+    ///
+    /// Commits and Proposals of past epochs were applied already, as the
+    /// Conversation Focus only delivers one Commit for each epoch; they come out
+    /// as Duplicate, as do Proposals already pending.
     pub fn process(&mut self, client: &MlsClient, message: &[u8]) -> Result<IncomingMessage> {
         if self.applied_commit.as_deref() == Some(message) {
             self.applied_commit = None;
@@ -525,6 +533,9 @@ impl MlsConversation {
         }
 
         let message = self.decode(message)?;
+        if message.is_handshake_message() && message.epoch() < self.group.epoch() {
+            return Ok(IncomingMessage::Duplicate);
+        }
         self.process_protocol_message(client, message)
     }
 
@@ -534,8 +545,14 @@ impl MlsConversation {
         client: &MlsClient,
         body: &[u8],
     ) -> Result<Vec<IncomingMessage>> {
-        let message: proto::ServerMlsRcsMessage = proto::decode(body)?;
+        self.process_server_mls_rcs_message(client, proto::decode(body)?)
+    }
 
+    pub(crate) fn process_server_mls_rcs_message(
+        &mut self,
+        client: &MlsClient,
+        message: proto::ServerMlsRcsMessage,
+    ) -> Result<Vec<IncomingMessage>> {
         match message.payload {
             Some(server_mls_rcs_message::Payload::ProposalList(list)) => {
                 self.process_message_list(client, &list)
@@ -620,6 +637,16 @@ impl MlsConversation {
             .iter()
             .map(|commit| self.process(client, commit))
             .collect::<Result<Vec<_>>>()?;
+
+        // the PrivateMessage of a bundle applied before was read before too
+        if !processed.is_empty()
+            && processed
+                .iter()
+                .all(|message| matches!(message, IncomingMessage::Duplicate))
+        {
+            return Ok(processed);
+        }
+
         if !private_message.is_empty() {
             let message = self.process(client, private_message)?;
             processed.push(metadata::receive_bundled(self, client, message)?);
@@ -685,6 +712,12 @@ impl MlsConversation {
             }
 
             ProcessedMessageContent::ProposalMessage(proposal) => {
+                if self.group.pending_proposals().any(|pending| {
+                    pending.proposal_reference_ref() == proposal.proposal_reference_ref()
+                }) {
+                    return Ok(IncomingMessage::Duplicate);
+                }
+
                 // refused here, it never ends up in a Commit of this client
                 if !proposal_valid(client.validator(), proposal.proposal()) {
                     return Err(ErrorKind::InvalidCredential);
