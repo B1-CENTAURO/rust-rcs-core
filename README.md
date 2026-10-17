@@ -19,10 +19,10 @@ Groups are set up as GSMA PRD RCC.16 (v3.0) requires: Era extension, Commits and
 - the TLS structures (SecretPayload, AuthenticatedData, Verifiable* IMDN content, Commit and Proposal lists, commitments) and protobuf messages (FileInfo, `message/mls-rcs-client`, `message/mls-rcs-server`)
 - encrypted CPIM messages bound to their Message-ID, signed IMDNs (`rcs_signature`), Commit bundles for the Conversation Focus, moving to unencrypted (`end_mls`), self-healing through External Commits
 - file, thumbnail, icon and subject encryption (Annex C.2, C.3)
+- Client Certificate validation (Annex A.4.1): `RcsCredentialValidator` checks X.509 credentials against the agreed roots, the certificate profiles, the ParticipantInformation signature and key rolls, and the Vendor ID, and applies the rules for KDS query results, additions and certificate updates. Revocation of intermediate CAs is checked through a callback, fetching CRLs is left to the caller.
 
 Not covered yet:
 
-- validating Client Certificates (Annex A.4.1); a `CredentialValidator` has to be supplied
 - Re-Sent Messages after a Fail to Decrypt (Annex C.4): the `group_id[32]` fields don't fit group ids of other lengths
 - the identity verification code (Annex C.5): `HASH_TO_DIGITS` is not defined
 - group icon and subject keys (section 9.7.1): RCC.16 puts them in GroupContext extensions while leaving them out of the GroupInfo, which the GroupInfo signature does not allow

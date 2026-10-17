@@ -270,7 +270,7 @@ impl MlsConversation {
             .map_err(fail("committing proposals", ErrorKind::InvalidState))?;
 
         if let Some(staged_commit) = self.group.pending_commit() {
-            if !commit_credentials_valid(client.validator(), staged_commit) {
+            if !proposals_valid(client.validator(), staged_commit) {
                 self.discard_pending_commit(client)?;
                 return Err(ErrorKind::InvalidCredential);
             }
@@ -479,6 +479,10 @@ impl MlsConversation {
             .map_err(fail("message processing", ErrorKind::Rejected))?;
 
         let sender = processed.credential().clone();
+        let committer = match processed.sender() {
+            Sender::Member(index) => self.group.member_at(*index),
+            _ => None,
+        };
         let authenticated_data = processed.aad().to_vec();
 
         match processed.into_content() {
@@ -522,7 +526,13 @@ impl MlsConversation {
             }
 
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                if !commit_credentials_valid(client.validator(), &staged_commit) {
+                let replaced = committer.or_else(|| {
+                    staged_commit
+                        .remove_proposals()
+                        .find_map(|p| self.group.member_at(p.remove_proposal().removed()))
+                });
+                if !commit_credentials_valid(client.validator(), &staged_commit, replaced.as_ref())
+                {
                     return Err(ErrorKind::InvalidCredential);
                 }
 
@@ -673,7 +683,11 @@ impl MlsConversation {
             return Err(ErrorKind::Rejected);
         }
 
-        if !leaf_node_valid(client.validator(), key_package.leaf_node()) {
+        let leaf_node = key_package.leaf_node();
+        if !client
+            .validator()
+            .validate_addition(leaf_node.credential(), leaf_node.signature_key().as_slice())
+        {
             return Err(ErrorKind::InvalidCredential);
         }
 
@@ -685,21 +699,37 @@ fn is_end_mls(extension: &Extension) -> bool {
     matches!(extension, Extension::Unknown(rcs::EXTENSION_END_MLS, _))
 }
 
-/// Runs every credential a Commit introduces through the validator, mirroring
-/// `StagedCommit::credentials_to_verify()` but keeping the signature keys at hand
+/// Runs every credential a Commit of another client introduces through the
+/// validator, mirroring `StagedCommit::credentials_to_verify()` but keeping the
+/// signature keys at hand, as well as the credential of the committer
 ///
-/// OpenMLS does not expose the keys of external senders, so a Commit introducing
-/// any is refused; groups created here never use them.
+/// `replaced` is the leaf the Commit's UpdatePath takes the place of: the
+/// committer's own, or for a resync External Commit the one it removes.
 fn commit_credentials_valid(
     validator: &dyn CredentialValidator,
     staged_commit: &StagedCommit,
+    replaced: Option<&Member>,
 ) -> bool {
-    if let Some(leaf_node) = staged_commit.update_path_leaf_node() {
-        if !leaf_node_valid(validator, leaf_node) {
-            return false;
+    let path_valid = match (staged_commit.update_path_leaf_node(), replaced) {
+        (Some(leaf_node), Some(old)) => validator.validate_replacement(
+            &old.credential,
+            leaf_node.credential(),
+            leaf_node.signature_key().as_slice(),
+        ),
+        (Some(leaf_node), None) => leaf_node_valid(validator, leaf_node),
+        // Commits signed with credentials no longer valid are refused (RCC.16 Annex A.4.1)
+        (None, Some(committer)) => {
+            validator.validate(&committer.credential, &committer.signature_key)
         }
-    }
+        (None, None) => true,
+    };
 
+    path_valid && proposals_valid(validator, staged_commit)
+}
+
+/// OpenMLS does not expose the keys of external senders, so a Commit introducing
+/// any is refused; groups created here never use them.
+fn proposals_valid(validator: &dyn CredentialValidator, staged_commit: &StagedCommit) -> bool {
     staged_commit
         .queued_proposals()
         .all(|queued_proposal| proposal_valid(validator, queued_proposal.proposal()))
