@@ -905,6 +905,106 @@ fn demuxer_aborts_the_message_when_reading_fails() {
     );
 }
 
+fn flag_of(chunk: &MsrpChunk) -> char {
+    match parsed(chunk) {
+        Parsed::Request(_, _, _, _, flag) => flag,
+        other => panic!("{:?}", other),
+    }
+}
+
+#[test]
+fn demuxer_aborts_a_message_that_fails_while_being_sent() {
+    // RFC 4975 section 7.3.2: the rest of the message is not sent, and the
+    // chunk that would have been next ends in #
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = demuxer();
+    let (tx, mut rx) = mpsc::channel(1); // the sender waits on the receiver
+    let results: Results = Arc::default();
+    let results_ = Arc::clone(&results);
+    demuxer.start(
+        ALICE.as_bytes().to_vec(),
+        BOB.as_bytes().to_vec(),
+        Some(b"text/plain".to_vec()),
+        50 * 1024,
+        std::io::Cursor::new(vec![b'x'; 50 * 1024]),
+        move |status_code, reason_phrase| {
+            results_.lock().unwrap().push((status_code, reason_phrase));
+        },
+        tx,
+        &rt,
+    );
+
+    let first = sent_chunks(&rt, &mut rx, 1).remove(0);
+    assert_eq!(flag_of(&first), '+');
+    assert!(demuxer
+        .on_response(response_to(&first, 413, "Too big"))
+        .is_ok());
+    assert_eq!(*results.lock().unwrap(), vec![(413, "Too big".to_string())]);
+
+    // the chunks already queued, then the one that ends the message
+    let rest = rt.block_on(async {
+        let mut chunks = Vec::new();
+        while let Some(chunk) = timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the sender hangs")
+        {
+            chunks.push(chunk);
+        }
+        chunks
+    });
+    let flags: Vec<char> = rest.iter().map(flag_of).collect();
+    assert_eq!(flags.last(), Some(&'#'), "{:?}", flags);
+    assert!(
+        flags[..flags.len() - 1].iter().all(|flag| *flag == '+'),
+        "{:?}",
+        flags
+    );
+    assert!(rest.len() < 4, "the rest is not sent: {:?}", flags);
+}
+
+#[test]
+fn a_failure_report_fails_the_session() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = demuxer();
+    let hello = || std::io::Cursor::new(b"Hello".to_vec());
+
+    // a failure response ends its message only
+    let (mut rx, refused) = start_sending(&demuxer, hello(), 5, &rt);
+    let chunks = sent_chunks(&rt, &mut rx, 1);
+    assert!(demuxer
+        .on_response(response_to(&chunks[0], 415, "Unsupported"))
+        .is_ok());
+    assert_eq!(
+        *refused.lock().unwrap(),
+        vec![(415, "Unsupported".to_string())]
+    );
+    assert_eq!(demuxer.session_failure(), None);
+
+    // a failure REPORT ends every message on the session (section 7.3.2)
+    let (mut rx, reported) = start_sending(&demuxer, hello(), 5, &rt);
+    let message_id = header_of(&sent_chunks(&rt, &mut rx, 1)[0], "Message-ID").unwrap();
+    let (mut rx, pending) = start_sending(&demuxer, hello(), 5, &rt);
+    sent_chunks(&rt, &mut rx, 1);
+
+    assert!(demuxer
+        .on_report(report_for(&message_id, "1-5/5", "000 413 Too big"))
+        .is_ok());
+    let failure = (413, "Too big".to_string());
+    assert_eq!(*reported.lock().unwrap(), vec![failure.clone()]);
+    assert_eq!(*pending.lock().unwrap(), vec![failure.clone()]);
+    assert_eq!(demuxer.session_failure(), Some(failure.clone()));
+
+    // and those started after it, which send nothing
+    let (mut rx, later) = start_sending(&demuxer, hello(), 5, &rt);
+    let sent = rt.block_on(async {
+        timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the sender hangs")
+    });
+    assert!(sent.is_none());
+    assert_eq!(*later.lock().unwrap(), vec![failure]);
+}
+
 #[test]
 fn demuxer_times_out_without_a_response() {
     let rt = Arc::new(
