@@ -149,11 +149,20 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
+    /// `client_config` may be shared with other protocols: the client keeps a
+    /// copy that offers only HTTP/1.1 in ALPN (RFC 7301), the one version it
+    /// speaks, so that no server switches its connections to HTTP/2.
     pub fn new(
         client_config: Arc<ClientConfig>,
         dns_client: Arc<DnsClient>,
         rt: Arc<Runtime>,
     ) -> HttpClient {
+        let client_config = {
+            let mut config = ClientConfig::clone(&client_config);
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            Arc::new(config)
+        };
+
         let (tx, mut rx) = mpsc::channel::<ConnectMessage>(MAX_CONCURRENT_CONNECTIONS);
 
         let connections: Arc<

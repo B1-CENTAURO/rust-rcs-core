@@ -245,3 +245,60 @@ fn https_does_not_reuse_a_plain_connection() {
     assert!(tls.cipher_id().is_some());
     get_ok(&rt, &tls, "localhost");
 }
+
+/// Serves one HTTPS request with `alpn` as the server's protocols, in order of
+/// preference, returning the port and what the handshake settled on.
+fn https_server_with_alpn(alpn: &[&[u8]]) -> (u16, std::sync::mpsc::Receiver<Option<Vec<u8>>>) {
+    let mut config = ServerConfig::clone(&server_config());
+    config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+    let config = Arc::new(config);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        let conn = ServerConnection::new(config).unwrap();
+        let mut tls = StreamOwned::new(conn, socket);
+        serve(&mut tls);
+        let _ = tx.send(tls.conn.alpn_protocol().map(|protocol| protocol.to_vec()));
+    });
+
+    (port, rx)
+}
+
+#[test]
+fn https_offers_only_http_1_1() {
+    // a config shared with something that speaks HTTP/2
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(SERVER_CERT.to_vec()))
+        .unwrap();
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let config = Arc::new(config);
+
+    let rt = Arc::new(Runtime::new().unwrap());
+    let dns_client = Arc::new(DnsClient::new(Arc::clone(&rt)));
+    let client = HttpClient::new(Arc::clone(&config), dns_client, Arc::clone(&rt));
+
+    // the server would rather speak HTTP/2
+    let (port, negotiated) = https_server_with_alpn(&[b"h2", b"http/1.1"]);
+    let conn = connect(&rt, &client, &format!("https://127.0.0.1:{}/", port))
+        .ok()
+        .expect("connect failed");
+    get_ok(&rt, &conn, "127.0.0.1");
+
+    assert_eq!(
+        negotiated.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Some(b"http/1.1".to_vec())
+    );
+    assert_eq!(
+        config.alpn_protocols,
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        "the shared config is left as it was"
+    );
+}
