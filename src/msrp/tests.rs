@@ -1534,6 +1534,7 @@ fn msrp_info(inactive: bool) -> MsrpInfo<'static> {
         setup_method: MsrpSetupMethod::Active,
         accept_types: b"message/cpim application/im-iscomposing+xml",
         accept_wrapped_types: Some(b"text/plain message/imdn+xml"),
+        cema: false,
         file_info: Some(MsrpFileInfo {
             file_selector: b"name:\"a.jpg\" type:image/jpeg size:10",
             file_transfer_id: b"vBnG916bdberum2f",
@@ -2157,4 +2158,77 @@ fn a_success_report_comes_back_through_the_wire_format() {
     assert_eq!(replies, vec!["200", "200", "200", "REPORT"]);
     assert_eq!(*results.lock().unwrap(), vec![(200, "Ok".to_string())]);
     assert_eq!(received(&bob_log), Some(body));
+}
+
+fn sdp_with(media_lines: &str) -> String {
+    format!(
+        "v=0\r\n\
+o=- 1 1 IN IP4 192.0.2.9\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=message 2856 TCP/MSRP *\r\n\
+c=IN IP4 192.0.2.9\r\n\
+a=accept-types:message/cpim\r\n\
+{}",
+        media_lines
+    )
+}
+
+fn connection_address(sdp: &str) -> Option<(String, u16)> {
+    let sdp = sdp.as_bytes().as_sdp().unwrap();
+    let info = sdp.as_msrp_info().unwrap();
+    info.connection_address()
+        .map(|(host, port)| (text(host), port))
+}
+
+#[test]
+fn reads_and_writes_msrp_cema() {
+    let path = "a=path:msrp://198.51.100.7:2855/xyz;tcp\r\n";
+    for (lines, cema) in [
+        (format!("{}a=msrp-cema\r\n", path), true),
+        (path.to_string(), false),
+    ] {
+        let sdp = sdp_with(&lines);
+        let sdp = sdp.as_bytes().as_sdp().unwrap();
+        assert_eq!(sdp.as_msrp_info().unwrap().cema, cema);
+    }
+
+    for cema in [true, false] {
+        let mut info = msrp_info(false);
+        info.cema = cema;
+        let sdp: String = info.into();
+        assert_eq!(sdp.contains("\r\na=msrp-cema\r\n"), cema);
+        let read = sdp.as_bytes().as_sdp().unwrap();
+        assert_eq!(read.as_msrp_info().unwrap().cema, cema);
+    }
+}
+
+#[test]
+fn connects_where_cema_says() {
+    // an intermediary rewrote c= and m= to 192.0.2.9:2856, a=path still
+    // names the endpoint
+    assert_eq!(
+        connection_address(&sdp_with(
+            "a=path:msrp://198.51.100.7:2855/xyz;tcp\r\na=msrp-cema\r\n"
+        )),
+        Some(("192.0.2.9".into(), 2856)),
+        "with CEMA, the c= address and m= port"
+    );
+    assert_eq!(
+        connection_address(&sdp_with("a=path:msrp://198.51.100.7:2855/xyz;tcp\r\n")),
+        Some(("198.51.100.7".into(), 2855)),
+        "without, the a=path URI"
+    );
+    assert_eq!(
+        connection_address(&sdp_with(
+            "a=path:msrps://bob@[2001:db8::1]:2857/relay;tcp msrps://[2001:db8::2]:2858/abc;tcp\r\n"
+        )),
+        Some(("2001:db8::1".into(), 2857)),
+        "the first hop of a path, IPv6"
+    );
+    assert_eq!(
+        connection_address(&sdp_with("a=path:msrp://relay.example.com/xyz;tcp\r\n")),
+        None,
+        "no port"
+    );
 }

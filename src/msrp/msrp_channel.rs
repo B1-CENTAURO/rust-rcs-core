@@ -221,6 +221,8 @@ impl MsrpChannelManager {
     /// From-Path and To-Path. The first chunk of a session opens it with
     /// `socket_factory`, unless the session was registered as passive.
     /// What arrives on a connection goes to the registered channels.
+    /// `MsrpInfo::connection_address` of the remote SDP says where to connect,
+    /// CEMA included.
     pub fn new<F, T>(
         mut rx: mpsc::Receiver<MsrpChunk>,
         socket_factory: F,

@@ -42,8 +42,49 @@ pub struct MsrpInfo<'a> {
     pub setup_method: MsrpSetupMethod,
     pub accept_types: &'a [u8],
     pub accept_wrapped_types: Option<&'a [u8]>,
+    pub cema: bool, // a=msrp-cema, RFC 6714
 
     pub file_info: Option<MsrpFileInfo<'a>>,
+}
+
+impl<'a> MsrpInfo<'a> {
+    /// Where to connect to the endpoint this SDP describes. With CEMA (RFC
+    /// 6714) that is the c= address and m= port, which a media anchoring
+    /// intermediary may have rewritten, otherwise the authority of the first
+    /// URI in a=path, the first hop, as in RFC 4975.
+    pub fn connection_address(&self) -> Option<(&'a [u8], u16)> {
+        if self.cema {
+            return Some((self.address, self.port));
+        }
+
+        // msrp[s]://[userinfo@]host:port[/session-id];transport
+        let uri = self
+            .path
+            .split(|c| *c == b' ')
+            .find(|uri| !uri.is_empty())?;
+        let idx = uri.windows(3).position(|w| w == b"://")?;
+        let rest = &uri[idx + 3..];
+        let end = rest
+            .iter()
+            .position(|c| *c == b'/' || *c == b';')
+            .unwrap_or(rest.len());
+        let authority = &rest[..end];
+        let authority = match authority.iter().rposition(|c| *c == b'@') {
+            Some(idx) => &authority[idx + 1..],
+            None => authority,
+        };
+
+        let (host, port) = if authority.first() == Some(&b'[') {
+            let idx = authority.iter().position(|c| *c == b']')?;
+            (&authority[1..idx], authority[idx + 1..].strip_prefix(b":")?)
+        } else {
+            let idx = authority.iter().rposition(|c| *c == b':')?;
+            (&authority[..idx], &authority[idx + 1..])
+        };
+
+        let port = std::str::from_utf8(port).ok()?.parse().ok()?;
+        Some((host, port))
+    }
 }
 
 pub struct MsrpFileInfo<'a> {

@@ -83,6 +83,10 @@ impl From<MsrpInfo<'_>> for String {
             accept_wrapped_types
         );
 
+        if msrp_info.cema {
+            sdp.push_str("a=msrp-cema\r\n");
+        }
+
         // RFC 5547
         if let Some(file_info) = msrp_info.file_info {
             for (name, value) in [
