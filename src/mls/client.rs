@@ -314,7 +314,9 @@ impl MlsClient {
     ///
     /// RCC.16 uses a random GUID as `group_id` for 1-to-1 chats, which is what
     /// passing None generates, and the Conversation-ID for group chats (section
-    /// 6.1.1). Starting a new Era of a group requires deleting the old one first.
+    /// 6.1.1). The GUID is written as 32 hex digits, the length of the group id
+    /// fields of Annex C.4. Starting a new Era of a group requires deleting the
+    /// old one first.
     pub fn create_conversation(
         &self,
         group_id: Option<&[u8]>,
@@ -336,21 +338,18 @@ impl MlsClient {
             .use_ratchet_tree_extension(true)
             .build();
 
-        let group = match group_id {
-            Some(group_id) => MlsGroup::new_with_group_id(
-                &self.provider,
-                &self.signer,
-                &config,
-                GroupId::from_slice(group_id),
-                self.credential.clone(),
-            ),
-            None => MlsGroup::new(
-                &self.provider,
-                &self.signer,
-                &config,
-                self.credential.clone(),
-            ),
-        }
+        let group_id = match group_id {
+            Some(group_id) => GroupId::from_slice(group_id),
+            None => GroupId::from_slice(uuid::Uuid::new_v4().simple().to_string().as_bytes()),
+        };
+
+        let group = MlsGroup::new_with_group_id(
+            &self.provider,
+            &self.signer,
+            &config,
+            group_id,
+            self.credential.clone(),
+        )
         .map_err(fail("group creation", ErrorKind::InvalidState))?;
 
         Ok(MlsConversation::new(group))

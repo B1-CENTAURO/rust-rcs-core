@@ -20,8 +20,10 @@
 
 pub mod certificate;
 pub mod file;
+pub mod imdn;
 pub mod messaging;
 pub mod proto;
+pub mod resend;
 pub mod wire;
 
 #[cfg(test)]

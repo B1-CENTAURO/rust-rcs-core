@@ -96,6 +96,15 @@ pub struct ResentMessage {
     pub padding: VLBytes,
 }
 
+/// HPKE encryption of a ResentMessage to one client (RCC.16 Annex C.4.1)
+#[derive(Clone, Debug, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsSize)]
+pub struct HpkeInnerEncapsulatedKeyAndCiphertext {
+    pub receiver_leaf_index: u32,
+    pub encapsulated_key: VLBytes,
+    pub ciphertext: VLBytes,
+    pub original_message_hmac: VLBytes,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsSize)]
 #[repr(u16)]
 pub enum DeliveryNotificationStatus {

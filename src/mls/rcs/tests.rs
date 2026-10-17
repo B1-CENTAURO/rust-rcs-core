@@ -510,7 +510,7 @@ fn encrypted_messages() {
     let decrypted = bob_conversation.decrypt(&bob, &message, b"msg-1").unwrap();
     assert_eq!(decrypted.sender.serialized_content(), b"alice");
     assert_eq!(decrypted.payload_type, SecretPayloadType::Application);
-    assert_eq!(decrypted.payload, cpim);
+    assert_eq!(decrypted.payload.as_deref(), Some(&cpim[..]));
     assert!(decrypted.original_message_id.is_empty());
 
     // the CPIM Message-ID is bound to the ciphertext
@@ -708,8 +708,9 @@ fn self_heal() {
         bob_conversation
             .decrypt(&bob, &message, b"msg-1")
             .unwrap()
-            .payload,
-        b"welcome back"
+            .payload
+            .as_deref(),
+        Some(&b"welcome back"[..])
     );
 }
 
@@ -749,4 +750,176 @@ fn leaving_through_proposal_list() {
         _ => panic!("expected a Commit"),
     }
     assert_eq!(alice_conversation.members().len(), 1);
+}
+
+#[test]
+fn one_to_one_group_id() {
+    let alice = client("alice");
+
+    // a GUID in hex digits, fitting the group_id[32] of RCC.16 Annex C.4.1 as it is
+    let conversation = alice.create_conversation(None, 1).unwrap();
+    assert_eq!(conversation.group_id().len(), 32);
+    assert!(conversation
+        .group_id()
+        .iter()
+        .all(|digit| digit.is_ascii_hexdigit()));
+    assert_ne!(
+        alice.create_conversation(None, 1).unwrap().group_id(),
+        conversation.group_id()
+    );
+
+    let conversation = alice.create_conversation(Some(b"group"), 1).unwrap();
+    assert_eq!(conversation.group_id(), b"group");
+}
+
+#[test]
+fn resent_messages() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let carol = client("carol");
+
+    let key_packages = [
+        bob.generate_key_package(false).unwrap(),
+        carol.generate_key_package(false).unwrap(),
+    ];
+    let mut alice_conversation = alice.create_conversation(None, 2).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_packages[0], &key_packages[1]])
+        .unwrap();
+    let bundle = accept(&output);
+    let mut bob_conversation = bob.join_conversation(&bundle.welcome).unwrap();
+    let mut carol_conversation = carol.join_conversation(&bundle.welcome).unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+
+    // Bob reported failing to decrypt msg-1, which Alice sends him again
+    let original = b"NS: cpm <http://www.openmobilealliance.org/cpm/>\r\n\r\nContent-Type: text/plain\r\n\r\nhello";
+    let message = alice_conversation
+        .encrypt_resent(&alice, original, bob.credential(), b"msg-2", b"msg-1")
+        .unwrap();
+
+    let decrypted = bob_conversation.decrypt(&bob, &message, b"msg-2").unwrap();
+    assert_eq!(decrypted.sender.serialized_content(), b"alice");
+    assert_eq!(decrypted.payload_type, SecretPayloadType::Hpke1To1Message);
+    assert_eq!(decrypted.payload.as_deref(), Some(&original[..]));
+    assert_eq!(decrypted.original_message_id, b"msg-1");
+
+    // the rest of the group sees that a message was re-sent, but not which
+    let decrypted = carol_conversation
+        .decrypt(&carol, &message, b"msg-2")
+        .unwrap();
+    assert_eq!(decrypted.payload_type, SecretPayloadType::Hpke1To1Message);
+    assert_eq!(decrypted.payload, None);
+    assert_eq!(decrypted.original_message_id, b"msg-1");
+
+    // padded as files are
+    let short = alice_conversation
+        .encrypt_resent(&alice, &[b'a'; 2000], bob.credential(), b"msg-3", b"msg-1")
+        .unwrap();
+    let long = alice_conversation
+        .encrypt_resent(&alice, &[b'a'; 2010], bob.credential(), b"msg-4", b"msg-1")
+        .unwrap();
+    assert_eq!(short.len(), long.len());
+
+    // sealed to the leaf key Bob has at the time; once he replaced it, a message
+    // re-sent before can no longer be read
+    let output = bob_conversation.update_keys(&bob).unwrap();
+    let message = carol_conversation
+        .encrypt_resent(&carol, b"again", bob.credential(), b"msg-5", b"msg-1")
+        .unwrap();
+    let bundle = accept(&output);
+    for (conversation, client) in [
+        (&mut alice_conversation, &alice),
+        (&mut bob_conversation, &bob),
+        (&mut carol_conversation, &carol),
+    ] {
+        conversation.process_commit_bundle(client, &bundle).unwrap();
+    }
+    let message_after = carol_conversation
+        .encrypt_resent(&carol, b"later", bob.credential(), b"msg-6", b"msg-1")
+        .unwrap();
+    assert_eq!(
+        bob_conversation
+            .decrypt(&bob, &message_after, b"msg-6")
+            .unwrap()
+            .payload
+            .as_deref(),
+        Some(&b"later"[..])
+    );
+    assert_eq!(
+        bob_conversation.decrypt(&bob, &message, b"msg-5").err(),
+        Some(ErrorKind::Rejected)
+    );
+
+    // only to members
+    let mallory = client("mallory");
+    assert_eq!(
+        alice_conversation
+            .encrypt_resent(&alice, original, mallory.credential(), b"msg-7", b"msg-1")
+            .err(),
+        Some(ErrorKind::UnknownMember)
+    );
+}
+
+#[test]
+fn imdn_failure_reasons() {
+    let imdn = br#"<?xml version="1.0" encoding="UTF-8"?>
+<imdn xmlns="urn:ietf:params:xml:ns:imdn">
+  <message-id>34jk324j</message-id>
+  <datetime>2008-04-04T12:16:49-05:00</datetime>
+  <delivery-notification>
+    <status>
+      <failed>
+        <mls-server-failure-reason><incorrect-epoch/></mls-server-failure-reason>
+      </failed>
+    </status>
+  </delivery-notification>
+</imdn>"#;
+    assert_eq!(
+        imdn::failure_reason(imdn),
+        Some(imdn::FailureReason::Server(
+            ServerFailureReason::IncorrectEpoch
+        ))
+    );
+
+    for reason in [
+        ClientFailureReason::MessageFromNonMember,
+        ClientFailureReason::InvalidCredential,
+        ClientFailureReason::InvalidCommit,
+        ClientFailureReason::FailureToDecrypt,
+        ClientFailureReason::CommitInPrivateMessage,
+    ] {
+        let imdn = format!(
+            "<imdn xmlns=\"urn:ietf:params:xml:ns:imdn\"><message-id>1</message-id><delivery-notification>{}</delivery-notification></imdn>",
+            imdn::failed_status(reason)
+        );
+        assert_eq!(
+            imdn::failure_reason(imdn.as_bytes()),
+            Some(imdn::FailureReason::Client(reason))
+        );
+    }
+
+    // prefixed elements, as with an extension namespace
+    let imdn = br#"<imdn xmlns="urn:ietf:params:xml:ns:imdn" xmlns:m="urn:gsma:params:xml:ns:rcs:mls"><delivery-notification><status><failed><m:mls-client-failure-reason><m:failed-to-decrypt/></m:mls-client-failure-reason></failed></status></delivery-notification></imdn>"#;
+    assert_eq!(
+        imdn::failure_reason(imdn),
+        Some(imdn::FailureReason::Client(
+            ClientFailureReason::FailureToDecrypt
+        ))
+    );
+
+    assert_eq!(
+        imdn::failed_status(ClientFailureReason::Unset),
+        "<status><failed/></status>"
+    );
+    for imdn in [
+        &b"<imdn><delivery-notification><status><failed/></status></delivery-notification></imdn>"[..],
+        b"<imdn><delivery-notification><status><delivered/></status></delivery-notification></imdn>",
+        b"<imdn><status><failed><mls-server-failure-reason></mls-server-failure-reason></failed></status></imdn>",
+        b"<imdn><status><failed><mls-server-failure-reason><unknown-reason/></mls-server-failure-reason></failed></status></imdn>",
+        b"not xml <",
+    ] {
+        assert_eq!(imdn::failure_reason(imdn), None);
+    }
 }
