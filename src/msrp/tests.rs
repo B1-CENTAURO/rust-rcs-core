@@ -2161,24 +2161,36 @@ fn a_success_report_comes_back_through_the_wire_format() {
 }
 
 fn sdp_with(media_lines: &str) -> String {
+    sdp_at("IN IP4 192.0.2.9", 2856, media_lines)
+}
+
+/// An SDP with `connection` in c= and `port` in m=.
+fn sdp_at(connection: &str, port: u16, media_lines: &str) -> String {
     format!(
         "v=0\r\n\
 o=- 1 1 IN IP4 192.0.2.9\r\n\
 s=-\r\n\
 t=0 0\r\n\
-m=message 2856 TCP/MSRP *\r\n\
-c=IN IP4 192.0.2.9\r\n\
+m=message {} TCP/MSRP *\r\n\
+c={}\r\n\
 a=accept-types:message/cpim\r\n\
 {}",
-        media_lines
+        port, connection, media_lines
     )
 }
 
-fn connection_address(sdp: &str) -> Option<(String, u16)> {
+fn connection_address(sdp: &str, local_cema: bool) -> Option<(String, u16)> {
     let sdp = sdp.as_bytes().as_sdp().unwrap();
     let info = sdp.as_msrp_info().unwrap();
-    info.connection_address()
+    info.connection_address(local_cema)
         .map(|(host, port)| (text(host), port))
+}
+
+fn connection_matches_path(connection: &str, port: u16, path: &str) -> Option<bool> {
+    let sdp = sdp_at(connection, port, &format!("a=path:{}\r\n", path));
+    let sdp = sdp.as_bytes().as_sdp().unwrap();
+    let info = sdp.as_msrp_info().unwrap();
+    info.connection_matches_path()
 }
 
 #[test]
@@ -2206,29 +2218,121 @@ fn reads_and_writes_msrp_cema() {
 #[test]
 fn connects_where_cema_says() {
     // an intermediary rewrote c= and m= to 192.0.2.9:2856, a=path still
-    // names the endpoint
+    // names the endpoint; what counts is whether this end does CEMA, not
+    // whether the remote one does (RFC 6714 sections 4.2 and 4.3)
+    let path = "a=path:msrp://198.51.100.7:2855/xyz;tcp\r\n";
+    for remote in [path.to_string(), format!("{}a=msrp-cema\r\n", path)] {
+        let sdp = sdp_with(&remote);
+        assert_eq!(
+            connection_address(&sdp, true),
+            Some(("192.0.2.9".into(), 2856)),
+            "doing CEMA, the c= address and m= port: {}",
+            remote
+        );
+        assert_eq!(
+            connection_address(&sdp, false),
+            Some(("198.51.100.7".into(), 2855)),
+            "not doing CEMA, the a=path URI: {}",
+            remote
+        );
+    }
+
     assert_eq!(
-        connection_address(&sdp_with(
-            "a=path:msrp://198.51.100.7:2855/xyz;tcp\r\na=msrp-cema\r\n"
-        )),
-        Some(("192.0.2.9".into(), 2856)),
-        "with CEMA, the c= address and m= port"
-    );
-    assert_eq!(
-        connection_address(&sdp_with("a=path:msrp://198.51.100.7:2855/xyz;tcp\r\n")),
-        Some(("198.51.100.7".into(), 2855)),
-        "without, the a=path URI"
-    );
-    assert_eq!(
-        connection_address(&sdp_with(
-            "a=path:msrps://bob@[2001:db8::1]:2857/relay;tcp msrps://[2001:db8::2]:2858/abc;tcp\r\n"
-        )),
+        connection_address(
+            &sdp_with(
+                "a=path:msrps://bob@[2001:db8::1]:2857/relay;tcp msrps://[2001:db8::2]:2858/abc;tcp\r\n"
+            ),
+            false
+        ),
         Some(("2001:db8::1".into(), 2857)),
         "the first hop of a path, IPv6"
     );
     assert_eq!(
-        connection_address(&sdp_with("a=path:msrp://relay.example.com/xyz;tcp\r\n")),
+        connection_address(
+            &sdp_with("a=path:msrp://relay.example.com/xyz;tcp\r\n"),
+            false
+        ),
         None,
         "no port"
     );
+}
+
+#[test]
+fn tells_a_rewritten_connection_address() {
+    // RFC 6714 section 4.4
+    let v4 = "IN IP4 192.0.2.9";
+    let name = "IN IP4 alice.example.com";
+
+    for (connection, port, path, matches, why) in [
+        (
+            v4,
+            2856,
+            "msrp://192.0.2.9:2856/xyz;tcp",
+            Some(true),
+            "the endpoint's own",
+        ),
+        (
+            v4,
+            2856,
+            "msrp://198.51.100.7:2855/xyz;tcp",
+            Some(false),
+            "rewritten",
+        ),
+        (
+            v4,
+            2857,
+            "msrp://192.0.2.9:2856/xyz;tcp",
+            Some(false),
+            "another port",
+        ),
+        (
+            "IN IP6 2001:db8::1",
+            2856,
+            "msrp://[2001:0db8:0:0:0:0:0:1]:2856/xyz;tcp",
+            Some(true),
+            "IPv6 spelled otherwise",
+        ),
+        (
+            v4,
+            2856,
+            "msrps://relay.example.com:2855/r;tcp msrps://192.0.2.9:2856/xyz;tcp",
+            Some(true),
+            "any URI of the path",
+        ),
+        (
+            name,
+            2856,
+            "msrp://ALICE.example.com:2856/xyz;tcp",
+            Some(true),
+            "the same name",
+        ),
+        (
+            v4,
+            2856,
+            "msrp://alice.example.com:2856/xyz;tcp",
+            None,
+            "a name in a=path",
+        ),
+        (
+            name,
+            2856,
+            "msrp://192.0.2.9:2856/xyz;tcp",
+            None,
+            "a name in c=",
+        ),
+        (
+            v4,
+            2856,
+            "msrp://alice.example.com:2855/xyz;tcp",
+            Some(false),
+            "a name, but another port",
+        ),
+    ] {
+        assert_eq!(
+            connection_matches_path(connection, port, path),
+            matches,
+            "{}",
+            why
+        );
+    }
 }
