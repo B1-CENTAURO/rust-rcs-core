@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
@@ -183,7 +183,9 @@ impl MsrpDemuxer {
 
         let waitlist = Arc::clone(&self.waitlist);
 
-        let rt_ = Arc::clone(rt);
+        // a handle, not the runtime: tokio panics when the last Arc<Runtime>
+        // is dropped inside one of its tasks
+        let rt_ = rt.handle().clone();
 
         rt.spawn(async move {
             let message_id = rand::create_raw_alpha_numeric_string(16);
@@ -474,7 +476,7 @@ async fn send_chunk(
     mut chunk: MsrpChunk,
     last: bool,
     tx: &mpsc::Sender<MsrpChunk>,
-    rt: &Arc<Runtime>,
+    rt: &Handle,
 ) -> bool {
     let pending = {
         let mut guard = waitlist.lock().unwrap();
@@ -609,7 +611,7 @@ fn build_msrp_chunk(
 }
 
 // a message waiting for success REPORTs fails when they have not come in time
-fn start_report_timeout(waitlist: &Waitlist, message_id: Vec<u8>, rt: &Arc<Runtime>) {
+fn start_report_timeout(waitlist: &Waitlist, message_id: Vec<u8>, rt: &Handle) {
     let waitlist = Arc::clone(waitlist);
     rt.spawn(async move {
         sleep(REPORT_TIMEOUT).await;
@@ -617,7 +619,7 @@ fn start_report_timeout(waitlist: &Waitlist, message_id: Vec<u8>, rt: &Arc<Runti
     });
 }
 
-fn start_timeout(waitlist: &Waitlist, transaction_id: Vec<u8>, rt: &Arc<Runtime>) {
+fn start_timeout(waitlist: &Waitlist, transaction_id: Vec<u8>, rt: &Handle) {
     let waitlist = Arc::clone(&waitlist);
     rt.spawn(async move {
         sleep(Duration::from_secs(30)).await;

@@ -1060,6 +1060,51 @@ fn a_late_failure_report_fails_the_session() {
 }
 
 #[test]
+fn tasks_do_not_hold_the_runtime() {
+    // tokio panics when a runtime is dropped inside one of its tasks, which a
+    // task holding the last Arc<Runtime> would do as it ended
+    let rt = Arc::new(Runtime::new().unwrap());
+
+    let (_tx, rx) = mpsc::channel(8);
+    let manager = MsrpChannelManager::new(
+        rx,
+        |_: &[u8], _: &[u8]| -> DuplexStream { panic!("nothing to connect") },
+        Arc::clone(&rt),
+    );
+    let (ours, _theirs) = tokio::io::duplex(1024);
+    {
+        let _guard = rt.enter();
+        manager.accept(ours);
+    }
+
+    // a message that waits to queue the rest of its five chunks
+    let demuxer = demuxer();
+    let (tx, mut rx) = mpsc::channel(1);
+    let results: Results = Arc::default();
+    let results_ = Arc::clone(&results);
+    demuxer.start(
+        ALICE.as_bytes().to_vec(),
+        BOB.as_bytes().to_vec(),
+        Some(b"text/plain".to_vec()),
+        50 * 1024,
+        std::io::Cursor::new(vec![b'x'; 50 * 1024]),
+        move |status_code, reason_phrase| {
+            results_.lock().unwrap().push((status_code, reason_phrase));
+        },
+        tx,
+        &rt,
+    );
+    sent_chunks(&rt, &mut rx, 1);
+
+    assert_eq!(
+        Arc::strong_count(&rt),
+        2,
+        "ours and the manager's, none in the tasks"
+    );
+    assert!(results.lock().unwrap().is_empty());
+}
+
+#[test]
 fn demuxer_times_out_without_a_response() {
     let rt = Arc::new(
         Builder::new_current_thread()
