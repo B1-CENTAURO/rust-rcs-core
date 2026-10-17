@@ -65,6 +65,45 @@ impl MlsProvider {
         Ok(())
     }
 
+    /// Value this crate keeps next to the state of OpenMLS, under a key starting
+    /// with a label of its own; OpenMLS labels its keys likewise
+    pub(crate) fn read_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let values = self.storage.values.read().map_err(|_| ErrorKind::Storage)?;
+        Ok(values.get(key).cloned())
+    }
+
+    pub(crate) fn write_value(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        let mut values = self
+            .storage
+            .values
+            .write()
+            .map_err(|_| ErrorKind::Storage)?;
+        values.insert(key, value);
+        Ok(())
+    }
+
+    pub(crate) fn remove_value(&self, key: &[u8]) -> Result<()> {
+        let mut values = self
+            .storage
+            .values
+            .write()
+            .map_err(|_| ErrorKind::Storage)?;
+        values.remove(key);
+        Ok(())
+    }
+
+    /// Copy of the state, to try out changes on
+    pub(crate) fn fork(&self) -> Result<MlsProvider> {
+        let values = self.storage.values.read().map_err(|_| ErrorKind::Storage)?;
+
+        Ok(MlsProvider {
+            crypto: RustCrypto::default(),
+            storage: MemoryStorage {
+                values: values.clone().into(),
+            },
+        })
+    }
+
     pub(crate) fn import_storage(data: &mut &[u8]) -> Result<MlsProvider> {
         let count = read_u32(data)?;
         let mut values = HashMap::new();

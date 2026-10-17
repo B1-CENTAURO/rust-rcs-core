@@ -65,8 +65,7 @@ fn hex(s: &str) -> Vec<u8> {
 /// without GroupInfo and epoch authenticator, with the ratchet tree for joiners
 /// (RCC.16 section 7.9.3)
 fn accept(output: &CommitOutput) -> ServerCommitBundle {
-    let message: ClientMlsRcsMessage =
-        proto::decode(&output.to_client_message(None).unwrap()).unwrap();
+    let message: ClientMlsRcsMessage = proto::decode(&output.to_client_message().unwrap()).unwrap();
     match message.payload.unwrap() {
         // the ratchet tree is either the one sent along or reconstructed
         client_mls_rcs_message::Payload::WelcomeCommitBundle(bundle) => ServerCommitBundle {
@@ -472,8 +471,7 @@ fn conversation_creation() {
         .unwrap();
 
     // the initial Commit carries the ratchet tree, and goes out as a PublicMessage
-    let message: ClientMlsRcsMessage =
-        proto::decode(&output.to_client_message(None).unwrap()).unwrap();
+    let message: ClientMlsRcsMessage = proto::decode(&output.to_client_message().unwrap()).unwrap();
     let bundle = match message.payload {
         Some(client_mls_rcs_message::Payload::WelcomeCommitBundle(bundle)) => bundle,
         _ => panic!("expected a WelcomeCommitBundle"),
@@ -528,11 +526,12 @@ fn conversation_creation() {
     // later Commits come without ratchet tree and Welcome
     let output = bob_conversation.update_keys(&bob).unwrap();
     assert!(output.ratchet_tree.is_none());
-    let message: ClientMlsRcsMessage =
-        proto::decode(&output.to_client_message(Some(b"keys")).unwrap()).unwrap();
+    assert!(output.private_message.is_none());
+    let message: ClientMlsRcsMessage = proto::decode(&output.to_client_message().unwrap()).unwrap();
     match message.payload {
         Some(client_mls_rcs_message::Payload::CommitBundle(bundle)) => {
-            assert_eq!(bundle.private_message, b"keys");
+            assert!(bundle.private_message.is_empty());
+            assert_eq!(bundle.epoch_authenticator, output.epoch_authenticator);
         }
         _ => panic!("expected a CommitBundle"),
     }
@@ -1066,8 +1065,7 @@ fn welcome_without_ratchet_tree() {
     let output = alice_conversation
         .add_members(&alice, &[&key_package])
         .unwrap();
-    let message: ClientMlsRcsMessage =
-        proto::decode(&output.to_client_message(None).unwrap()).unwrap();
+    let message: ClientMlsRcsMessage = proto::decode(&output.to_client_message().unwrap()).unwrap();
     match message.payload {
         Some(client_mls_rcs_message::Payload::WelcomeCommitBundle(bundle)) => {
             assert!(bundle.ratchet_tree.is_empty())
@@ -1254,4 +1252,523 @@ fn reserved_extension_types() {
     assert!(capabilities
         .proposals()
         .contains(&openmls::prelude::ProposalType::from(0xF020)));
+}
+
+/// Types of the extensions of a GroupInfo for the Conversation Focus
+fn group_info_extension_types(group_info: &[u8]) -> Vec<u16> {
+    match MlsMessageIn::tls_deserialize_exact(group_info)
+        .unwrap()
+        .extract()
+    {
+        MlsMessageBodyIn::GroupInfo(group_info) => group_info
+            .extensions()
+            .iter()
+            .map(|extension| u16::from(extension.extension_type()))
+            .collect(),
+        _ => panic!("expected a GroupInfo"),
+    }
+}
+
+fn accepted(epoch: EpochIdentifier) -> Vec<u8> {
+    proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::AcceptedMlsRcsMessage(
+            AcceptedMlsRcsMessage {
+                message_id: "cpim".to_string(),
+                previous_epoch_identifier: Some(epoch),
+            },
+        )),
+    })
+}
+
+/// Has the Conversation Focus accept a Commit of `committer` and deliver it to
+/// the others; returns what each of the others got
+fn deliver(
+    committer: (&mut MlsConversation, &MlsClient),
+    others: Vec<(&mut MlsConversation, &MlsClient)>,
+    output: &CommitOutput,
+) -> Vec<Vec<IncomingMessage>> {
+    let (conversation, client) = committer;
+    let before = conversation.epoch_identifier();
+    conversation
+        .process_server_message(client, &accepted(before))
+        .unwrap();
+    assert_eq!(
+        conversation.epoch_authenticator(),
+        output.epoch_authenticator
+    );
+
+    let bundle = accept(output);
+    others
+        .into_iter()
+        .map(|(conversation, client)| {
+            let events = conversation.process_commit_bundle(client, &bundle).unwrap();
+            assert_eq!(
+                conversation.epoch_authenticator(),
+                output.epoch_authenticator
+            );
+            events
+        })
+        .collect()
+}
+
+#[test]
+fn continuity_token() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (alice_conversation, bob_conversation, group_info) = establish(&alice, &bob);
+    let group_id = alice_conversation.group_id().to_vec();
+
+    // made with the group, and sent along in the Welcome
+    let token = alice.group_metadata(&group_id).unwrap().continuity_token;
+    assert_eq!(token.len(), metadata::CONTINUITY_TOKEN_LENGTH);
+    assert_eq!(
+        bob.group_metadata(&group_id).unwrap().continuity_token,
+        token
+    );
+    assert_eq!(
+        bob_conversation
+            .group_metadata(&bob)
+            .unwrap()
+            .continuity_token,
+        token
+    );
+
+    // the GroupInfo for the Conversation Focus commits to it, at its epoch
+    let epoch_authenticator = alice_conversation.epoch_authenticator().to_vec();
+    for client in [&alice, &bob] {
+        assert_eq!(
+            client
+                .continuity_token_matches(&group_info, &epoch_authenticator)
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            client
+                .continuity_token_matches(&group_info, b"another epoch")
+                .unwrap(),
+            Some(false)
+        );
+    }
+    let carol = client("carol");
+    assert_eq!(
+        carol
+            .continuity_token_matches(&group_info, &epoch_authenticator)
+            .unwrap(),
+        None
+    );
+
+    // kept for the next Era, unless renewed
+    alice_conversation.delete(&alice).unwrap();
+    let next_era = alice.create_conversation(Some(&group_id), 3).unwrap();
+    assert_eq!(
+        next_era.group_metadata(&alice).unwrap().continuity_token,
+        token
+    );
+    let renewed = alice.renew_continuity_token(&group_id).unwrap();
+    assert_ne!(renewed, token);
+    assert_eq!(
+        alice
+            .continuity_token_matches(&group_info, &epoch_authenticator)
+            .unwrap(),
+        Some(false)
+    );
+
+    alice.forget_group_metadata(&group_id).unwrap();
+    assert_eq!(
+        alice.group_metadata(&group_id).unwrap(),
+        proto::GroupMetadataKeys::default()
+    );
+}
+
+#[test]
+fn group_icon_and_subject() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    let icon = b"\x89PNG not really";
+    let (output, encrypted) = alice_conversation
+        .set_group_icon(&alice, icon, "image/png", b"msg-icon")
+        .unwrap();
+    assert!(output.private_message.is_some());
+
+    // the GroupInfo of every Commit commits to the continuity token, at the new epoch
+    assert_eq!(
+        alice
+            .continuity_token_matches(&output.group_info, &output.epoch_authenticator)
+            .unwrap(),
+        Some(true)
+    );
+    let message: ClientMlsRcsMessage = proto::decode(&output.to_client_message().unwrap()).unwrap();
+    match message.payload {
+        Some(client_mls_rcs_message::Payload::CommitBundle(bundle)) => {
+            assert_eq!(Some(bundle.private_message), output.private_message)
+        }
+        _ => panic!("expected a CommitBundle"),
+    }
+
+    // the new key is only kept once the Commit is accepted
+    assert!(alice
+        .group_metadata(alice_conversation.group_id())
+        .unwrap()
+        .group_subject_icon_keys
+        .is_none());
+
+    let events = deliver(
+        (&mut alice_conversation, &alice),
+        vec![(&mut bob_conversation, &bob)],
+        &output,
+    );
+    match events[0].as_slice() {
+        [IncomingMessage::Commit { .. }, IncomingMessage::GroupMetadataKeys {
+            sender,
+            icon,
+            subject,
+            continuity_token_matches,
+        }] => {
+            assert_eq!(sender.serialized_content(), b"alice");
+            assert!(*icon);
+            assert!(!*subject);
+            assert_eq!(*continuity_token_matches, None);
+        }
+        _ => panic!("expected a Commit with group metadata keys"),
+    }
+
+    for (conversation, client) in [(&alice_conversation, &alice), (&bob_conversation, &bob)] {
+        assert!(conversation.group_metadata_in_sync(client).unwrap());
+        let keys = conversation.group_metadata(client).unwrap();
+        let key = keys.group_subject_icon_keys.unwrap().icon.unwrap();
+        assert_eq!(key.file_name, GROUP_ICON_FILE_NAME);
+        assert_eq!(key.content_type, "image/png");
+        assert_eq!(
+            file::decrypt_file(
+                &encrypted.ciphertext,
+                GROUP_ICON_FILE_NAME,
+                &key.encryption_info.unwrap()
+            )
+            .unwrap(),
+            icon
+        );
+    }
+
+    // the key generation used for the keys is not used again
+    let message = alice_conversation
+        .encrypt_cpim(&alice, b"hi", b"msg-1", b"")
+        .unwrap();
+    match bob_conversation.process(&bob, &message).unwrap() {
+        IncomingMessage::Application { data, .. } => {
+            assert_eq!(
+                wire::decode::<SecretPayload>(&data).unwrap().key_generation,
+                1
+            )
+        }
+        _ => panic!("expected an application message"),
+    }
+
+    // a subject from bob, delivered back to him as well
+    let (output, encrypted) = bob_conversation
+        .set_group_subject(&bob, "Holidays", b"msg-subject")
+        .unwrap();
+    let bundle = accept(&output);
+    assert!(matches!(
+        bob_conversation
+            .process_commit_bundle(&bob, &bundle)
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Commit { .. }, IncomingMessage::Own]
+    ));
+    match alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { .. }, IncomingMessage::GroupMetadataKeys { icon, subject, .. }] =>
+        {
+            assert!(!*icon);
+            assert!(*subject);
+        }
+        _ => panic!("expected a Commit with group metadata keys"),
+    }
+    let keys = alice_conversation.group_metadata(&alice).unwrap();
+    let keys = keys.group_subject_icon_keys.unwrap();
+    assert!(keys.icon.is_some());
+    let subject = keys.subject.unwrap();
+    assert_eq!(subject.content_type, metadata::SUBJECT_CONTENT_TYPE);
+    assert_eq!(
+        file::decrypt_file(
+            &encrypted.ciphertext,
+            GROUP_SUBJECT_FILE_NAME,
+            &subject.encryption_info.unwrap()
+        )
+        .unwrap(),
+        b"Holidays"
+    );
+
+    // deleting the icon drops its key everywhere
+    let output = bob_conversation.delete_group_icon(&bob).unwrap();
+    assert!(output.private_message.is_none());
+    deliver(
+        (&mut bob_conversation, &bob),
+        vec![(&mut alice_conversation, &alice)],
+        &output,
+    );
+    for (conversation, client) in [(&alice_conversation, &alice), (&bob_conversation, &bob)] {
+        let keys = conversation.group_metadata(client).unwrap();
+        let keys = keys.group_subject_icon_keys.unwrap();
+        assert!(keys.icon.is_none());
+        assert!(keys.subject.is_some());
+        assert!(conversation.group_metadata_in_sync(client).unwrap());
+    }
+    assert_eq!(
+        alice_conversation.delete_group_icon(&alice).err(),
+        Some(ErrorKind::InvalidState)
+    );
+}
+
+#[test]
+fn group_metadata_keys_for_others() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let group_id = alice_conversation.group_id().to_vec();
+
+    let (output, _) = alice_conversation
+        .set_group_icon(&alice, b"icon", "image/png", b"msg-icon")
+        .unwrap();
+    deliver(
+        (&mut alice_conversation, &alice),
+        vec![(&mut bob_conversation, &bob)],
+        &output,
+    );
+
+    // a new member gets the keys and the token with the Welcome
+    let carol = client("carol");
+    let key_package = carol.generate_key_package(false).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_package])
+        .unwrap();
+    deliver(
+        (&mut alice_conversation, &alice),
+        vec![(&mut bob_conversation, &bob)],
+        &output,
+    );
+    let mut carol_conversation = carol
+        .join_conversation(
+            output.welcome.as_ref().unwrap(),
+            output.ratchet_tree.as_ref().unwrap(),
+        )
+        .unwrap();
+    assert!(carol_conversation.group_metadata_in_sync(&carol).unwrap());
+
+    // which never go in the GroupInfo for the Conversation Focus
+    let extension_types = group_info_extension_types(&output.group_info);
+    assert!(extension_types.contains(&EXTENSION_CONTINUITY_TOKEN_COMMITMENT));
+    for secret in [
+        EXTENSION_ICON_KEY,
+        EXTENSION_SUBJECT_KEY,
+        EXTENSION_CONTINUITY_TOKEN,
+    ] {
+        assert!(!extension_types.contains(&secret));
+    }
+    assert_eq!(
+        carol.group_metadata(&group_id).unwrap(),
+        alice.group_metadata(&group_id).unwrap()
+    );
+
+    // carol loses them, and asks for them
+    carol.forget_group_metadata(&group_id).unwrap();
+    assert!(!carol_conversation.group_metadata_in_sync(&carol).unwrap());
+    assert_eq!(
+        alice_conversation
+            .send_group_metadata_keys(&alice, b"msg-keys")
+            .err(),
+        Some(ErrorKind::InvalidState)
+    );
+
+    let output = carol_conversation
+        .request_group_metadata_keys(&carol)
+        .unwrap();
+    assert!(output.private_message.is_none());
+    deliver(
+        (&mut carol_conversation, &carol),
+        vec![
+            (&mut alice_conversation, &alice),
+            (&mut bob_conversation, &bob),
+        ],
+        &output,
+    );
+    assert!(alice_conversation.group_metadata_keys_requested());
+    assert_eq!(
+        carol_conversation.request_group_metadata_keys(&carol).err(),
+        Some(ErrorKind::InvalidState)
+    );
+
+    // bob answers
+    let output = bob_conversation
+        .send_group_metadata_keys(&bob, b"msg-keys")
+        .unwrap();
+    assert!(output.private_message.is_some());
+    let events = deliver(
+        (&mut bob_conversation, &bob),
+        vec![
+            (&mut carol_conversation, &carol),
+            (&mut alice_conversation, &alice),
+        ],
+        &output,
+    );
+    match events[0].as_slice() {
+        [IncomingMessage::Commit { .. }, IncomingMessage::GroupMetadataKeys {
+            icon,
+            continuity_token_matches,
+            ..
+        }] => {
+            assert!(*icon);
+            // carol had none left, and keeps it
+            assert_eq!(*continuity_token_matches, Some(true));
+        }
+        _ => panic!("expected a Commit with group metadata keys"),
+    }
+    assert!(carol_conversation.group_metadata_in_sync(&carol).unwrap());
+    assert_eq!(
+        carol.group_metadata(&group_id).unwrap(),
+        alice.group_metadata(&group_id).unwrap()
+    );
+    for conversation in [&alice_conversation, &bob_conversation, &carol_conversation] {
+        assert!(!conversation.group_metadata_keys_requested());
+    }
+
+    // a continuity token that differs is reported, and the one kept stays
+    let renewed = alice.renew_continuity_token(&group_id).unwrap();
+    let output = carol_conversation
+        .request_group_metadata_keys(&carol)
+        .unwrap();
+    deliver(
+        (&mut carol_conversation, &carol),
+        vec![
+            (&mut alice_conversation, &alice),
+            (&mut bob_conversation, &bob),
+        ],
+        &output,
+    );
+    let output = bob_conversation
+        .send_group_metadata_keys(&bob, b"msg-keys-2")
+        .unwrap();
+    let events = deliver(
+        (&mut bob_conversation, &bob),
+        vec![(&mut alice_conversation, &alice)],
+        &output,
+    );
+    match events[0].as_slice() {
+        [IncomingMessage::Commit { .. }, IncomingMessage::GroupMetadataKeys {
+            continuity_token_matches,
+            ..
+        }] => assert_eq!(*continuity_token_matches, Some(false)),
+        _ => panic!("expected a Commit with group metadata keys"),
+    }
+    assert_eq!(
+        alice.group_metadata(&group_id).unwrap().continuity_token,
+        renewed
+    );
+}
+
+#[test]
+fn group_metadata_in_new_era() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let group_id = alice_conversation.group_id().to_vec();
+
+    let (output, _) = alice_conversation
+        .set_group_subject(&alice, "Team", b"msg-subject")
+        .unwrap();
+    deliver(
+        (&mut alice_conversation, &alice),
+        vec![(&mut bob_conversation, &bob)],
+        &output,
+    );
+
+    // the next Era commits to the subject kept, and sends its key along
+    alice_conversation.delete(&alice).unwrap();
+    bob_conversation.delete(&bob).unwrap();
+    let mut alice_conversation = alice.create_conversation(Some(&group_id), 3).unwrap();
+    assert!(alice_conversation.group_metadata_in_sync(&alice).unwrap());
+
+    bob.forget_group_metadata(&group_id).unwrap();
+    let key_package = bob.generate_key_package(false).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_package])
+        .unwrap();
+    let bob_conversation = bob
+        .join_conversation(
+            output.welcome.as_ref().unwrap(),
+            output.ratchet_tree.as_ref().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(bob_conversation.era(), Some(3));
+    assert!(bob_conversation.group_metadata_in_sync(&bob).unwrap());
+    assert_eq!(
+        bob.group_metadata(&group_id).unwrap(),
+        alice.group_metadata(&group_id).unwrap()
+    );
+}
+
+#[test]
+fn commit_bundles_apply_whole() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    let (output, _) = alice_conversation
+        .set_group_icon(&alice, b"icon", "image/png", b"msg-icon")
+        .unwrap();
+
+    // a private message that cannot be read voids the Commit with it
+    let mut bundle = accept(&output);
+    let mut broken = output.private_message.clone().unwrap();
+    let last = broken.len() - 1;
+    broken[last] ^= 1;
+    bundle.private_message = broken;
+    let epoch = bob_conversation.epoch_identifier();
+    assert!(bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .is_err());
+    assert_eq!(bob_conversation.epoch_identifier(), epoch);
+    assert!(bob
+        .group_metadata(bob_conversation.group_id())
+        .unwrap()
+        .group_subject_icon_keys
+        .is_none());
+
+    deliver(
+        (&mut alice_conversation, &alice),
+        vec![(&mut bob_conversation, &bob)],
+        &output,
+    );
+    assert!(bob_conversation.group_metadata_in_sync(&bob).unwrap());
+
+    // a Commit discarded leaves the keys as they were
+    let keys = alice_conversation.group_metadata(&alice).unwrap();
+    alice_conversation
+        .set_group_icon(&alice, b"other icon", "image/png", b"msg-icon-2")
+        .unwrap();
+    alice_conversation.discard_pending_commit(&alice).unwrap();
+    assert_eq!(alice_conversation.group_metadata(&alice).unwrap(), keys);
+    assert!(alice_conversation.group_metadata_in_sync(&alice).unwrap());
+
+    // and so does a Commit of another member coming first
+    alice_conversation
+        .set_group_icon(&alice, b"other icon", "image/png", b"msg-icon-3")
+        .unwrap();
+    let output = bob_conversation.update_keys(&bob).unwrap();
+    deliver(
+        (&mut bob_conversation, &bob),
+        vec![(&mut alice_conversation, &alice)],
+        &output,
+    );
+    assert!(!alice_conversation.has_pending_commit());
+    assert_eq!(alice_conversation.group_metadata(&alice).unwrap(), keys);
+    let message = alice_conversation
+        .encrypt_cpim(&alice, b"hi", b"msg-1", b"")
+        .unwrap();
+    assert!(bob_conversation.decrypt(&bob, &message, b"msg-1").is_ok());
 }

@@ -22,6 +22,7 @@ Groups are set up as GSMA PRD RCC.16 (v4.0) requires: Era extension, Commits and
 - Client Certificate validation (Annex A.4.1): `RcsCredentialValidator` checks X.509 credentials against the agreed roots, the certificate profiles, the ParticipantInformation signature and key rolls, and the Vendor ID, and applies the rules for KDS query results, additions and certificate updates. Revocation of intermediate CAs is checked through a callback, fetching CRLs is left to the caller.
 - Re-Sent Messages after a Fail to Decrypt (sections 10.3, 10.4, Annex C.4): the Original Message is sealed with HPKE to the leaf key of the client that failed, then encrypted to the group with its HMAC, which the members that decrypted the Original Message check with `resent_matches()`. 1-to-1 group ids are GUIDs in 32 hex digits so they fill `group_id[32]` as they are; other group ids are hashed with SHA-256 to fit, which RCC.16 does not define. A Re-Sent Message can only be read with the leaf key it was sealed to, so before a key update of the receiver.
 - the failure reasons of Negative-Delivery IMDNs (section 7.7.2), which are also how an FTD is sent: reading the server or client reason out of an IMDN, and building the `<status>` of a client generated one
+- encrypted group icon and subject, the continuity token and the recovery of their keys (sections 7.11.3 to 7.11.12, 7.13.4, 8.3.1, 9.7.1, 10.5): setting and deleting the icon and subject, their keys and the continuity token in Welcomes, the commitment to the token in every GroupInfo, asking for and sending missing keys, and checking the token against a GroupInfo of the Conversation Focus. The keys and the token are kept per group id and carry over from one Era to the next.
 
 Where RCC.16 v4.0 is silent or contradicts itself, this library:
 
@@ -31,10 +32,16 @@ Where RCC.16 v4.0 is silent or contradicts itself, this library:
 - fills the key_generation of SecretPayloads by counting the messages it encrypted in the epoch, but does not check it on receipt, as OpenMLS does not tell the generation of a received message
 - still checks the file_length_hint of Annex C.3 when present, though v4.0 dropped it from FileEncryptionInfo
 - applies a Commit of its own when the Conversation Focus accepts it, and also takes it being delivered back, as sections 6.2.4 and 9.5.1 differ on which happens
+- puts the commitments, the keys and the continuity token in extension_data as they are, without a further length prefix, and the icon key, like the subject key, as a FileInfo with its field set (section 9.7.1.1.2 has a bare FileMetadata, which is accepted too)
+- computes the continuity token commitment as RFC 9420's RefHash with the label as given, "Continuity Token GroupInfo Commitment"
+- does not check the Message-ID bound to a PrivateMessage bundled with a Commit, as the CPIM message the Conversation Focus delivers it in is not known
+
+OpenMLS puts the same extensions in the GroupInfo of a Welcome and in the one for the Conversation Focus, and has no way to encrypt in the epoch a pending Commit leads to. The GroupInfo for the Conversation Focus and a bundled PrivateMessage are therefore made on a copy of the client with the Commit applied; once the Commit is applied for real, the key generations the copy used are skipped. Commit bundles with more than one message are tried out on a copy too, so that they apply whole or not at all.
 
 Not covered yet:
 
-- group icon and subject keys, the continuity token and the recovery of group metadata keys (sections 7.11.3 to 7.11.12, 7.13, 9.7.1, 10.5): these keys have to go in the Welcome but not in the GroupInfo for the Conversation Focus, which OpenMLS builds from the same extensions, and `GroupMetadataKeys` and `GroupMetadataKeysRequested` are left incomplete
+- asking for group metadata keys within the External Commit of a self-heal or the GroupInfo of a new Era (section 10.5.2); `request_group_metadata_keys()` makes a Commit of its own. `GroupMetadataKeys` is cut off in RCC.16 v4.0 and taken to end after its two fields; `GroupMetadataKeysRequested` is not defined, and not sent.
+- the XML of CPM group data requests and of conference-info NOTIFYs for the encrypted subject and icon (section 7.13)
 - enhanced self-healing from an MlsEnhancedGroupInfo (section 10.1.2)
 - the `self_remove` and `server_remove` proposals: OpenMLS knows SelfRemove only under its IETF code, not RCC.16's 0xF003, and cannot apply proposal types it doesn't know. Leaving still uses a Remove proposal, which a Conversation Focus following v4.0 refuses (section 6.2.3).
 - the identity verification code (Annex C.5): `HASH_TO_DIGITS` is not defined

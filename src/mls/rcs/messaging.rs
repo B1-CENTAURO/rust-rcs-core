@@ -67,7 +67,7 @@ impl MlsConversation {
     }
 
     /// Encrypts a SecretPayload of `payload_type` (RCC.16 sections 7.5.1 to 7.5.3)
-    pub(super) fn encrypt_secret_payload(
+    pub(crate) fn encrypt_secret_payload(
         &mut self,
         client: &MlsClient,
         payload_type: SecretPayloadType,
