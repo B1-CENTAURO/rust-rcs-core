@@ -63,7 +63,7 @@ fn establish(
         .collect();
     let key_packages: Vec<&[u8]> = key_packages.iter().map(|k| k.as_slice()).collect();
 
-    let mut conversation = creator.create_conversation(None).unwrap();
+    let mut conversation = creator.create_conversation(None, 0).unwrap();
     let output = conversation.add_members(creator, &key_packages).unwrap();
     conversation.merge_pending_commit(creator).unwrap();
 
@@ -82,7 +82,7 @@ fn decrypt(
     message: &[u8],
 ) -> (Vec<u8>, Vec<u8>) {
     match conversation.process(client, message).unwrap() {
-        IncomingMessage::Application { sender, data } => (identity(&sender).to_vec(), data),
+        IncomingMessage::Application { sender, data, .. } => (identity(&sender).to_vec(), data),
         _ => panic!("expected an application message"),
     }
 }
@@ -264,13 +264,13 @@ fn pending_commit_lifecycle() {
     assert_eq!(conversation.epoch(), epoch);
     assert_eq!(conversation.members().len(), 2);
 
-    let mut conversation = alice.create_conversation(Some(b"chat-1")).unwrap();
+    let mut conversation = alice.create_conversation(Some(b"chat-1"), 0).unwrap();
     assert_eq!(conversation.group_id(), b"chat-1");
     assert!(conversation.encrypt(&alice, b"alone").is_ok());
 
     // group ids are unique per client
     assert_eq!(
-        alice.create_conversation(Some(b"chat-1")).err(),
+        alice.create_conversation(Some(b"chat-1"), 0).err(),
         Some(ErrorKind::InvalidState)
     );
 }
@@ -302,7 +302,7 @@ fn snapshot_and_restore() {
     let (_, data) = decrypt(&mut alice_conversation, &alice, &reply);
     assert_eq!(data, b"yes");
 
-    let mut other = alice.create_conversation(None).unwrap();
+    let mut other = alice.create_conversation(None, 0).unwrap();
     let output = other.add_members(&alice, &[&key_package]).unwrap();
     other.merge_pending_commit(&alice).unwrap();
     assert!(bob.join_conversation(&output.welcome.unwrap()).is_ok());
@@ -345,11 +345,11 @@ fn key_packages_are_consumed_unless_last_resort() {
     let last_resort = bob.generate_key_package(true).unwrap();
 
     for key_package in [&one_time, &last_resort] {
-        let mut first = alice.create_conversation(None).unwrap();
+        let mut first = alice.create_conversation(None, 0).unwrap();
         let output = first.add_members(&alice, &[key_package]).unwrap();
         assert!(bob.join_conversation(&output.welcome.unwrap()).is_ok());
 
-        let mut second = alice.create_conversation(None).unwrap();
+        let mut second = alice.create_conversation(None, 0).unwrap();
         let output = second.add_members(&alice, &[key_package]).unwrap();
         let joined = bob.join_conversation(&output.welcome.unwrap());
 
@@ -371,7 +371,7 @@ fn validator_guards_membership() {
     let lenient = client("lenient");
 
     // adding a refused identity
-    let mut conversation = alice.create_conversation(None).unwrap();
+    let mut conversation = alice.create_conversation(None, 0).unwrap();
     let key_package = mallory.generate_key_package(false).unwrap();
     assert_eq!(
         conversation.add_members(&alice, &[&key_package]).err(),
@@ -379,7 +379,7 @@ fn validator_guards_membership() {
     );
 
     // joining a group that contains a refused identity
-    let mut conversation = mallory.create_conversation(None).unwrap();
+    let mut conversation = mallory.create_conversation(None, 0).unwrap();
     let key_package = bob.generate_key_package(false).unwrap();
     let output = conversation.add_members(&mallory, &[&key_package]).unwrap();
     assert_eq!(
@@ -410,7 +410,7 @@ fn routing_and_malformed_input() {
     let key_package = bob.generate_key_package(false).unwrap();
     assert!(matches!(inspect(&key_package), Ok(MessageKind::KeyPackage)));
 
-    let mut conversation = alice.create_conversation(Some(b"route-me")).unwrap();
+    let mut conversation = alice.create_conversation(Some(b"route-me"), 0).unwrap();
     let output = conversation.add_members(&alice, &[&key_package]).unwrap();
     conversation.merge_pending_commit(&alice).unwrap();
 
@@ -440,7 +440,7 @@ fn routing_and_malformed_input() {
     );
 
     let other = alice
-        .create_conversation(None)
+        .create_conversation(None, 0)
         .unwrap()
         .encrypt(&alice, b"x");
     assert_eq!(
@@ -542,7 +542,7 @@ fn other_credential_types() {
 
     // bob can bring alice into a group of his own as well
     let key_package = alice.generate_key_package(false).unwrap();
-    let mut conversation = bob.create_conversation(None).unwrap();
+    let mut conversation = bob.create_conversation(None, 0).unwrap();
     let output = conversation.add_members(&bob, &[&key_package]).unwrap();
     assert!(alice.join_conversation(&output.welcome.unwrap()).is_ok());
 

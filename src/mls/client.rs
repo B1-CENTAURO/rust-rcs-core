@@ -17,8 +17,9 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 
-use super::conversation::MlsConversation;
+use super::conversation::{CommitOutput, MlsConversation};
 use super::provider::{self, MlsProvider};
+use super::rcs;
 use super::{fail, ErrorKind, Result};
 
 const SNAPSHOT_MAGIC: &[u8] = b"RCSMLS";
@@ -34,25 +35,14 @@ pub trait CredentialValidator: Send + Sync {
     fn validate(&self, credential: &Credential, signature_key: &[u8]) -> bool;
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct MlsConfig {
-    /// Number of past epochs whose secrets are kept, so that messages sent before
-    /// a Commit but delivered after it can still be decrypted
-    pub max_past_epochs: usize,
-    /// Application messages are padded to a multiple of this many bytes, hiding
-    /// their exact length; 0 disables padding
-    pub padding_size: usize,
-}
-
-impl Default for MlsConfig {
-    fn default() -> MlsConfig {
-        MlsConfig {
-            // SIP MESSAGE and MSRP give no ordering guarantee relative to each other,
-            // so allow for some reordering around Commits
-            max_past_epochs: 3,
-            padding_size: 0,
-        }
-    }
+    /// Cap on the number of past epochs whose secrets are kept, so that messages
+    /// sent before a Commit but delivered after it can still be decrypted
+    ///
+    /// None keeps them until `MlsConversation::prune_past_epochs()` drops them;
+    /// RCC.16 requires keeping them for at least `rcs::PAST_EPOCH_RETENTION`.
+    pub max_past_epochs: Option<usize>,
 }
 
 /// One MLS client, i.e. one device of a user
@@ -220,19 +210,57 @@ impl MlsClient {
         self.validator.as_ref()
     }
 
-    /// Leaf node capabilities
+    /// Leaf node capabilities, covering the extensions and proposals of RCC.16
     ///
     /// OpenMLS only lists basic credentials by default, while every member has to
     /// support the credential types of all others. Whether a credential is trusted
     /// is up to the CredentialValidator, so all types this client can carry are listed.
-    fn capabilities(&self, extensions: &[ExtensionType]) -> Capabilities {
+    fn capabilities(&self, last_resort: bool) -> Capabilities {
         let mut credentials = vec![CredentialType::Basic, CredentialType::X509];
         let own = self.credential.credential.credential_type();
         if !credentials.contains(&own) {
             credentials.push(own);
         }
 
-        Capabilities::new(None, None, Some(extensions), None, Some(&credentials))
+        let mut extensions: Vec<ExtensionType> = rcs::EXTENSIONS
+            .iter()
+            .map(|e| ExtensionType::from(*e))
+            .collect();
+        if last_resort {
+            extensions.push(ExtensionType::LastResort);
+        }
+
+        let proposals: Vec<ProposalType> = rcs::PROPOSALS
+            .iter()
+            .map(|p| ProposalType::from(*p))
+            .collect();
+
+        Capabilities::new(
+            None,
+            None,
+            Some(&extensions),
+            Some(&proposals),
+            Some(&credentials),
+        )
+    }
+
+    fn past_epoch_deletion_policy(&self) -> PastEpochDeletionPolicy {
+        match self.config.max_past_epochs {
+            Some(max_past_epochs) => PastEpochDeletionPolicy::MaxEpochs(max_past_epochs),
+            None => PastEpochDeletionPolicy::KeepAll,
+        }
+    }
+
+    /// Handshake messages go out as PublicMessages, which the Conversation Focus
+    /// has to be able to validate (RCC.16 section 6.2.6), and application messages
+    /// are padded to `padding_size`
+    pub(crate) fn join_config(&self, padding_size: usize) -> MlsGroupJoinConfig {
+        MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .set_past_epoch_deletion_policy(self.past_epoch_deletion_policy())
+            .padding_size(padding_size)
+            .use_ratchet_tree_extension(true)
+            .build()
     }
 
     /// Generates a KeyPackage others can use to add this client to a group,
@@ -241,13 +269,10 @@ impl MlsClient {
     /// Its private part is kept until a Welcome consumes it. A `last_resort`
     /// KeyPackage is never consumed, and serves when no other one is left.
     pub fn generate_key_package(&self, last_resort: bool) -> Result<Vec<u8>> {
-        let mut builder = KeyPackage::builder();
+        let mut builder =
+            KeyPackage::builder().leaf_node_capabilities(self.capabilities(last_resort));
         if last_resort {
-            builder = builder
-                .mark_as_last_resort()
-                .leaf_node_capabilities(self.capabilities(&[ExtensionType::LastResort]));
-        } else {
-            builder = builder.leaf_node_capabilities(self.capabilities(&[]));
+            builder = builder.mark_as_last_resort();
         }
 
         let bundle = builder
@@ -264,15 +289,29 @@ impl MlsClient {
             .map_err(fail("KeyPackage encoding", ErrorKind::BadFormat))
     }
 
-    /// Creates a group with this client as its only member
+    /// Creates a group with this client as its only member, in Era `era`
     ///
-    /// Without a `group_id` a random one is generated.
-    pub fn create_conversation(&self, group_id: Option<&[u8]>) -> Result<MlsConversation> {
+    /// RCC.16 uses a random GUID as `group_id` for 1-to-1 chats, which is what
+    /// passing None generates, and the Conversation-ID for group chats (section
+    /// 6.1.1). Starting a new Era of a group requires deleting the old one first.
+    pub fn create_conversation(
+        &self,
+        group_id: Option<&[u8]>,
+        era: u32,
+    ) -> Result<MlsConversation> {
+        let era = Extension::Unknown(
+            rcs::EXTENSION_ERA,
+            UnknownExtension(era.to_be_bytes().to_vec()),
+        );
+        let extensions =
+            Extensions::single(era).map_err(fail("Era extension", ErrorKind::InvalidState))?;
+
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(self.ciphersuite)
-            .capabilities(self.capabilities(&[]))
-            .max_past_epochs(self.config.max_past_epochs)
-            .padding_size(self.config.padding_size)
+            .capabilities(self.capabilities(false))
+            .with_group_context_extensions(extensions)
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .set_past_epoch_deletion_policy(self.past_epoch_deletion_policy())
             .use_ratchet_tree_extension(true)
             .build();
 
@@ -306,14 +345,9 @@ impl MlsClient {
             _ => return Err(ErrorKind::UnexpectedMessage),
         };
 
-        let config = MlsGroupJoinConfig::builder()
-            .max_past_epochs(self.config.max_past_epochs)
-            .padding_size(self.config.padding_size)
-            .use_ratchet_tree_extension(true)
-            .build();
-
-        let builder = StagedWelcome::build_from_welcome(&self.provider, &config, welcome)
-            .map_err(fail("Welcome processing", ErrorKind::Rejected))?;
+        let builder =
+            StagedWelcome::build_from_welcome(&self.provider, &self.join_config(0), welcome)
+                .map_err(fail("Welcome processing", ErrorKind::Rejected))?;
 
         // being added again to a group this client was removed from earlier; a
         // group still active locally is never replaced
@@ -330,13 +364,8 @@ impl MlsClient {
             .build()
             .map_err(fail("Welcome processing", ErrorKind::Rejected))?;
 
-        for member in staged_welcome.members() {
-            if !self
-                .validator
-                .validate(&member.credential, &member.signature_key)
-            {
-                return Err(ErrorKind::InvalidCredential);
-            }
+        if !self.members_valid(staged_welcome.members()) {
+            return Err(ErrorKind::InvalidCredential);
         }
 
         let group = staged_welcome
@@ -344,6 +373,98 @@ impl MlsClient {
             .map_err(fail("joining group", ErrorKind::Storage))?;
 
         Ok(MlsConversation::new(group))
+    }
+
+    /// Self-heals by re-joining a group through an External Commit, after losing
+    /// or corrupting its local state (RCC.16 section 10.1.1)
+    ///
+    /// `group_info` is what the Conversation Focus returned to an
+    /// MLS-Group-Info-Pull INFO request. Any local state of the group is dropped.
+    /// Unlike other Commits the External Commit is applied locally right away;
+    /// should the Conversation Focus reject it, self-healing has to start over.
+    pub fn rejoin_conversation(
+        &self,
+        group_info: &rcs::proto::MlsGroupInfo,
+    ) -> Result<(MlsConversation, CommitOutput)> {
+        let message = MlsMessageIn::tls_deserialize_exact(&group_info.group_info)
+            .map_err(fail("GroupInfo decoding", ErrorKind::BadFormat))?;
+
+        let verifiable_group_info = match message.extract() {
+            MlsMessageBodyIn::GroupInfo(group_info) => group_info,
+            _ => return Err(ErrorKind::UnexpectedMessage),
+        };
+
+        let group_id = verifiable_group_info.group_id().clone();
+        if let Ok(Some(mut old_group)) = MlsGroup::load(self.provider.storage(), &group_id) {
+            old_group
+                .delete(self.provider.storage())
+                .map_err(fail("deleting group", ErrorKind::Storage))?;
+        }
+
+        let mut builder = MlsGroup::external_commit_builder().with_config(self.join_config(0));
+        if !group_info.ratchet_tree.is_empty() {
+            let ratchet_tree = RatchetTreeIn::tls_deserialize_exact(&group_info.ratchet_tree)
+                .map_err(fail("ratchet tree decoding", ErrorKind::BadFormat))?;
+            builder = builder.with_ratchet_tree(ratchet_tree);
+        }
+
+        let (group, bundle) = builder
+            .build_group(
+                &self.provider,
+                verifiable_group_info,
+                self.credential.clone(),
+            )
+            .map_err(fail("External Commit", ErrorKind::Rejected))?
+            .leaf_node_parameters(
+                LeafNodeParameters::builder()
+                    .with_capabilities(self.capabilities(false))
+                    .build(),
+            )
+            .load_psks(self.provider.storage())
+            .map_err(fail("External Commit", ErrorKind::Storage))?
+            .build(
+                self.provider.rand(),
+                self.provider.crypto(),
+                &self.signer,
+                |_| true,
+            )
+            .map_err(fail("External Commit", ErrorKind::Rejected))?
+            .finalize(&self.provider)
+            .map_err(fail("External Commit", ErrorKind::Storage))?;
+
+        let mut conversation = MlsConversation::new(group);
+
+        if !self.members_valid(conversation.mls_group().members()) {
+            conversation.delete(self)?;
+            return Err(ErrorKind::InvalidCredential);
+        }
+
+        // OpenMLS applies External Commits right away, unlike other Commits
+        let (commit, _, group_info) = bundle.into_contents();
+        let commit = commit
+            .to_bytes()
+            .map_err(fail("Commit encoding", ErrorKind::BadFormat))?;
+        let group_info = MlsMessageOut::from(group_info.ok_or(ErrorKind::InvalidState)?)
+            .to_bytes()
+            .map_err(fail("GroupInfo encoding", ErrorKind::BadFormat))?;
+
+        let output = CommitOutput {
+            commit: commit.clone(),
+            welcome: None,
+            group_info,
+            epoch_authenticator: conversation.epoch_authenticator().to_vec(),
+            ratchet_tree: None,
+        };
+        conversation.applied_commit = Some(commit);
+
+        Ok((conversation, output))
+    }
+
+    fn members_valid(&self, mut members: impl Iterator<Item = Member>) -> bool {
+        members.all(|member| {
+            self.validator
+                .validate(&member.credential, &member.signature_key)
+        })
     }
 
     /// Loads a group this client is a member of from local state

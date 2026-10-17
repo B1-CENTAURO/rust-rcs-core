@@ -13,7 +13,21 @@ Also, some code are half way through the sync-async conversion and require clean
 
 The `e2ee` feature adds the `mls` module, an MLS (RFC 9420) engine built on OpenMLS that covers identities, KeyPackages, group lifecycle, message protection and state persistence. It needs rustc 1.91 or newer.
 
-What it does not cover yet is how MLS is applied within RCS, which GSMA PRD RCC.16 defines: Key Distribution Server interaction, how encrypted content is carried in CPIM / MSRP / File Transfer, message state signing and the certificate model. The `+g.gsma.rcs.mls.mls-version` capability indication is defined in GSMA PRD RCC.07 (v15.0 for UP 3.0).
+Groups are set up as GSMA PRD RCC.16 (v3.0) requires: Era extension, Commits and Proposals as PublicMessages, past epochs kept until pruned, PADME padding. `mls::rcs` adds what RCC.16 and RCC.07 (v15.0) define on top:
+
+- content types, CPIM headers, SIP headers, capability feature tags, ACS parameters, extension and proposal code points, unencrypted CPIM header rules, failure reasons
+- the TLS structures (SecretPayload, AuthenticatedData, Verifiable* IMDN content, Commit and Proposal lists, commitments) and protobuf messages (FileInfo, `message/mls-rcs-client`, `message/mls-rcs-server`)
+- encrypted CPIM messages bound to their Message-ID, signed IMDNs (`rcs_signature`), Commit bundles for the Conversation Focus, moving to unencrypted (`end_mls`), self-healing through External Commits
+- file, thumbnail, icon and subject encryption (Annex C.2, C.3)
+
+Not covered yet:
+
+- validating Client Certificates (Annex A.4.1); a `CredentialValidator` has to be supplied
+- Re-Sent Messages after a Fail to Decrypt (Annex C.4): the `group_id[32]` fields don't fit group ids of other lengths
+- the identity verification code (Annex C.5): `HASH_TO_DIGITS` is not defined
+- group icon and subject keys (section 9.7.1): RCC.16 puts them in GroupContext extensions while leaving them out of the GroupInfo, which the GroupInfo signature does not allow
+- the `self_remove` and `server_remove` proposals: OpenMLS cannot apply proposal types it doesn't know; leaving uses a Remove proposal, which section 6.2.3 accepts
+- the interface to the KDS, which RCC.16 leaves vendor specific
 
 ### FAQ
 
