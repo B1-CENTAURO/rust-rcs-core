@@ -115,6 +115,9 @@ impl MsrpChannel {
                                 Ok(chunks)
                             }
 
+                            // the error is known as the chunk is answered, so it goes
+                            // in the response; RFC 4975 section 7.1.4 leaves failure
+                            // REPORTs to errors found later, as at a gateway
                             Err((status_code, comment)) => match failure_report {
                                 ReportFailure::Yes | ReportFailure::Partial => {
                                     Ok(vec![MsrpChunk::new_response_chunk(

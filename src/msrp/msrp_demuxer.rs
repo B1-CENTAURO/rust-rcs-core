@@ -73,6 +73,9 @@ pub struct MsrpDemuxer {
     pub from_path: Vec<u8>,
     pub to_path: Vec<u8>,
     waitlist: Waitlist,
+    // the status of the failure REPORT that failed the session; set and read
+    // with the waitlist locked, so that no message starts after it
+    failure: Arc<Mutex<Option<(u16, String)>>>,
 }
 
 impl MsrpDemuxer {
@@ -81,11 +84,24 @@ impl MsrpDemuxer {
             from_path,
             to_path,
             waitlist: Arc::new(Mutex::new(Vec::new())),
+            failure: Arc::new(Mutex::new(None)),
         }
     }
 
+    /// The status of the failure REPORT that failed this session, if one
+    /// did. RFC 4975 section 7.3.2 has the session treated as failed then:
+    /// the messages pending on it and those started after it end with that
+    /// status, and sending again takes negotiating a new session.
+    pub fn session_failure(&self) -> Option<(u16, String)> {
+        let _guard = self.waitlist.lock().unwrap();
+        self.failure.lock().unwrap().clone()
+    }
+
     /// Sends what `r` reads as one message, in chunks. `c` is called once: with
-    /// 200 when every chunk got a 200 response, otherwise with the failure.
+    /// 200 when every chunk got a 200 response, otherwise with the failure. A
+    /// message that fails while it is being sent is aborted with a chunk
+    /// ending in #. Once the session has failed, see `session_failure`, `c`
+    /// gets its status and nothing is sent.
     pub fn start<R, C>(
         &self,
         from_path: Vec<u8>,
@@ -147,6 +163,7 @@ impl MsrpDemuxer {
         let success_report = success_report && total > 0;
 
         let waitlist = Arc::clone(&self.waitlist);
+        let failure = Arc::clone(&self.failure);
 
         let rt_ = Arc::clone(rt);
 
@@ -155,6 +172,13 @@ impl MsrpDemuxer {
 
             {
                 let mut guard = waitlist.lock().unwrap();
+                let failed = failure.lock().unwrap().clone();
+                if let Some((status_code, reason_phrase)) = failed {
+                    drop(guard);
+                    report(&c, status_code, reason_phrase);
+                    return;
+                }
+
                 guard.push((
                     message_id.clone(),
                     if success_report {
@@ -269,8 +293,9 @@ impl MsrpDemuxer {
     }
 
     /// Takes a REPORT for a message being sent: a success REPORT counts the
-    /// bytes it covers until they are the whole message, a failure REPORT ends
-    /// the message with its status.
+    /// bytes it covers until they are the whole message, a failure REPORT
+    /// fails the session (RFC 4975 section 7.3.2), ending every message on it
+    /// with its status.
     pub fn on_report(&self, message: MsrpChunk) -> Result<(), &'static str> {
         let report_status = match message.get_report_status() {
             Some(report_status) if report_status.ns == 0 => report_status,
@@ -335,10 +360,9 @@ impl MsrpDemuxer {
             return Ok(());
         }
 
-        let (_, _, _, _, c) = guard.remove(i);
-        drop(guard);
-
         if report_status.status_code == 200 {
+            let (_, _, _, _, c) = guard.remove(i);
+            drop(guard);
             report(&c, 200, String::from("Ok"));
         } else {
             let reason_phrase = if let Some(comment) = report_status.comment {
@@ -346,7 +370,15 @@ impl MsrpDemuxer {
             } else {
                 String::from("")
             };
-            report(&c, report_status.status_code, reason_phrase);
+
+            *self.failure.lock().unwrap() =
+                Some((report_status.status_code, reason_phrase.clone()));
+            let callbacks: Vec<Callback> = guard.drain(..).map(|(_, _, _, _, c)| c).collect();
+            drop(guard);
+
+            for c in callbacks {
+                report(&c, report_status.status_code, reason_phrase.clone());
+            }
         }
 
         Ok(())
@@ -410,17 +442,18 @@ impl MsrpDemuxer {
 }
 
 // tracks the transaction of a chunk and queues the chunk, false when the
-// message has already failed and the rest of it should not be sent
+// message has already failed: the chunk then goes out ending in # instead, to
+// abort the message (RFC 4975 section 7.3.2), and the rest is not sent
 async fn send_chunk(
     waitlist: &Waitlist,
     message_id: &[u8],
     transaction_id: Vec<u8>,
-    chunk: MsrpChunk,
+    mut chunk: MsrpChunk,
     last: bool,
     tx: &mpsc::Sender<MsrpChunk>,
     rt: &Arc<Runtime>,
 ) -> bool {
-    {
+    let pending = {
         let mut guard = waitlist.lock().unwrap();
         match guard.iter_mut().find(|(id, _, _, _, _)| id == message_id) {
             Some((_, _, transaction_status_arr, all_sent, _)) => {
@@ -429,9 +462,18 @@ async fn send_chunk(
                     TransactionStatus::AwaitResponseAndTimeout,
                 ));
                 *all_sent = last;
+                true
             }
-            None => return false,
+            None => false,
         }
+    };
+
+    if !pending {
+        if let MsrpChunk::Request(_, _, _, continuation_flag) = &mut chunk {
+            *continuation_flag = ContinuationFlag::Abort;
+        }
+        let _ = tx.send(chunk).await;
+        return false;
     }
 
     match tx.send(chunk).await {
