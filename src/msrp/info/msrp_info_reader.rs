@@ -49,6 +49,7 @@ impl<'a> AsMsrpInfo<'a> for Sdp<'a> {
                         };
 
                         let mut inactive = false;
+                        let mut cema = false;
                         let mut direction = MsrpDirection::SendReceive; // RFC 4566 section 6
                         let mut setup_method = MsrpSetupMethod::Passive;
 
@@ -72,6 +73,8 @@ impl<'a> AsMsrpInfo<'a> for Sdp<'a> {
                             } else if attribute.eq_ignore_ascii_case(b"recvonly") {
                                 inactive = false;
                                 direction = MsrpDirection::ReceiveOnly;
+                            } else if attribute.eq_ignore_ascii_case(b"msrp-cema") {
+                                cema = true;
                             } else if attribute.eq_ignore_ascii_case(b"sendrecv") {
                                 inactive = false;
                                 direction = MsrpDirection::SendReceive;
@@ -122,6 +125,7 @@ impl<'a> AsMsrpInfo<'a> for Sdp<'a> {
                                     None
                                 },
                                 inactive,
+                                cema,
                                 direction,
                                 setup_method,
                                 file_info: if file_selector.len() > 0 && file_transfer_id.len() > 0
