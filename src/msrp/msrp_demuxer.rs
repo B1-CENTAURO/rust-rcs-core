@@ -34,6 +34,10 @@ use super::msrp_chunk::MsrpRequestLine;
 
 const MAX_MSRP_CHUNK_SIZE: usize = 10 * 1024;
 
+// the 30 seconds a chunk's response may take, and as long again for the
+// success REPORTs that follow
+const REPORT_TIMEOUT: Duration = Duration::from_secs(60);
+
 enum DeliveryStatus {
     AwaitPositiveReport(Vec<Range<usize>>, usize),
     AwaitNegativeReport,
@@ -88,7 +92,7 @@ impl MsrpDemuxer {
         to_path: Vec<u8>,
         content_type: Option<Vec<u8>>,
         total: usize,
-        mut r: R,
+        r: R,
         c: C,
         // tx: mpsc::Sender<MsrpChunk>,
         tx: mpsc::Sender<MsrpChunk>,
@@ -99,7 +103,48 @@ impl MsrpDemuxer {
         R: std::io::Read + Send + Sync + 'static,
         C: FnOnce(u16, String) + Send + Sync + 'static,
     {
+        self.start_message(from_path, to_path, content_type, total, r, c, false, tx, rt);
+    }
+
+    /// As start(), asking the receiver for success REPORTs (RFC 4975 section
+    /// 7.1.2). `c` then gets 200 once the REPORTs cover the whole message, or
+    /// 408 when they have not 60 seconds after the last chunk was queued. An
+    /// empty message has nothing to report on and ends with its 200 response.
+    pub fn start_with_success_report<R, C>(
+        &self,
+        from_path: Vec<u8>,
+        to_path: Vec<u8>,
+        content_type: Option<Vec<u8>>,
+        total: usize,
+        r: R,
+        c: C,
+        tx: mpsc::Sender<MsrpChunk>,
+        rt: &Arc<Runtime>,
+    ) where
+        R: std::io::Read + Send + Sync + 'static,
+        C: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        self.start_message(from_path, to_path, content_type, total, r, c, true, tx, rt);
+    }
+
+    fn start_message<R, C>(
+        &self,
+        from_path: Vec<u8>,
+        to_path: Vec<u8>,
+        content_type: Option<Vec<u8>>,
+        total: usize,
+        mut r: R,
+        c: C,
+        success_report: bool,
+        tx: mpsc::Sender<MsrpChunk>,
+        rt: &Arc<Runtime>,
+    ) where
+        R: std::io::Read + Send + Sync + 'static,
+        C: FnOnce(u16, String) + Send + Sync + 'static,
+    {
         let c: Callback = Arc::new(Mutex::new(Some(Box::new(c))));
+
+        let success_report = success_report && total > 0;
 
         let waitlist = Arc::clone(&self.waitlist);
 
@@ -112,7 +157,11 @@ impl MsrpDemuxer {
                 let mut guard = waitlist.lock().unwrap();
                 guard.push((
                     message_id.clone(),
-                    DeliveryStatus::AwaitNegativeReport,
+                    if success_report {
+                        DeliveryStatus::AwaitPositiveAndNegativeReport(Vec::new(), total)
+                    } else {
+                        DeliveryStatus::AwaitNegativeReport
+                    },
                     Vec::new(),
                     false,
                     c,
@@ -141,6 +190,7 @@ impl MsrpDemuxer {
                                 &mut sent,
                                 total,
                                 ContinuationFlag::Continuation,
+                                success_report,
                             );
 
                             if !send_chunk(
@@ -174,6 +224,7 @@ impl MsrpDemuxer {
                             &mut sent,
                             total,
                             ContinuationFlag::Abort,
+                            success_report,
                         );
 
                         match tx.send(chunk).await {
@@ -197,9 +248,10 @@ impl MsrpDemuxer {
                 &mut sent,
                 total,
                 ContinuationFlag::Complete,
+                success_report,
             );
 
-            send_chunk(
+            if send_chunk(
                 &waitlist,
                 &message_id,
                 transaction_id,
@@ -208,109 +260,103 @@ impl MsrpDemuxer {
                 &tx,
                 &rt_,
             )
-            .await;
+            .await
+                && success_report
+            {
+                start_report_timeout(&waitlist, message_id, &rt_);
+            }
         });
     }
 
+    /// Takes a REPORT for a message being sent: a success REPORT counts the
+    /// bytes it covers until they are the whole message, a failure REPORT ends
+    /// the message with its status.
     pub fn on_report(&self, message: MsrpChunk) -> Result<(), &'static str> {
-        if let Some(report_status) = message.get_report_status() {
-            if report_status.ns == 0 {
-                let mut guard = self.waitlist.lock().unwrap();
-                let mut i = 0;
-                for (message_id, status, _, _, _) in &mut *guard {
-                    if message_id == report_status.message_id {
-                        if report_status.status_code == 200 {
-                            if let Some(byte_range) = report_status.byte_range {
-                                if let Some(byte_range) = byte_range::parse(byte_range) {
-                                    if let Some(to) = byte_range.to {
-                                        match &mut *status {
-                                            DeliveryStatus::AwaitPositiveReport(ranges, total)
-                                            | DeliveryStatus::AwaitPositiveAndNegativeReport(
-                                                ranges,
-                                                total,
-                                            ) => {
-                                                if byte_range.total != Some(0)
-                                                    && byte_range.from <= to
-                                                    && byte_range.from > 1
-                                                {
-                                                    let mut range = Range {
-                                                        start: byte_range.from - 1,
-                                                        end: to,
-                                                    };
-                                                    let mut i = 0;
-                                                    while i < ranges.len() {
-                                                        let lhs = &ranges[i];
-                                                        if let Some(r) = range.union(lhs) {
-                                                            ranges.remove(i);
-                                                            range = r;
-                                                            i = 0;
-                                                        } else {
-                                                            i = i + 1;
-                                                        }
-                                                    }
-                                                    if ranges.len() == 0 {
-                                                        if range.covering(&Range {
-                                                            start: 0,
-                                                            end: *total,
-                                                        }) {
-                                                            let (_, _, _, _, c) =
-                                                                (*guard).remove(i);
-                                                            let mut guard = c.lock().unwrap();
-                                                            match (*guard).take() {
-                                                                Some(c) => {
-                                                                    c(200, String::from("Ok"));
-                                                                }
-                                                                None => {}
-                                                            }
-                                                            return Ok(());
-                                                        }
-                                                    }
-                                                    ranges.push(range);
-                                                }
-                                                return Ok(());
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            match status {
-                                DeliveryStatus::AwaitNegativeReport
-                                | DeliveryStatus::AwaitPositiveAndNegativeReport(_, _) => {
-                                    let (_, _, _, _, c) = (*guard).remove(i);
-                                    let mut guard = c.lock().unwrap();
-                                    match (*guard).take() {
-                                        Some(c) => {
-                                            let reason_phrase =
-                                                if let Some(comment) = report_status.comment {
-                                                    String::from_utf8_lossy(comment).to_string()
-                                                } else {
-                                                    String::from("")
-                                                };
-                                            c(report_status.status_code, reason_phrase);
-                                        }
-                                        None => {}
-                                    }
-                                    return Ok(());
-                                }
-                                _ => {}
-                            }
-                        }
+        let report_status = match message.get_report_status() {
+            Some(report_status) if report_status.ns == 0 => report_status,
+            _ => return Err("Server Internal Error"),
+        };
+
+        let mut guard = self.waitlist.lock().unwrap();
+        let i = match guard
+            .iter()
+            .position(|(message_id, _, _, _, _)| message_id == report_status.message_id)
+        {
+            Some(i) => i,
+            None => return Err("Server Internal Error"),
+        };
+
+        let ended = match (&mut guard[i].1, report_status.status_code) {
+            (
+                DeliveryStatus::AwaitPositiveReport(ranges, total)
+                | DeliveryStatus::AwaitPositiveAndNegativeReport(ranges, total),
+                200,
+            ) => {
+                let byte_range = match report_status.byte_range.and_then(byte_range::parse) {
+                    Some(byte_range) if byte_range.from > 0 => byte_range,
+                    _ => return Err("Server Internal Error"),
+                };
+
+                let mut range = Range {
+                    start: byte_range.from - 1,
+                    end: byte_range.to.unwrap_or(*total),
+                };
+
+                // merged with the ranges reported before
+                let mut j = 0;
+                while j < ranges.len() {
+                    if let Some(union) = range.union(&ranges[j]) {
+                        range = union;
+                        ranges.remove(j);
+                        j = 0;
+                    } else {
+                        j = j + 1;
                     }
-                    i = i + 1;
                 }
+
+                let complete = range.covering(&Range {
+                    start: 0,
+                    end: *total,
+                });
+                ranges.push(range);
+                complete
             }
+
+            (
+                DeliveryStatus::AwaitNegativeReport
+                | DeliveryStatus::AwaitPositiveAndNegativeReport(_, _),
+                status_code,
+            ) => status_code != 200,
+
+            _ => false,
+        };
+
+        if !ended {
+            return Ok(());
         }
 
-        Err("Server Internal Error")
+        let (_, _, _, _, c) = guard.remove(i);
+        drop(guard);
+
+        if report_status.status_code == 200 {
+            report(&c, 200, String::from("Ok"));
+        } else {
+            let reason_phrase = if let Some(comment) = report_status.comment {
+                String::from_utf8_lossy(comment).to_string()
+            } else {
+                String::from("")
+            };
+            report(&c, report_status.status_code, reason_phrase);
+        }
+
+        Ok(())
     }
 
     pub fn on_response(&self, message: MsrpChunk) -> Result<(), (u16, &'static str)> {
         if let MsrpChunk::Response(resp_line, _) = message {
             let mut guard = self.waitlist.lock().unwrap();
             for i in 0..guard.len() {
-                let (_, _, transaction_status_arr, all_sent, _) = &mut guard[i];
+                let (_, delivery_status, transaction_status_arr, all_sent, _) = &mut guard[i];
                 if let Some((_, status)) = transaction_status_arr
                     .iter_mut()
                     .find(|(t, _)| *t == resp_line.transaction_id)
@@ -328,6 +374,13 @@ impl MsrpDemuxer {
                             || transaction_status_arr
                                 .iter()
                                 .any(|(_, status)| !matches!(status, TransactionStatus::Sent))
+                        {
+                            return Ok(());
+                        }
+
+                        // it is delivered once success REPORTs cover it
+                        if let DeliveryStatus::AwaitPositiveReport(_, _)
+                        | DeliveryStatus::AwaitPositiveAndNegativeReport(_, _) = delivery_status
                         {
                             return Ok(());
                         }
@@ -424,6 +477,7 @@ fn build_msrp_chunk(
     sent: &mut usize,
     total: usize,
     continuation_flag: ContinuationFlag,
+    success_report: bool,
 ) -> MsrpChunk {
     let mut message = MsrpChunk::new_request_chunk(
         MsrpRequestLine {
@@ -458,9 +512,22 @@ fn build_msrp_chunk(
         }
     }
 
+    if success_report {
+        message.add_header(Header::new(b"Success-Report", b"yes"));
+    }
+
     message.add_header(Header::new(b"Failure-Report", b"yes"));
 
     message
+}
+
+// a message waiting for success REPORTs fails when they have not come in time
+fn start_report_timeout(waitlist: &Waitlist, message_id: Vec<u8>, rt: &Arc<Runtime>) {
+    let waitlist = Arc::clone(waitlist);
+    rt.spawn(async move {
+        sleep(REPORT_TIMEOUT).await;
+        fail(&waitlist, &message_id, 408, "Timeout");
+    });
 }
 
 fn start_timeout(waitlist: &Waitlist, transaction_id: Vec<u8>, rt: &Arc<Runtime>) {

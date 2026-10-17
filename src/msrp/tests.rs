@@ -1955,3 +1955,206 @@ fn an_ended_session_drops_what_it_held() {
     read_nothing(&rt, &mut alice_io);
     assert!(result(&held).is_none());
 }
+
+fn start_sending_reported<R>(
+    demuxer: &MsrpDemuxer,
+    reader: R,
+    total: usize,
+    rt: &Arc<Runtime>,
+) -> (mpsc::Receiver<MsrpChunk>, Results)
+where
+    R: Read + Send + Sync + 'static,
+{
+    let (tx, rx) = mpsc::channel(8);
+    let results: Results = Arc::default();
+    let results_ = Arc::clone(&results);
+    demuxer.start_with_success_report(
+        ALICE.as_bytes().to_vec(),
+        BOB.as_bytes().to_vec(),
+        Some(b"text/plain".to_vec()),
+        total,
+        reader,
+        move |status_code, reason_phrase| {
+            results_.lock().unwrap().push((status_code, reason_phrase));
+        },
+        tx,
+        rt,
+    );
+    (rx, results)
+}
+
+fn header_of(chunk: &MsrpChunk, name: &str) -> Option<String> {
+    chunk
+        .headers()
+        .iter()
+        .find(|h| h.get_name() == name.as_bytes())
+        .map(|h| text(h.get_value()))
+}
+
+fn report_for(message_id: &str, byte_range: &str, status: &str) -> MsrpChunk {
+    request(
+        "r1",
+        "REPORT",
+        &[
+            ("To-Path", ALICE),
+            ("From-Path", BOB),
+            ("Message-ID", message_id),
+            ("Byte-Range", byte_range),
+            ("Status", status),
+        ],
+        None,
+        ContinuationFlag::Complete,
+    )
+}
+
+#[test]
+fn demuxer_waits_for_success_reports_covering_the_message() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = demuxer();
+    let body = vec![b'x'; 25 * 1024];
+    let (mut rx, results) =
+        start_sending_reported(&demuxer, std::io::Cursor::new(body), 25 * 1024, &rt);
+    let chunks = sent_chunks(&rt, &mut rx, 3);
+
+    for chunk in &chunks {
+        assert_eq!(header_of(chunk, "Success-Report").as_deref(), Some("yes"));
+    }
+    let message_id = header_of(&chunks[0], "Message-ID").unwrap();
+
+    for chunk in &chunks {
+        assert!(demuxer.on_response(response_to(chunk, 200, "OK")).is_ok());
+    }
+    assert!(
+        results.lock().unwrap().is_empty(),
+        "accepted, not yet reported"
+    );
+
+    assert!(demuxer
+        .on_report(report_for(&message_id, "1-10240/25600", "000 200 OK"))
+        .is_ok());
+    assert!(results.lock().unwrap().is_empty(), "only part is reported");
+
+    assert!(demuxer
+        .on_report(report_for(&message_id, "10241-25600/25600", "000 200 OK"))
+        .is_ok());
+    assert_eq!(*results.lock().unwrap(), vec![(200, "Ok".to_string())]);
+
+    assert!(demuxer
+        .on_report(report_for(&message_id, "1-25600/25600", "000 200 OK"))
+        .is_err());
+    assert_eq!(results.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn demuxer_takes_reports_before_responses_and_failure_reports() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = demuxer();
+
+    let (mut rx, results) =
+        start_sending_reported(&demuxer, std::io::Cursor::new(b"Hello".to_vec()), 5, &rt);
+    let chunks = sent_chunks(&rt, &mut rx, 1);
+    let message_id = header_of(&chunks[0], "Message-ID").unwrap();
+    assert!(demuxer
+        .on_report(report_for(&message_id, "1-5/5", "000 200 OK"))
+        .is_ok());
+    assert_eq!(*results.lock().unwrap(), vec![(200, "Ok".to_string())]);
+
+    let (mut rx, results) =
+        start_sending_reported(&demuxer, std::io::Cursor::new(b"Hello".to_vec()), 5, &rt);
+    let chunks = sent_chunks(&rt, &mut rx, 1);
+    let message_id = header_of(&chunks[0], "Message-ID").unwrap();
+    assert!(demuxer
+        .on_response(response_to(&chunks[0], 200, "OK"))
+        .is_ok());
+    assert!(demuxer
+        .on_report(report_for(&message_id, "1-5/5", "000 413 Too big"))
+        .is_ok());
+    assert_eq!(*results.lock().unwrap(), vec![(413, "Too big".to_string())]);
+}
+
+#[test]
+fn demuxer_times_out_without_success_reports() {
+    let rt = Arc::new(
+        Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap(),
+    );
+    let demuxer = demuxer();
+    let (mut rx, results) =
+        start_sending_reported(&demuxer, std::io::Cursor::new(b"Hello".to_vec()), 5, &rt);
+    let chunks = sent_chunks(&rt, &mut rx, 1);
+    assert!(demuxer
+        .on_response(response_to(&chunks[0], 200, "OK"))
+        .is_ok());
+
+    rt.block_on(async { sleep(Duration::from_secs(59)).await });
+    assert!(results.lock().unwrap().is_empty());
+
+    rt.block_on(async { sleep(Duration::from_secs(2)).await });
+    assert_eq!(*results.lock().unwrap(), vec![(408, "Timeout".to_string())]);
+}
+
+#[test]
+fn an_empty_message_ends_with_its_response_even_when_reports_are_asked_for() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = demuxer();
+    let (mut rx, results) = start_sending_reported(&demuxer, std::io::empty(), 0, &rt);
+    let chunks = sent_chunks(&rt, &mut rx, 1);
+
+    assert_eq!(header_of(&chunks[0], "Success-Report"), None);
+    assert!(demuxer
+        .on_response(response_to(&chunks[0], 200, "OK"))
+        .is_ok());
+    assert_eq!(*results.lock().unwrap(), vec![(200, "Ok".to_string())]);
+}
+
+#[test]
+fn a_success_report_comes_back_through_the_wire_format() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let alice_demuxer = Arc::new(demuxer());
+    let mut alice = MsrpChannel::new(
+        ALICE.as_bytes().to_vec(),
+        BOB.as_bytes().to_vec(),
+        Arc::clone(&alice_demuxer),
+        muxer(&Log::default()),
+    );
+    let bob_log = Log::default();
+    let mut bob = channel(&bob_log);
+
+    let body: Vec<u8> = (0..25 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
+    let (mut rx, results) = start_sending_reported(
+        &alice_demuxer,
+        std::io::Cursor::new(body.clone()),
+        body.len(),
+        &rt,
+    );
+
+    let mut to_bob = MsrpParser::new();
+    let mut to_alice = MsrpParser::new();
+    let mut replies = Vec::new();
+    for chunk in sent_chunks(&rt, &mut rx, 3) {
+        to_bob.feed(&serialize(&chunk));
+        let chunk = to_bob.produce().unwrap().unwrap();
+        for reply in bob.on_message(chunk).unwrap() {
+            to_alice.feed(&serialize(&reply));
+            let reply = to_alice.produce().unwrap().unwrap();
+            replies.push(match &reply {
+                MsrpChunk::Request(req_line, _, _, _) => text(&req_line.request_method),
+                MsrpChunk::Response(resp_line, _) => resp_line.status_code.to_string(),
+            });
+            assert!(alice.on_message(reply).unwrap().is_empty());
+            if replies.len() == 3 {
+                assert!(
+                    results.lock().unwrap().is_empty(),
+                    "three 200s are not enough"
+                );
+            }
+        }
+    }
+
+    assert_eq!(replies, vec!["200", "200", "200", "REPORT"]);
+    assert_eq!(*results.lock().unwrap(), vec![(200, "Ok".to_string())]);
+    assert_eq!(received(&bob_log), Some(body));
+}
