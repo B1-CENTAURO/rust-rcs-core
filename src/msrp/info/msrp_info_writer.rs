@@ -13,8 +13,12 @@
 // limitations under the License.
 
 use std::borrow::Cow;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{MsrpDirection, MsrpInfo, MsrpInterfaceType, MsrpSetupMethod};
+
+// seconds from 1900 to 1970
+const NTP_UNIX_OFFSET: u64 = 2208988800;
 
 impl From<MsrpInfo<'_>> for String {
     fn from(msrp_info: MsrpInfo<'_>) -> Self {
@@ -34,43 +38,70 @@ impl From<MsrpInfo<'_>> for String {
             None => Cow::Borrowed("*"),
         };
 
-        format!(
-            "v=0\n\
-        o=+860 0 0 IN {} {}\n\
-        s=-\n\
-        c=IN {} {}\n\
-        t=0 0\n\
-        m=message {} {} *\n\
-        a={}\n\
-        a=path:{}\n\
-        {}
-        a=setup:{}\n\
-        a=connection:new\n\
-        a=accept-types:{}\n\
-        a=accept-wrapped-types:{}\n",
+        // RFC 4566 suggests an NTP timestamp for the session id and version
+        let ntp_time = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs() + NTP_UNIX_OFFSET,
+            Err(_) => NTP_UNIX_OFFSET,
+        };
+
+        let mut sdp = format!(
+            "v=0\r\n\
+             o=- {} {} IN {} {}\r\n\
+             s=-\r\n\
+             c=IN {} {}\r\n\
+             t=0 0\r\n\
+             m=message {} {} *\r\n\
+             a={}\r\n\
+             a=path:{}\r\n\
+             a=setup:{}\r\n\
+             a=connection:new\r\n\
+             a=accept-types:{}\r\n\
+             a=accept-wrapped-types:{}\r\n",
+            ntp_time,
+            ntp_time,
             address_type,
             address,
             address_type,
             address,
             msrp_info.port,
             protocol,
-            match msrp_info.direction {
-                MsrpDirection::SendOnly => "sendonly",
-                MsrpDirection::ReceiveOnly => "recvonly",
-                MsrpDirection::SendReceive => "sendrecv",
+            if msrp_info.inactive {
+                "inactive"
+            } else {
+                match msrp_info.direction {
+                    MsrpDirection::SendOnly => "sendonly",
+                    MsrpDirection::ReceiveOnly => "recvonly",
+                    MsrpDirection::SendReceive => "sendrecv",
+                }
             },
             path,
-            if msrp_info.inactive {
-                "a=inactive\n"
-            } else {
-                ""
-            },
             match msrp_info.setup_method {
                 MsrpSetupMethod::Passive => "passive",
                 MsrpSetupMethod::Active => "active",
             },
             accept_types,
             accept_wrapped_types
-        )
+        );
+
+        // RFC 5547
+        if let Some(file_info) = msrp_info.file_info {
+            for (name, value) in [
+                ("file-selector", Some(file_info.file_selector)),
+                ("file-transfer-id", Some(file_info.file_transfer_id)),
+                ("file-disposition", file_info.file_disposition),
+                ("file-range", file_info.file_range),
+                ("file-icon", file_info.file_icon),
+            ] {
+                if let Some(value) = value {
+                    sdp.push_str(&format!(
+                        "a={}:{}\r\n",
+                        name,
+                        String::from_utf8_lossy(value)
+                    ));
+                }
+            }
+        }
+
+        sdp
     }
 }

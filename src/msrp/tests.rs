@@ -24,6 +24,10 @@ use crate::internet::header::Header;
 use crate::internet::headers::byte_range;
 use crate::io::DynamicChain;
 
+use rust_strict_sdp::AsSDP;
+
+use super::info::msrp_info_reader::AsMsrpInfo;
+use super::info::{MsrpDirection, MsrpFileInfo, MsrpInfo, MsrpInterfaceType, MsrpSetupMethod};
 use super::msrp_channel::{route, MsrpChannel, MsrpChannelManager};
 use super::msrp_chunk::{ContinuationFlag, MsrpChunk, MsrpRequestLine, MsrpResponseLine};
 use super::msrp_demuxer::MsrpDemuxer;
@@ -1346,4 +1350,242 @@ fn a_transport_ends_when_the_peer_closes() {
             None
         }
     });
+}
+
+/// What as_msrp_info() finds in `sdp`, one field per line.
+fn msrp_sdp(sdp: &str) -> Option<Vec<String>> {
+    let sdp = sdp.as_bytes().as_sdp()?;
+    let info = sdp.as_msrp_info()?;
+
+    let mut fields = vec![
+        format!("protocol {}", text(info.protocol)),
+        format!(
+            "address {} {}",
+            match info.interface_type {
+                MsrpInterfaceType::IPv4 => "IP4",
+                MsrpInterfaceType::IPv6 => "IP6",
+            },
+            text(info.address)
+        ),
+        format!("port {}", info.port),
+        format!("path {}", text(info.path)),
+        format!(
+            "direction {}",
+            if info.inactive {
+                "inactive"
+            } else {
+                match info.direction {
+                    MsrpDirection::SendOnly => "sendonly",
+                    MsrpDirection::ReceiveOnly => "recvonly",
+                    MsrpDirection::SendReceive => "sendrecv",
+                }
+            }
+        ),
+        format!(
+            "setup {}",
+            match info.setup_method {
+                MsrpSetupMethod::Active => "active",
+                MsrpSetupMethod::Passive => "passive",
+            }
+        ),
+        format!("accept-types {}", text(info.accept_types)),
+        format!(
+            "accept-wrapped-types {:?}",
+            info.accept_wrapped_types.map(text)
+        ),
+    ];
+
+    if let Some(file_info) = &info.file_info {
+        fields.push(format!("file-selector {}", text(file_info.file_selector)));
+        fields.push(format!(
+            "file-transfer-id {}",
+            text(file_info.file_transfer_id)
+        ));
+        fields.push(format!(
+            "file-disposition {:?}",
+            file_info.file_disposition.map(text)
+        ));
+        fields.push(format!("file-range {:?}", file_info.file_range.map(text)));
+        fields.push(format!("file-icon {:?}", file_info.file_icon.map(text)));
+    }
+
+    Some(fields)
+}
+
+fn strings(lines: &[&str]) -> Vec<String> {
+    lines.iter().map(|line| line.to_string()).collect()
+}
+
+#[test]
+fn reads_an_msrp_offer() {
+    let sdp = "v=0\r\n\
+o=- 3866767545 3866767545 IN IP4 192.0.2.2\r\n\
+s=-\r\n\
+c=IN IP4 192.0.2.2\r\n\
+t=0 0\r\n\
+m=message 2855 TCP/MSRP *\r\n\
+a=accept-types:message/cpim application/im-iscomposing+xml\r\n\
+a=accept-wrapped-types:text/plain message/imdn+xml\r\n\
+a=path:msrp://192.0.2.2:2855/xyz;tcp\r\n\
+a=setup:active\r\n\
+a=sendrecv\r\n";
+
+    assert_eq!(
+        msrp_sdp(sdp),
+        Some(strings(&[
+            "protocol TCP/MSRP",
+            "address IP4 192.0.2.2",
+            "port 2855",
+            "path msrp://192.0.2.2:2855/xyz;tcp",
+            "direction sendrecv",
+            "setup active",
+            "accept-types message/cpim application/im-iscomposing+xml",
+            "accept-wrapped-types Some(\"text/plain message/imdn+xml\")",
+        ]))
+    );
+}
+
+#[test]
+fn reads_defaults_and_overrides() {
+    // the session is inactive, the media's c= line wins, and the path goes
+    // through a relay
+    let sdp = |direction: &str| {
+        format!(
+            "v=0\r\n\
+o=- 1 1 IN IP4 192.0.2.9\r\n\
+s=-\r\n\
+c=IN IP4 192.0.2.9\r\n\
+t=0 0\r\n\
+a=inactive\r\n\
+m=message 2856 TCP/TLS/MSRP *\r\n\
+c=IN IP6 2001:db8::2\r\n\
+a=accept-types:message/cpim\r\n\
+a=path:msrps://[2001:db8::1]:2856/relay;tcp msrps://[2001:db8::2]:2856/abc;tcp\r\n\
+{}",
+            direction
+        )
+    };
+    let expected = |direction: &str| {
+        Some(strings(&[
+            "protocol TCP/TLS/MSRP",
+            "address IP6 2001:db8::2",
+            "port 2856",
+            "path msrps://[2001:db8::1]:2856/relay;tcp msrps://[2001:db8::2]:2856/abc;tcp",
+            direction,
+            "setup passive",
+            "accept-types message/cpim",
+            "accept-wrapped-types None",
+        ]))
+    };
+
+    assert_eq!(msrp_sdp(&sdp("")), expected("direction inactive"));
+    assert_eq!(
+        msrp_sdp(&sdp("a=recvonly\r\n")),
+        expected("direction recvonly"),
+        "the media overrides the session"
+    );
+    assert_eq!(
+        msrp_sdp(&sdp("").replace("a=inactive\r\n", "")),
+        expected("direction sendrecv"),
+        "sendrecv is the default"
+    );
+}
+
+#[test]
+fn reads_file_transfer_attributes() {
+    let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 192.0.2.2\r\n\
+s=-\r\n\
+c=IN IP4 192.0.2.2\r\n\
+t=0 0\r\n\
+m=message 2855 TCP/MSRP *\r\n\
+a=sendonly\r\n\
+a=accept-types:message/cpim\r\n\
+a=path:msrp://192.0.2.2:2855/xyz;tcp\r\n\
+a=file-selector:name:\"My cool picture.jpg\" type:image/jpeg size:32349\r\n\
+a=file-transfer-id:vBnG916bdberum2fFEABR1FR3ExZMUrd\r\n\
+a=file-disposition:attachment\r\n\
+a=file-range:1-32349\r\n\
+a=file-icon:cid:id2@alicepc.example.com\r\n";
+
+    let fields = msrp_sdp(sdp).unwrap();
+    assert_eq!(
+        &fields[8..],
+        &strings(&[
+            "file-selector name:\"My cool picture.jpg\" type:image/jpeg size:32349",
+            "file-transfer-id vBnG916bdberum2fFEABR1FR3ExZMUrd",
+            "file-disposition Some(\"attachment\")",
+            "file-range Some(\"1-32349\")",
+            "file-icon Some(\"cid:id2@alicepc.example.com\")",
+        ])[..]
+    );
+    assert_eq!(fields[4], "direction sendonly");
+}
+
+fn msrp_info(inactive: bool) -> MsrpInfo<'static> {
+    MsrpInfo {
+        protocol: b"TCP/MSRP",
+        address: b"192.0.2.1",
+        interface_type: MsrpInterfaceType::IPv4,
+        port: 2855,
+        path: b"msrp://192.0.2.1:2855/abc;tcp",
+        inactive,
+        direction: MsrpDirection::SendReceive,
+        setup_method: MsrpSetupMethod::Active,
+        accept_types: b"message/cpim application/im-iscomposing+xml",
+        accept_wrapped_types: Some(b"text/plain message/imdn+xml"),
+        file_info: Some(MsrpFileInfo {
+            file_selector: b"name:\"a.jpg\" type:image/jpeg size:10",
+            file_transfer_id: b"vBnG916bdberum2f",
+            file_range: None,
+            file_icon: None,
+            file_disposition: Some(b"render"),
+        }),
+    }
+}
+
+#[test]
+fn writes_sdp_that_reads_back() {
+    let sdp: String = msrp_info(false).into();
+
+    assert!(sdp.ends_with("\r\n"));
+    let lines: Vec<&str> = sdp.trim_end_matches("\r\n").split("\r\n").collect();
+    for line in &lines {
+        assert!(
+            line.len() > 2 && line.as_bytes()[1] == b'=' && !line.contains('\n'),
+            "{:?}",
+            line
+        );
+    }
+
+    let origin: Vec<&str> = lines[1].split(' ').collect();
+    assert_eq!(origin[0], "o=-");
+    assert!(origin[1].parse::<u64>().is_ok() && origin[1] == origin[2]);
+    assert_eq!(&origin[3..], &["IN", "IP4", "192.0.2.1"]);
+
+    let directions = ["a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"];
+    assert_eq!(lines.iter().filter(|l| directions.contains(l)).count(), 1);
+
+    assert_eq!(
+        msrp_sdp(&sdp),
+        Some(strings(&[
+            "protocol TCP/MSRP",
+            "address IP4 192.0.2.1",
+            "port 2855",
+            "path msrp://192.0.2.1:2855/abc;tcp",
+            "direction sendrecv",
+            "setup active",
+            "accept-types message/cpim application/im-iscomposing+xml",
+            "accept-wrapped-types Some(\"text/plain message/imdn+xml\")",
+            "file-selector name:\"a.jpg\" type:image/jpeg size:10",
+            "file-transfer-id vBnG916bdberum2f",
+            "file-disposition Some(\"render\")",
+            "file-range None",
+            "file-icon None",
+        ]))
+    );
+
+    let sdp: String = msrp_info(true).into();
+    assert!(sdp.contains("\r\na=inactive\r\n") && !sdp.contains("a=sendrecv"));
+    assert_eq!(msrp_sdp(&sdp).unwrap()[4], "direction inactive");
 }

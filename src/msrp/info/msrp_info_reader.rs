@@ -31,7 +31,8 @@ impl<'a> AsMsrpInfo<'a> for Sdp<'a> {
                 && (media.protocol.eq_ignore_ascii_case(b"TCP/MSRP")
                     || media.protocol.eq_ignore_ascii_case(b"TCP/TLS/MSRP"))
             {
-                let connection = if self.connection.is_none() {
+                // a c= line of the media overrides the one of the session
+                let connection = if media.connection.is_some() {
                     &media.connection
                 } else {
                     &self.connection
@@ -48,7 +49,7 @@ impl<'a> AsMsrpInfo<'a> for Sdp<'a> {
                         };
 
                         let mut inactive = false;
-                        let mut direction = MsrpDirection::SendOnly;
+                        let mut direction = MsrpDirection::SendReceive; // RFC 4566 section 6
                         let mut setup_method = MsrpSetupMethod::Passive;
 
                         let mut path: &[u8] = &[];
@@ -61,17 +62,22 @@ impl<'a> AsMsrpInfo<'a> for Sdp<'a> {
                         let mut file_icon: &[u8] = &[];
                         let mut file_disposition: &[u8] = &[];
 
-                        for attribute in &media.attributes {
+                        // the media's attributes come last, overriding the session's
+                        for attribute in self.attributes.iter().chain(media.attributes.iter()) {
                             if attribute.eq_ignore_ascii_case(b"inactive") {
                                 inactive = true;
                             } else if attribute.eq_ignore_ascii_case(b"sendonly") {
+                                inactive = false;
                                 direction = MsrpDirection::SendOnly;
                             } else if attribute.eq_ignore_ascii_case(b"recvonly") {
+                                inactive = false;
                                 direction = MsrpDirection::ReceiveOnly;
                             } else if attribute.eq_ignore_ascii_case(b"sendrecv") {
+                                inactive = false;
                                 direction = MsrpDirection::SendReceive;
                             } else {
-                                if let Some(idx) = attribute.iter().position(|c| *c == b'=') {
+                                // a=<attribute>:<value>
+                                if let Some(idx) = attribute.iter().position(|c| *c == b':') {
                                     let attr_name = &attribute[..idx];
                                     let attr_value = &attribute[idx + 1..];
 
@@ -84,7 +90,7 @@ impl<'a> AsMsrpInfo<'a> for Sdp<'a> {
                                     } else if attr_name.eq_ignore_ascii_case(b"accept-types") {
                                         accept_types = attr_value;
                                     } else if attr_name
-                                        .eq_ignore_ascii_case(b"accept-wrapped-typess")
+                                        .eq_ignore_ascii_case(b"accept-wrapped-types")
                                     {
                                         accept_wrapped_types = attr_value;
                                     } else if attr_name.eq_ignore_ascii_case(b"file-selector") {
