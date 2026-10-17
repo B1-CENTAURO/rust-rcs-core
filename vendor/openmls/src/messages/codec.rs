@@ -32,6 +32,7 @@ impl Size for Proposal {
                 #[cfg(feature = "extensions-draft")]
                 Proposal::AppDataUpdate(p) => p.tls_serialized_len(),
                 Proposal::SelfRemove => 0,
+                Proposal::ServerRemove(p) => p.tls_serialized_len(),
                 #[cfg(feature = "extensions-draft")]
                 Proposal::AppEphemeral(p) => p.tls_serialized_len(),
                 Proposal::Custom(p) => p.payload().tls_serialized_len(),
@@ -53,6 +54,7 @@ impl Serialize for Proposal {
             #[cfg(feature = "extensions-draft")]
             Proposal::AppDataUpdate(p) => p.tls_serialize(writer),
             Proposal::SelfRemove => Ok(0),
+            Proposal::ServerRemove(p) => p.tls_serialize(writer),
             #[cfg(feature = "extensions-draft")]
             Proposal::AppEphemeral(p) => p.tls_serialize(writer),
             Proposal::Custom(p) => p.payload().tls_serialize(writer),
@@ -75,6 +77,7 @@ impl Size for &ProposalIn {
                 #[cfg(feature = "extensions-draft")]
                 ProposalIn::AppDataUpdate(p) => p.tls_serialized_len(),
                 ProposalIn::SelfRemove => 0,
+                ProposalIn::ServerRemove(p) => p.tls_serialized_len(),
                 #[cfg(feature = "extensions-draft")]
                 ProposalIn::AppEphemeral(p) => p.tls_serialized_len(),
                 ProposalIn::Custom(p) => p.payload().tls_serialized_len(),
@@ -102,6 +105,7 @@ impl Serialize for &ProposalIn {
             #[cfg(feature = "extensions-draft")]
             ProposalIn::AppDataUpdate(p) => p.tls_serialize(writer),
             ProposalIn::SelfRemove => Ok(0),
+            ProposalIn::ServerRemove(p) => p.tls_serialize(writer),
             #[cfg(feature = "extensions-draft")]
             ProposalIn::AppEphemeral(p) => p.tls_serialize(writer),
             ProposalIn::Custom(p) => p.payload().tls_serialize(writer),
@@ -147,6 +151,9 @@ impl Deserialize for ProposalIn {
                 ProposalIn::AppDataUpdate(Box::new(AppDataUpdateProposal::tls_deserialize(bytes)?))
             }
             ProposalType::SelfRemove => ProposalIn::SelfRemove,
+            ProposalType::ServerRemove => {
+                ProposalIn::ServerRemove(Box::new(RemoveProposal::tls_deserialize(bytes)?))
+            }
             #[cfg(feature = "extensions-draft")]
             ProposalType::AppEphemeral => {
                 ProposalIn::AppEphemeral(Box::new(AppEphemeralProposal::tls_deserialize(bytes)?))

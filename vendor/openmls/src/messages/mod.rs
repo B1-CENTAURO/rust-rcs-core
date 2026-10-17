@@ -274,10 +274,20 @@ impl CommitIn {
                             })
                         });
 
+                    // rust-rcs-core: ServerRemoves free their leaf as well
+                    let server_removed_indices = proposals.iter().filter_map(|p| match p {
+                        ProposalOrRef::Proposal(proposal) => match proposal.as_ref() {
+                            Proposal::ServerRemove(r) => Some(r.removed()),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+
                     let new_leaf_index = [leftmost_blank_index]
                         .into_iter()
                         .chain(former_sender_index)
                         .chain(self_removed_indices)
+                        .chain(server_removed_indices)
                         .min()
                         .ok_or_else(|| {
                             ValidationError::LibraryError(LibraryError::custom(

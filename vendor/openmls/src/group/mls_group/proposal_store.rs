@@ -305,7 +305,7 @@ impl ProposalQueue {
                     // ValSem200
                     // https://validation.openmls.tech/#valn0303
                     if proposal
-                        .as_remove()
+                        .as_any_remove()
                         .and_then(|remove_proposal| {
                             sender.as_member().filter(|leaf_index| {
                                 // The proposal must not remove the committer.
@@ -331,7 +331,7 @@ impl ProposalQueue {
                     match proposals_by_reference_queue.get(proposal_reference) {
                         Some(queued_proposal) => {
                             // ValSem200
-                            if let Proposal::Remove(ref remove_proposal) = queued_proposal.proposal
+                            if let Some(remove_proposal) = queued_proposal.proposal.as_any_remove()
                             {
                                 if let Sender::Member(leaf_index) = sender {
                                     if remove_proposal.removed() == *leaf_index {
@@ -416,8 +416,9 @@ impl ProposalQueue {
     /// Returns an iterator over all Remove proposals in the queue
     /// in the order of the the Commit message
     pub(crate) fn remove_proposals(&self) -> impl Iterator<Item = QueuedRemoveProposal<'_>> {
+        // rust-rcs-core: ServerRemoves included
         self.queued_proposals().filter_map(|queued_proposal| {
-            if let Proposal::Remove(remove_proposal) = queued_proposal.proposal() {
+            if let Some(remove_proposal) = queued_proposal.proposal().as_any_remove() {
                 let sender = queued_proposal.sender();
                 Some(QueuedRemoveProposal {
                     remove_proposal,
@@ -598,7 +599,8 @@ impl ProposalQueue {
                     }
                     register_member_specific_proposal(*sender_index, queued_proposal);
                 }
-                Proposal::Remove(ref remove_proposal) => {
+                Proposal::Remove(ref remove_proposal)
+                | Proposal::ServerRemove(ref remove_proposal) => {
                     let removed = remove_proposal.removed();
                     register_member_specific_proposal(removed, queued_proposal);
                 }

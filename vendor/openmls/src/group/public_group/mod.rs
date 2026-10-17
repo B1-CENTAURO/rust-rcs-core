@@ -335,7 +335,8 @@ impl PublicGroup {
         // proposals.
         let removed_indices = queued_proposals.filter_map(|proposal| {
             match (proposal.proposal(), proposal.sender()) {
-                (Proposal::Remove(r), _) => Some(r.removed),
+                // rust-rcs-core: ServerRemoves free their leaf as well
+                (Proposal::Remove(r) | Proposal::ServerRemove(r), _) => Some(r.removed),
                 (Proposal::SelfRemove, Sender::Member(sender)) => Some(*sender),
                 _ => None, // SelfRemove proposals must come from group members
             }

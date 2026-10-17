@@ -9,7 +9,7 @@ use crate::treesync::LeafNodeParameters;
 
 use crate::{
     binary_tree::LeafNodeIndex,
-    credentials::CredentialWithKey,
+    credentials::{Credential, CredentialWithKey},
     error::LibraryError,
     framing::{ContentType, DecryptedMessage, PublicMessageIn, Sender},
     group::{
@@ -71,6 +71,8 @@ pub enum ExternalCommitBuilderError<StorageError> {
 #[derive(Default)]
 pub struct ExternalCommitBuilder {
     proposals: Vec<PublicMessageIn>,
+    // rust-rcs-core: members to remove next to the joiner's old leaf
+    removed_credentials: Vec<Credential>,
     ratchet_tree: Option<RatchetTreeIn>,
     config: MlsGroupJoinConfig,
     validate_lifetimes: LeafNodeLifetimePolicy,
@@ -94,6 +96,17 @@ impl ExternalCommitBuilder {
     /// other types of messages are ignored.
     pub fn with_proposals(mut self, proposals: Vec<PublicMessageIn>) -> Self {
         self.proposals = proposals;
+        self
+    }
+
+    /// Removes the members holding these credentials as well (rust-rcs-core).
+    ///
+    /// The first is removed with a Remove proposal, unless a member with the
+    /// joiner's signature key takes it, and all others with RCC.16 server_remove
+    /// proposals, as an External Commit has at most one Remove proposal (RCC.16
+    /// section 10.1.1).
+    pub fn with_removed_credentials(mut self, credentials: Vec<Credential>) -> Self {
+        self.removed_credentials = credentials;
         self
     }
 
@@ -147,6 +160,7 @@ impl ExternalCommitBuilder {
     > {
         let ExternalCommitBuilder {
             proposals,
+            removed_credentials,
             ratchet_tree,
             mut config,
             aad,
@@ -259,16 +273,32 @@ impl ExternalCommitBuilder {
         // If there is a group member in the group with the same identity as us,
         // commit a remove proposal.
         let our_signature_key = credential_with_key.signature_key.as_slice();
-        let remove_proposal = public_group.members().find_map(|member| {
-            (member.signature_key == our_signature_key).then_some(Proposal::remove(
-                RemoveProposal {
-                    removed: member.index,
-                },
-            ))
-        });
+        let own_former_index = public_group
+            .members()
+            .find_map(|member| (member.signature_key == our_signature_key).then_some(member.index));
+
+        // rust-rcs-core: the members holding `removed_credentials`, the first
+        // one in place of the joiner's old leaf when there is none
+        let mut removed_indices: Vec<LeafNodeIndex> = public_group
+            .members()
+            .filter(|member| {
+                Some(member.index) != own_former_index
+                    && removed_credentials.contains(&member.credential)
+            })
+            .map(|member| member.index)
+            .collect();
+        let former_index = match own_former_index {
+            Some(index) => Some(index),
+            None if !removed_indices.is_empty() => Some(removed_indices.remove(0)),
+            None => None,
+        };
+        let remove_proposal =
+            former_index.map(|removed| Proposal::remove(RemoveProposal { removed }));
+        let server_remove_proposals = removed_indices.into_iter().map(Proposal::server_remove);
 
         let inline_proposals = inline_proposals
             .chain(remove_proposal)
+            .chain(server_remove_proposals)
             .map(|p| {
                 QueuedProposal::from_proposal_and_sender(
                     ciphersuite,
