@@ -461,6 +461,9 @@ impl MlsClient {
     ///
     /// `group_info` is what the Conversation Focus returned to an
     /// MLS-Group-Info-Pull INFO request. Any local state of the group is dropped.
+    /// The self_remove Proposals among its pending Proposals are committed too,
+    /// as the Conversation Focus only accepts Commits that cover all of them
+    /// (section 6.2.1).
     /// Unlike other Commits the External Commit is applied locally right away;
     /// should the Conversation Focus reject it, self-healing has to start over.
     pub fn rejoin_conversation(
@@ -482,7 +485,21 @@ impl MlsClient {
                 .map_err(fail("deleting group", ErrorKind::Storage))?;
         }
 
-        let mut builder = MlsGroup::external_commit_builder().with_config(self.join_config(0));
+        let mut pending_proposals = Vec::new();
+        if !group_info.pending_proposals.is_empty() {
+            for proposal in rcs::wire::decode_message_list(&group_info.pending_proposals)? {
+                let message = MlsMessageIn::tls_deserialize_exact(&proposal)
+                    .map_err(fail("Proposal decoding", ErrorKind::BadFormat))?;
+                match message.extract() {
+                    MlsMessageBodyIn::PublicMessage(proposal) => pending_proposals.push(proposal),
+                    _ => return Err(ErrorKind::UnexpectedMessage),
+                }
+            }
+        }
+
+        let mut builder = MlsGroup::external_commit_builder()
+            .with_config(self.join_config(0))
+            .with_proposals(pending_proposals);
         if !group_info.ratchet_tree.is_empty() {
             let ratchet_tree = RatchetTreeIn::tls_deserialize_exact(&group_info.ratchet_tree)
                 .map_err(fail("ratchet tree decoding", ErrorKind::BadFormat))?;

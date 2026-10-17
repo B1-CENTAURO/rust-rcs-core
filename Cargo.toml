@@ -85,3 +85,8 @@ e2ee = [
     "dep:tls_codec",
     "dep:x509-cert",
 ]
+
+# OpenMLS with SelfRemove under the proposal type RCC.16 gives self_remove,
+# see vendor/openmls/VENDORED.md
+[patch.crates-io]
+openmls = { path = "vendor/openmls" }
