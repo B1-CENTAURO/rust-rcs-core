@@ -19,6 +19,8 @@ pub mod http;
 pub mod imdn;
 pub mod internet;
 pub mod io;
+#[cfg(feature = "e2ee")]
+pub mod mls;
 pub mod msrp;
 pub mod security;
 pub mod sip;
