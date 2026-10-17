@@ -40,7 +40,15 @@ url = { version = "2.5" }
 uuid = { version = "1.6", features = ["v4"] }
 walkdir = { version = "2.4" }
 
+openmls = { version = "0.9", optional = true }
+openmls_basic_credential = { version = "0.6", optional = true }
+openmls_rust_crypto = { version = "0.6", optional = true }
+openmls_traits = { version = "0.6", optional = true }
+
 [features]
 default = []
 android = []
 ohos = []
+# MLS (RFC 9420) based end-to-end encryption, required by RCS Universal Profile 3.0.
+# Pulls in OpenMLS, which needs rustc 1.91 or newer.
+e2ee = ["dep:openmls", "dep:openmls_basic_credential", "dep:openmls_rust_crypto", "dep:openmls_traits"]
