@@ -553,8 +553,10 @@ impl PublicGroup {
         let contains_denied_proposal = proposal_queue.queued_proposals().any(|p| {
             let is_inline = p.proposal_or_ref_type() == ProposalOrRefType::Proposal;
             let is_allowed_type = match p.proposal() {
+                // rust-rcs-core: and ServerRemove, as RCC.16 section 10.1.1 has it
                 Proposal::ExternalInit(_)
                 | Proposal::Remove(_)
+                | Proposal::ServerRemove(_)
                 | Proposal::PreSharedKey(_)
                 | Proposal::Custom(_) => true,
                 #[cfg(feature = "extensions-draft")]

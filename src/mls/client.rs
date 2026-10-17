@@ -44,9 +44,9 @@ pub trait CredentialValidator: Send + Sync {
         self.validate(credential, signature_key)
     }
 
-    /// Decides whether `new` may take the place of `old` in the same leaf, through
-    /// the committer's own update or a resync External Commit; unlike `old`, `new`
-    /// is not yet trusted
+    /// Decides whether `new` may take the place of `old`, through the committer's
+    /// own update or an External Commit removing `old`; unlike `old`, `new` is
+    /// not yet trusted
     fn validate_replacement(
         &self,
         old: &Credential,
@@ -470,6 +470,21 @@ impl MlsClient {
         &self,
         group_info: &rcs::proto::MlsGroupInfo,
     ) -> Result<(MlsConversation, CommitOutput)> {
+        self.rejoin_conversation_replacing(group_info, &[])
+    }
+
+    /// Self-heals as `rejoin_conversation()` does, removing the Clients holding
+    /// `replaced` as well: the old Clients of this Participant, e.g. all those of
+    /// a former Participant Key (RCC.16 section 10.1.1)
+    ///
+    /// A Remove Proposal takes out the leaf this client had, or else the first
+    /// of these, and server_remove Proposals the rest, as an External Commit has
+    /// at most one Remove Proposal.
+    pub fn rejoin_conversation_replacing(
+        &self,
+        group_info: &rcs::proto::MlsGroupInfo,
+        replaced: &[Credential],
+    ) -> Result<(MlsConversation, CommitOutput)> {
         let message = MlsMessageIn::tls_deserialize_exact(&group_info.group_info)
             .map_err(fail("GroupInfo decoding", ErrorKind::BadFormat))?;
 
@@ -499,7 +514,8 @@ impl MlsClient {
 
         let mut builder = MlsGroup::external_commit_builder()
             .with_config(self.join_config(0))
-            .with_proposals(pending_proposals);
+            .with_proposals(pending_proposals)
+            .with_removed_credentials(replaced.to_vec());
         if !group_info.ratchet_tree.is_empty() {
             let ratchet_tree = RatchetTreeIn::tls_deserialize_exact(&group_info.ratchet_tree)
                 .map_err(fail("ratchet tree decoding", ErrorKind::BadFormat))?;

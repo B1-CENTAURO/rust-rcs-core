@@ -292,6 +292,33 @@ impl MlsConversation {
         client: &MlsClient,
         credentials: &[Credential],
     ) -> Result<CommitOutput> {
+        let leaf_indices = self.leaf_indices(credentials)?;
+        self.commit(
+            client,
+            |builder| Ok(builder.propose_removals(leaf_indices)),
+            CommitExtras::default(),
+        )
+    }
+
+    /// Removes every Client of the Participants the Messaging Server removed
+    /// from the conversation, with server_remove Proposals (RCC.16 section 9.6)
+    pub fn remove_members_for_server(
+        &mut self,
+        client: &MlsClient,
+        credentials: &[Credential],
+    ) -> Result<CommitOutput> {
+        let leaf_indices = self.leaf_indices(credentials)?;
+        self.commit(
+            client,
+            |builder| {
+                Ok(builder.add_proposals(leaf_indices.into_iter().map(Proposal::server_remove)))
+            },
+            CommitExtras::default(),
+        )
+    }
+
+    /// Leaves of the members holding one of `credentials`, each holding at least one
+    fn leaf_indices(&self, credentials: &[Credential]) -> Result<Vec<LeafNodeIndex>> {
         let mut leaf_indices = Vec::new();
         for credential in credentials {
             let before = leaf_indices.len();
@@ -304,12 +331,7 @@ impl MlsConversation {
                 return Err(ErrorKind::UnknownMember);
             }
         }
-
-        self.commit(
-            client,
-            |builder| Ok(builder.propose_removals(leaf_indices)),
-            CommitExtras::default(),
-        )
+        Ok(leaf_indices)
     }
 
     /// Replaces this client's own key material, for post-compromise security
@@ -752,13 +774,16 @@ impl MlsConversation {
             }
 
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                let replaced = committer.or_else(|| {
-                    staged_commit
+                // an External Commit takes the place of the leaves it removes,
+                // with server_remove Proposals as well (RCC.16 section 10.1.1)
+                let replaced: Vec<Member> = match committer {
+                    Some(committer) => vec![committer],
+                    None => staged_commit
                         .remove_proposals()
-                        .find_map(|p| self.group.member_at(p.remove_proposal().removed()))
-                });
-                if !commit_credentials_valid(client.validator(), &staged_commit, replaced.as_ref())
-                {
+                        .filter_map(|p| self.group.member_at(p.remove_proposal().removed()))
+                        .collect(),
+                };
+                if !commit_credentials_valid(client.validator(), &staged_commit, &replaced) {
                     return Err(ErrorKind::InvalidCredential);
                 }
 
@@ -1063,25 +1088,26 @@ fn is_end_mls(extension: &Extension) -> bool {
 /// validator, mirroring `StagedCommit::credentials_to_verify()` but keeping the
 /// signature keys at hand, as well as the credential of the committer
 ///
-/// `replaced` is the leaf the Commit's UpdatePath takes the place of: the
-/// committer's own, or for a resync External Commit the one it removes.
+/// `replaced` are the leaves the Commit's UpdatePath takes the place of: the
+/// committer's own, or for an External Commit the ones it removes, each of which
+/// has to be one the new leaf may replace.
 fn commit_credentials_valid(
     validator: &dyn CredentialValidator,
     staged_commit: &StagedCommit,
-    replaced: Option<&Member>,
+    replaced: &[Member],
 ) -> bool {
     let path_valid = match (staged_commit.update_path_leaf_node(), replaced) {
-        (Some(leaf_node), Some(old)) => validator.validate_replacement(
-            &old.credential,
-            leaf_node.credential(),
-            leaf_node.signature_key().as_slice(),
-        ),
-        (Some(leaf_node), None) => leaf_node_valid(validator, leaf_node),
+        (Some(leaf_node), []) => leaf_node_valid(validator, leaf_node),
+        (Some(leaf_node), replaced) => replaced.iter().all(|old| {
+            validator.validate_replacement(
+                &old.credential,
+                leaf_node.credential(),
+                leaf_node.signature_key().as_slice(),
+            )
+        }),
         // Commits signed with credentials no longer valid are refused (RCC.16 Annex A.4.1)
-        (None, Some(committer)) => {
-            validator.validate(&committer.credential, &committer.signature_key)
-        }
-        (None, None) => true,
+        (None, [committer]) => validator.validate(&committer.credential, &committer.signature_key),
+        (None, _) => true,
     };
 
     path_valid && proposals_valid(validator, staged_commit)

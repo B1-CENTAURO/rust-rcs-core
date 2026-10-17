@@ -113,6 +113,16 @@ impl PublicGroupDiff<'_> {
             }
         }
 
+        // rust-rcs-core: process server removes as removes
+        for queued_proposal in proposal_queue.filtered_by_type(ProposalType::ServerRemove) {
+            if let Proposal::ServerRemove(remove_proposal) = queued_proposal.proposal() {
+                if own_leaf_index == Some(remove_proposal.removed()) {
+                    self_removed = true;
+                }
+                self.diff.blank_leaf(remove_proposal.removed());
+            }
+        }
+
         // Process self removes
         for queued_proposal in proposal_queue.filtered_by_type(ProposalType::SelfRemove) {
             if let Proposal::SelfRemove = queued_proposal.proposal() {

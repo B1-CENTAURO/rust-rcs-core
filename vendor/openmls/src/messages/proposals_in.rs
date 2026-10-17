@@ -65,6 +65,8 @@ pub enum ProposalIn {
 
     // A SelfRemove proposal is an empty struct.
     SelfRemove,
+    // rust-rcs-core: RCC.16 server_remove, laid out as a Remove
+    ServerRemove(Box<RemoveProposal>),
     #[cfg(feature = "extensions-draft")]
     AppEphemeral(Box<AppEphemeralProposal>),
     Custom(Box<CustomProposal>),
@@ -84,6 +86,7 @@ impl ProposalIn {
             #[cfg(feature = "extensions-draft")]
             ProposalIn::AppDataUpdate(_) => ProposalType::AppDataUpdate,
             ProposalIn::SelfRemove => ProposalType::SelfRemove,
+            ProposalIn::ServerRemove(_) => ProposalType::ServerRemove,
             #[cfg(feature = "extensions-draft")]
             ProposalIn::AppEphemeral(_) => ProposalType::AppEphemeral,
             ProposalIn::Custom(custom_proposal) => {
@@ -130,6 +133,7 @@ impl ProposalIn {
             #[cfg(feature = "extensions-draft")]
             ProposalIn::AppDataUpdate(app_data_update) => Proposal::AppDataUpdate(app_data_update),
             ProposalIn::SelfRemove => Proposal::SelfRemove,
+            ProposalIn::ServerRemove(remove) => Proposal::ServerRemove(remove),
             #[cfg(feature = "extensions-draft")]
             ProposalIn::AppEphemeral(app_ephemeral) => Proposal::AppEphemeral(app_ephemeral),
             ProposalIn::Custom(custom) => Proposal::Custom(custom),
@@ -396,6 +400,7 @@ impl From<ProposalIn> for crate::messages::proposals::Proposal {
             #[cfg(feature = "extensions-draft")]
             ProposalIn::AppDataUpdate(app_data_update) => Self::AppDataUpdate(app_data_update),
             ProposalIn::SelfRemove => Self::SelfRemove,
+            ProposalIn::ServerRemove(remove) => Self::ServerRemove(remove),
             #[cfg(feature = "extensions-draft")]
             ProposalIn::AppEphemeral(app_ephemeral) => Self::AppEphemeral(app_ephemeral),
             ProposalIn::Custom(other) => Self::Custom(other),
@@ -418,6 +423,7 @@ impl From<crate::messages::proposals::Proposal> for ProposalIn {
             #[cfg(feature = "extensions-draft")]
             Proposal::AppDataUpdate(app_data_update) => Self::AppDataUpdate(app_data_update),
             Proposal::SelfRemove => Self::SelfRemove,
+            Proposal::ServerRemove(remove) => Self::ServerRemove(remove),
             #[cfg(feature = "extensions-draft")]
             Proposal::AppEphemeral(app_ephemeral) => Self::AppEphemeral(app_ephemeral),
             Proposal::Custom(other) => Self::Custom(other),

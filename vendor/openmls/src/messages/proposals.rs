@@ -75,6 +75,8 @@ use crate::component::ComponentId;
 ///
 /// rust-rcs-core: SelfRemove goes by 0xF003, the code GSMA PRD RCC.16 (v4.0,
 /// section 7.11.8) gives the self_remove proposal; 0x000a is a Custom type here.
+/// ServerRemove is RCC.16's server_remove (0xF004, section 7.11.9), a Remove by
+/// another name that External Commits may carry next to their one Remove.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, Hash)]
 #[cfg_attr(
     feature = "0-8-1-storage-format",
@@ -107,6 +109,9 @@ pub enum ProposalType {
     // AppAck = 7,
     #[cfg_attr(not(feature = "0-8-1-storage-format"), storage_tag = 8)]
     SelfRemove,
+    // rust-rcs-core: RCC.16 server_remove
+    #[cfg_attr(not(feature = "0-8-1-storage-format"), storage_tag = 13)]
+    ServerRemove,
     #[cfg(feature = "extensions-draft")]
     #[cfg_attr(not(feature = "0-8-1-storage-format"), storage_tag = 11)]
     AppEphemeral,
@@ -131,7 +136,10 @@ impl ProposalType {
             | ProposalType::Reinit
             | ProposalType::ExternalInit
             | ProposalType::GroupContextExtensions => true,
-            ProposalType::SelfRemove | ProposalType::Grease(_) | ProposalType::Custom(_) => false,
+            ProposalType::SelfRemove
+            | ProposalType::ServerRemove
+            | ProposalType::Grease(_)
+            | ProposalType::Custom(_) => false,
             #[cfg(feature = "extensions-draft")]
             ProposalType::AppEphemeral | ProposalType::AppDataUpdate => false,
         }
@@ -193,6 +201,7 @@ impl ProposalType {
                 | Self::ExternalInit
                 | Self::GroupContextExtensions
                 | Self::SelfRemove
+                | Self::ServerRemove
         )
     }
 }
@@ -213,6 +222,8 @@ impl From<u16> for ProposalType {
             0x0009 => ProposalType::AppEphemeral,
             // rust-rcs-core: RCC.16 self_remove instead of 0x000a
             0xF003 => ProposalType::SelfRemove,
+            // rust-rcs-core: RCC.16 server_remove
+            0xF004 => ProposalType::ServerRemove,
             other if crate::grease::is_grease_value(other) => ProposalType::Grease(other),
             other => ProposalType::Custom(other),
         }
@@ -235,6 +246,8 @@ impl From<ProposalType> for u16 {
             ProposalType::AppEphemeral => 0x0009,
             // rust-rcs-core: RCC.16 self_remove instead of 0x000a
             ProposalType::SelfRemove => 0xF003,
+            // rust-rcs-core: RCC.16 server_remove
+            ProposalType::ServerRemove => 0xF004,
             ProposalType::Grease(id) => id,
             ProposalType::Custom(id) => id,
         }
@@ -296,6 +309,9 @@ pub enum Proposal {
     // A SelfRemove proposal is an empty struct.
     #[cfg_attr(not(feature = "0-8-1-storage-format"), storage_tag = 8)]
     SelfRemove,
+    // rust-rcs-core: RCC.16 server_remove, laid out as a Remove
+    #[cfg_attr(not(feature = "0-8-1-storage-format"), storage_tag = 12)]
+    ServerRemove(Box<RemoveProposal>),
     #[cfg(feature = "extensions-draft")]
     #[cfg_attr(not(feature = "0-8-1-storage-format"), storage_tag = 11)]
     AppEphemeral(Box<AppEphemeralProposal>),
@@ -307,6 +323,11 @@ impl Proposal {
     /// Build a remove proposal.
     pub(crate) fn remove(r: RemoveProposal) -> Self {
         Self::Remove(Box::new(r))
+    }
+
+    /// Build a server_remove proposal of RCC.16 (rust-rcs-core).
+    pub fn server_remove(removed: LeafNodeIndex) -> Self {
+        Self::ServerRemove(Box::new(RemoveProposal { removed }))
     }
 
     /// Build an add proposal.
@@ -358,6 +379,7 @@ impl Proposal {
             #[cfg(feature = "extensions-draft")]
             Proposal::AppDataUpdate(_) => ProposalType::AppDataUpdate,
             Proposal::SelfRemove => ProposalType::SelfRemove,
+            Proposal::ServerRemove(_) => ProposalType::ServerRemove,
             #[cfg(feature = "extensions-draft")]
             Proposal::AppEphemeral(_) => ProposalType::AppEphemeral,
             Proposal::Custom(custom) => ProposalType::Custom(custom.proposal_type.to_owned()),
@@ -378,15 +400,29 @@ impl Proposal {
             // Updates have the lowest priority.
             (Proposal::Update(_), _) => true,
             // Removes have a higher priority than Updates.
-            (Proposal::Remove(_), Proposal::Update(_)) => false,
+            (Proposal::Remove(_) | Proposal::ServerRemove(_), Proposal::Update(_)) => false,
             // Later Removes trump earlier Removes
-            (Proposal::Remove(_), Proposal::Remove(_)) => true,
+            (
+                Proposal::Remove(_) | Proposal::ServerRemove(_),
+                Proposal::Remove(_) | Proposal::ServerRemove(_),
+            ) => true,
             // SelfRemoves have the highest priority.
             (_, Proposal::SelfRemove) => true,
+            // rust-rcs-core: and stay when a (Server)Remove of the leaf follows
+            (Proposal::SelfRemove, _) => false,
             _ => {
                 debug_assert!(false);
                 false
             }
+        }
+    }
+
+    // Get this proposal as a `RemoveProposal`, be it a Remove or a ServerRemove
+    // (rust-rcs-core).
+    pub(crate) fn as_any_remove(&self) -> Option<&RemoveProposal> {
+        match self {
+            Self::Remove(v) | Self::ServerRemove(v) => Some(v),
+            _ => None,
         }
     }
 
