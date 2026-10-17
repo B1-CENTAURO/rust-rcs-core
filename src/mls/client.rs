@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -73,7 +75,7 @@ pub struct MlsClient {
     credential: CredentialWithKey,
     ciphersuite: Ciphersuite,
     config: MlsConfig,
-    validator: Box<dyn CredentialValidator>,
+    validator: Arc<dyn CredentialValidator>,
 }
 
 impl MlsClient {
@@ -125,7 +127,7 @@ impl MlsClient {
             credential,
             ciphersuite,
             config,
-            validator,
+            validator: validator.into(),
         })
     }
 
@@ -180,7 +182,7 @@ impl MlsClient {
             credential,
             ciphersuite,
             config,
-            validator,
+            validator: validator.into(),
         })
     }
 
@@ -229,6 +231,18 @@ impl MlsClient {
 
     pub(crate) fn validator(&self) -> &dyn CredentialValidator {
         self.validator.as_ref()
+    }
+
+    /// Copy of this client and its state, to try out changes on
+    pub(crate) fn fork(&self) -> Result<MlsClient> {
+        Ok(MlsClient {
+            provider: self.provider.fork()?,
+            signer: self.signer.clone(),
+            credential: self.credential.clone(),
+            ciphersuite: self.ciphersuite,
+            config: self.config,
+            validator: self.validator.clone(),
+        })
     }
 
     /// Leaf node capabilities, covering the extensions and proposals of RCC.16
@@ -323,17 +337,31 @@ impl MlsClient {
     /// 6.1.1). The GUID is written as 32 hex digits, the length of the group id
     /// fields of Annex C.4. Starting a new Era of a group requires deleting the
     /// old one first.
+    ///
+    /// The group takes on the continuity token kept for `group_id`, or a new one,
+    /// and commits to the keys of the icon and subject kept for it (sections
+    /// 8.3.1, 9.7.1.3).
     pub fn create_conversation(
         &self,
         group_id: Option<&[u8]>,
         era: u32,
     ) -> Result<MlsConversation> {
-        let era = Extension::Unknown(
+        let group_id = match group_id {
+            Some(group_id) => GroupId::from_slice(group_id),
+            None => GroupId::from_slice(uuid::Uuid::new_v4().simple().to_string().as_bytes()),
+        };
+
+        rcs::metadata::ensure_continuity_token(self, group_id.as_slice())?;
+        let mut extensions = vec![Extension::Unknown(
             rcs::EXTENSION_ERA,
             UnknownExtension(era.to_be_bytes().to_vec()),
-        );
-        let extensions =
-            Extensions::single(era).map_err(fail("Era extension", ErrorKind::InvalidState))?;
+        )];
+        extensions.extend(rcs::metadata::initial_context_extensions(
+            self,
+            group_id.as_slice(),
+        )?);
+        let extensions = Extensions::from_vec(extensions)
+            .map_err(fail("GroupContext extensions", ErrorKind::InvalidState))?;
 
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(self.ciphersuite)
@@ -342,11 +370,6 @@ impl MlsClient {
             .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
             .set_past_epoch_deletion_policy(self.past_epoch_deletion_policy())
             .build();
-
-        let group_id = match group_id {
-            Some(group_id) => GroupId::from_slice(group_id),
-            None => GroupId::from_slice(uuid::Uuid::new_v4().simple().to_string().as_bytes()),
-        };
 
         let group = MlsGroup::new_with_group_id(
             &self.provider,
@@ -366,6 +389,10 @@ impl MlsClient {
     /// Welcome (RCC.16 section 7.9.3); it may be left empty for a Welcome that
     /// carries the tree in an extension. Any attempt uses up the KeyPackage
     /// unless it is a last resort one, even one failing for lack of the tree.
+    ///
+    /// The keys of the icon and subject and the continuity token in the Welcome
+    /// are kept (RCC.16 section 9.7.1.3); a continuity token that differs from
+    /// the one kept so far replaces it, see `group_metadata()`.
     pub fn join_conversation(
         &self,
         welcome: &[u8],
@@ -399,6 +426,19 @@ impl MlsClient {
             _ => builder,
         };
 
+        let welcome_extensions: Vec<(u16, Vec<u8>)> = builder
+            .processed_welcome()
+            .unverified_group_info()
+            .extensions()
+            .iter()
+            .filter_map(|extension| match extension {
+                Extension::Unknown(extension_type, UnknownExtension(data)) => {
+                    Some((*extension_type, data.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
         let staged_welcome = builder
             .build()
             .map_err(fail("Welcome processing", ErrorKind::Rejected))?;
@@ -411,7 +451,9 @@ impl MlsClient {
             .into_group(&self.provider)
             .map_err(fail("joining group", ErrorKind::Storage))?;
 
-        Ok(MlsConversation::new(group))
+        let conversation = MlsConversation::new(group);
+        rcs::metadata::receive_welcome(&conversation, self, &welcome_extensions)?;
+        Ok(conversation)
     }
 
     /// Self-heals by re-joining a group through an External Commit, after losing
@@ -480,11 +522,23 @@ impl MlsClient {
         }
 
         // OpenMLS applies External Commits right away, unlike other Commits
-        let (commit, _, group_info) = bundle.into_contents();
-        let commit = commit
+        let commit = bundle
+            .into_commit()
             .to_bytes()
             .map_err(fail("Commit encoding", ErrorKind::BadFormat))?;
-        let group_info = MlsMessageOut::from(group_info.ok_or(ErrorKind::InvalidState)?)
+
+        rcs::metadata::drop_stale_keys(&conversation, self)?;
+        let keys = rcs::metadata::load(self, group_id.as_slice())?;
+        let extensions = rcs::metadata::group_info_extensions(&conversation, self, &keys)?;
+        let group_info = conversation
+            .group
+            .export_group_info_with_additional_extensions(
+                self.provider.crypto(),
+                &self.signer,
+                false,
+                extensions,
+            )
+            .map_err(fail("GroupInfo export", ErrorKind::InvalidState))?
             .to_bytes()
             .map_err(fail("GroupInfo encoding", ErrorKind::BadFormat))?;
 
@@ -493,6 +547,7 @@ impl MlsClient {
             welcome: None,
             group_info,
             epoch_authenticator: conversation.epoch_authenticator().to_vec(),
+            private_message: None,
             ratchet_tree: None,
             first_in_era: false,
         };

@@ -46,7 +46,7 @@ der = { version = "0.7", features = ["alloc", "derive", "oid"], optional = true 
 hkdf = { version = "0.12", optional = true }
 hmac = { version = "0.12", optional = true }
 openmls = { version = "0.9", optional = true }
-openmls_basic_credential = { version = "0.6", optional = true }
+openmls_basic_credential = { version = "0.6", optional = true, features = ["clonable"] }
 openmls_rust_crypto = { version = "0.6", optional = true }
 openmls_traits = { version = "0.6", optional = true }
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }

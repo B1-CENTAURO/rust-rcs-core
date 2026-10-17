@@ -73,6 +73,19 @@ pub struct FileInfo {
     pub icon: Option<FileMetadata>,
 }
 
+/// Keys of the encrypted group icon and subject, and the continuity token, in a
+/// group_metadata_keys SecretPayload (RCC.16 section 7.13.4)
+///
+/// RCC.16 v4.0 cuts the definition off after these two fields.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct GroupMetadataKeys {
+    #[prost(bytes = "vec", tag = "1")]
+    pub continuity_token: Vec<u8>,
+    /// FileInfo with the icon and subject fields set
+    #[prost(message, optional, tag = "2")]
+    pub group_subject_icon_keys: Option<FileInfo>,
+}
+
 /// Commit that adds Clients or starts an Era, with its Welcome
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct WelcomeCommitBundle {
