@@ -41,7 +41,7 @@ use crate::dns::DnsClient;
 use crate::io::network::stream;
 
 use super::request::{Request, GET};
-use super::{ipv4_first, ErrorKind, HttpClient, HttpConnectionHandle, Result};
+use super::{ipv4_first, ErrorKind, HttpClient, HttpConnectionHandle, Result, CONNECT_TIMEOUT};
 
 const SERVER_CERT: &[u8] = include_bytes!("testdata/server.der");
 const SERVER_KEY: &[u8] = include_bytes!("testdata/server.key.der");
@@ -111,6 +111,14 @@ fn http_then_https_server() -> u16 {
 /// A client with `root` as the only trusted certificate, resolving localhost
 /// to `localhost` without a DNS server.
 fn client(root: &[u8], localhost: &[IpAddr]) -> (Arc<Runtime>, HttpClient) {
+    client_with_timeout(root, localhost, CONNECT_TIMEOUT)
+}
+
+fn client_with_timeout(
+    root: &[u8],
+    localhost: &[IpAddr],
+    connect_timeout: Duration,
+) -> (Arc<Runtime>, HttpClient) {
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(root.to_vec())).unwrap();
     let config = ClientConfig::builder()
@@ -122,7 +130,12 @@ fn client(root: &[u8], localhost: &[IpAddr]) -> (Arc<Runtime>, HttpClient) {
     for ip in localhost {
         dns_client.cache_address("localhost", *ip);
     }
-    let client = HttpClient::new(Arc::new(config), dns_client, Arc::clone(&rt));
+    let client = HttpClient::with_connect_timeout(
+        Arc::new(config),
+        dns_client,
+        Arc::clone(&rt),
+        connect_timeout,
+    );
 
     (rt, client)
 }
@@ -301,4 +314,55 @@ fn https_offers_only_http_1_1() {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         "the shared config is left as it was"
     );
+}
+
+/// Accepts a connection and never answers the TLS handshake on it, then, when
+/// `then_serve`, serves one HTTPS request on the next connection. Returns the
+/// port.
+fn silent_server(then_serve: bool) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    thread::spawn(move || {
+        // kept open, so the client is left waiting rather than told to go
+        let (_silent, _) = listener.accept().unwrap();
+
+        if then_serve {
+            let (socket, _) = listener.accept().unwrap();
+            let conn = ServerConnection::new(server_config()).unwrap();
+            serve(&mut StreamOwned::new(conn, socket));
+        } else {
+            thread::sleep(Duration::from_secs(10));
+        }
+    });
+
+    port
+}
+
+#[test]
+fn silent_server_times_out() {
+    let port = silent_server(false);
+    let (rt, client) =
+        client_with_timeout(SERVER_CERT, &[V4_LOCALHOST], Duration::from_millis(200));
+    let result = connect(&rt, &client, &format!("https://127.0.0.1:{}/", port));
+    assert!(
+        matches!(result, Err(ErrorKind::Timeout)),
+        "{:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn next_address_is_tried_after_a_timeout() {
+    // the same address twice: the first connection to it goes unanswered
+    let port = silent_server(true);
+    let (rt, client) = client_with_timeout(
+        SERVER_CERT,
+        &[V4_LOCALHOST, V4_LOCALHOST],
+        Duration::from_secs(1),
+    );
+    let conn = connect(&rt, &client, &format!("https://localhost:{}/", port))
+        .ok()
+        .expect("connect failed");
+    get_ok(&rt, &conn, "localhost");
 }
