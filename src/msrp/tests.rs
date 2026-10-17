@@ -15,6 +15,7 @@
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
@@ -23,11 +24,12 @@ use crate::internet::header::Header;
 use crate::internet::headers::byte_range;
 use crate::io::DynamicChain;
 
-use super::msrp_channel::MsrpChannel;
+use super::msrp_channel::{route, MsrpChannel, MsrpChannelManager};
 use super::msrp_chunk::{ContinuationFlag, MsrpChunk, MsrpRequestLine, MsrpResponseLine};
 use super::msrp_demuxer::MsrpDemuxer;
 use super::msrp_muxer::{MsrpDataWriter, MsrpMessageReceiver, MsrpMuxer};
 use super::msrp_parser::MsrpParser;
+use super::msrp_transport::msrp_transport_start;
 
 // modelled on the Alice and Bob exchange in RFC 4975 section 4
 const SEND: &[u8] = b"MSRP a786hjs2 SEND\r\n\
@@ -1057,4 +1059,291 @@ fn a_message_goes_from_demuxer_to_channel_and_back() {
         .collect();
     assert_eq!(received.as_bytes(), &body[..]);
     assert_eq!(log.last().unwrap(), "complete");
+}
+
+fn send_message(
+    demuxer: &MsrpDemuxer,
+    from_path: &str,
+    to_path: &str,
+    body: Vec<u8>,
+    tx: mpsc::Sender<MsrpChunk>,
+    rt: &Arc<Runtime>,
+) -> Results {
+    let results: Results = Arc::default();
+    let results_ = Arc::clone(&results);
+    demuxer.start(
+        from_path.as_bytes().to_vec(),
+        to_path.as_bytes().to_vec(),
+        Some(b"text/plain".to_vec()),
+        body.len(),
+        std::io::Cursor::new(body),
+        move |status_code, reason_phrase| {
+            results_.lock().unwrap().push((status_code, reason_phrase));
+        },
+        tx,
+        rt,
+    );
+    results
+}
+
+fn wait_for<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..500 {
+        if let Some(value) = check() {
+            return value;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {}", what);
+}
+
+fn received(log: &Log) -> Option<Vec<u8>> {
+    let log = log.0.lock().unwrap();
+    if log.last().map(String::as_str) == Some("complete") {
+        Some(
+            log.iter()
+                .filter_map(|entry| entry.strip_prefix("write "))
+                .collect::<String>()
+                .into_bytes(),
+        )
+    } else {
+        None
+    }
+}
+
+fn result(results: &Results) -> Option<Vec<(u16, String)>> {
+    let results = results.lock().unwrap();
+    if results.is_empty() {
+        None
+    } else {
+        Some(results.clone())
+    }
+}
+
+/// Starts a transport on `io` that routes to `channels`, and returns a sender
+/// of chunks onto it.
+fn transport(
+    io: DuplexStream,
+    channels: &Arc<Mutex<Vec<MsrpChannel>>>,
+    rt: &Arc<Runtime>,
+) -> mpsc::Sender<MsrpChunk> {
+    let (data_tx, data_rx) = mpsc::channel(8);
+    let channels = Arc::clone(channels);
+    msrp_transport_start(
+        io,
+        "bob".into(),
+        data_tx.clone(),
+        data_rx,
+        move |message| route(&channels, message),
+        || {},
+        rt,
+    );
+
+    let (tx, mut rx) = mpsc::channel::<MsrpChunk>(8);
+    rt.spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            let _ = data_tx.send(Some(serialize(&chunk))).await;
+        }
+    });
+    tx
+}
+
+#[test]
+fn messages_cross_one_connection_both_ways() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (alice_io, bob_io) = tokio::io::duplex(64 * 1024);
+
+    let bob_log = Log::default();
+    let bob_demuxer = Arc::new(MsrpDemuxer::new(
+        BOB.as_bytes().to_vec(),
+        ALICE.as_bytes().to_vec(),
+    ));
+    let bob_channels = Arc::new(Mutex::new(vec![MsrpChannel::new(
+        BOB.as_bytes().to_vec(),
+        ALICE.as_bytes().to_vec(),
+        Arc::clone(&bob_demuxer),
+        muxer(&bob_log),
+    )]));
+    let bob_tx = transport(bob_io, &bob_channels, &rt);
+
+    // Alice's manager opens the connection with her first chunk
+    let opened = Arc::new(Mutex::new(0));
+    let opened_ = Arc::clone(&opened);
+    let alice_io = Mutex::new(Some(alice_io));
+    let (alice_tx, alice_rx) = mpsc::channel(8);
+    let manager = MsrpChannelManager::new(
+        alice_rx,
+        move |_: &[u8], _: &[u8]| {
+            *opened_.lock().unwrap() += 1;
+            alice_io
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| tokio::io::duplex(1).0)
+        },
+        Arc::clone(&rt),
+    );
+    let alice_log = Log::default();
+    let alice_demuxer = Arc::new(demuxer());
+    manager.register_channel(MsrpChannel::new(
+        ALICE.as_bytes().to_vec(),
+        BOB.as_bytes().to_vec(),
+        Arc::clone(&alice_demuxer),
+        muxer(&alice_log),
+    ));
+
+    let to_bob: Vec<u8> = (0..25 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
+    let alice_results = send_message(&alice_demuxer, ALICE, BOB, to_bob.clone(), alice_tx, &rt);
+    assert_eq!(wait_for("Bob to receive", || received(&bob_log)), to_bob);
+    assert_eq!(
+        wait_for("Alice's result", || result(&alice_results)),
+        vec![(200, "Ok".to_string())]
+    );
+    assert_eq!(*opened.lock().unwrap(), 1, "one connection for all chunks");
+
+    let to_alice: Vec<u8> = (0..12 * 1024).map(|i| b'A' + (i % 26) as u8).collect();
+    let bob_results = send_message(&bob_demuxer, BOB, ALICE, to_alice.clone(), bob_tx, &rt);
+    assert_eq!(
+        wait_for("Alice to receive", || received(&alice_log)),
+        to_alice
+    );
+    assert_eq!(
+        wait_for("Bob's result", || result(&bob_results)),
+        vec![(200, "Ok".to_string())]
+    );
+    assert_eq!(*opened.lock().unwrap(), 1);
+}
+
+fn read_messages(rt: &Runtime, io: &mut DuplexStream, n: usize) -> Vec<Parsed> {
+    rt.block_on(async {
+        let mut parser = MsrpParser::new();
+        let mut messages = Vec::new();
+        let mut buf = [0; 4096];
+        while messages.len() < n {
+            let size = timeout(Duration::from_secs(5), io.read(&mut buf))
+                .await
+                .expect("no reply")
+                .unwrap();
+            assert!(size > 0, "connection closed");
+            parser.feed(&buf[..size]);
+            while let Some(chunk) = parser.produce().unwrap() {
+                messages.push(parsed(&chunk));
+            }
+        }
+        messages
+    })
+}
+
+#[test]
+fn a_connection_outlives_requests_for_no_session() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (mut alice_io, bob_io) = tokio::io::duplex(64 * 1024);
+    let bob_channels = Arc::new(Mutex::new(Vec::new()));
+    let _bob_tx = transport(bob_io, &bob_channels, &rt);
+
+    // a REPORT, which gets no response, and two SENDs in one write
+    let mut data = REPORT.to_vec();
+    data.extend_from_slice(SEND);
+    data.extend_from_slice(EMPTY_SEND);
+    rt.block_on(alice_io.write_all(&data)).unwrap();
+
+    let no_session = |transaction_id: &str| {
+        Parsed::Response(
+            transaction_id.into(),
+            481,
+            Some("Session does not exist".into()),
+            pairs(&[("To-Path", ALICE), ("From-Path", BOB)]),
+        )
+    };
+    assert_eq!(
+        read_messages(&rt, &mut alice_io, 2),
+        vec![no_session("a786hjs2"), no_session("9di4ea")]
+    );
+
+    let bob_log = Log::default();
+    bob_channels.lock().unwrap().push(channel(&bob_log));
+    rt.block_on(alice_io.write_all(SEND)).unwrap();
+    assert_eq!(
+        read_messages(&rt, &mut alice_io, 1),
+        vec![Parsed::Response(
+            "a786hjs2".into(),
+            200,
+            Some("OK".into()),
+            pairs(&[
+                ("To-Path", ALICE),
+                ("From-Path", BOB),
+                ("Message-ID", "87652491")
+            ]),
+        )]
+    );
+    assert_eq!(
+        received(&bob_log),
+        Some(b"Hey Bob, are you there?".to_vec())
+    );
+}
+
+#[test]
+fn sessions_are_matched_by_uri() {
+    let bob_log = Log::default();
+    let channels = Mutex::new(vec![channel(&bob_log)]);
+    let status = |to_path: &str| {
+        let chunk = request(
+            "t1",
+            "SEND",
+            &[
+                ("To-Path", to_path),
+                ("From-Path", ALICE),
+                ("Message-ID", "m1"),
+            ],
+            None,
+            ContinuationFlag::Complete,
+        );
+        match route(&channels, chunk).unwrap().first().map(parsed) {
+            Some(Parsed::Response(_, status_code, _, _)) => status_code,
+            other => panic!("{:?}", other),
+        }
+    };
+
+    assert_eq!(status(BOB), 200);
+    assert_eq!(
+        status("MSRP://Biloxi.Example.COM:12763/kjhd37s2s20w2a;TCP;x=y"),
+        200,
+        "case and parameters do not count"
+    );
+    assert_eq!(
+        status("msrp://biloxi.example.com:12763/KJHD37S2S20W2A;tcp"),
+        481,
+        "the session-id is case sensitive"
+    );
+    assert_eq!(
+        status("msrp://biloxi.example.com:12764/kjhd37s2s20w2a;tcp"),
+        481,
+        "another port"
+    );
+}
+
+#[test]
+fn a_transport_ends_when_the_peer_closes() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (io, peer) = tokio::io::duplex(1024);
+    let (data_tx, data_rx) = mpsc::channel(8);
+    let released = Arc::new(Mutex::new(false));
+    let released_ = Arc::clone(&released);
+    msrp_transport_start(
+        io,
+        "closing".into(),
+        data_tx,
+        data_rx,
+        |_| Ok(Vec::new()),
+        move || *released_.lock().unwrap() = true,
+        &rt,
+    );
+
+    drop(peer);
+    wait_for("the transport to end", || {
+        if *released.lock().unwrap() {
+            Some(())
+        } else {
+            None
+        }
+    });
 }
