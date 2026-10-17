@@ -25,6 +25,9 @@ pub mod decompress;
 pub mod request;
 pub mod response;
 
+#[cfg(test)]
+mod tests;
+
 use std::fmt;
 use std::io;
 use std::io::Read;
@@ -243,6 +246,10 @@ impl HttpClient {
 
                                             match dns_client.resolve(dns_config, domain.clone()).await {
                                                 Ok(mut stream) => {
+                                                    // Dns unless an address was tried, then the
+                                                    // last connect error, e.g. a TLS failure
+                                                    let mut error = ErrorKind::Dns;
+
                                                     while let Some(ip) = stream.next().await {
                                                         if let IpAddr::V6(_) = ip {
                                                             continue; // to-do: IPv6 not supported?
@@ -278,11 +285,12 @@ impl HttpClient {
                                                                         e
                                                                     ),
                                                                 );
+                                                                error = e;
                                                             }
                                                         }
                                                     }
 
-                                                    match tx.send(Err(ErrorKind::Dns)) {
+                                                    match tx.send(Err(error)) {
                                                         Ok(()) => {
                                                             return;
                                                         }
@@ -311,7 +319,7 @@ impl HttpClient {
                                         let connections = Arc::clone(&connections);
 
                                         tokio::spawn(async move {
-                                            if let Ok(handle) = Self::connect_inner(
+                                            match Self::connect_inner(
                                                 tls,
                                                 host,
                                                 IpAddr::V4(ip),
@@ -323,13 +331,27 @@ impl HttpClient {
                                             )
                                             .await
                                             {
-                                                match tx.send(Ok(handle)) {
+                                                Ok(handle) => match tx.send(Ok(handle)) {
                                                     Ok(()) => {
                                                         return;
                                                     }
 
                                                     Err(_) => {
                                                         panic!("")
+                                                    }
+                                                },
+
+                                                Err(e) => {
+                                                    platform_log(
+                                                        LOG_TAG,
+                                                        format!(
+                                                            "connect_inner failed with error {:?}",
+                                                            e
+                                                        ),
+                                                    );
+                                                    match tx.send(Err(e)) {
+                                                        Ok(()) => {}
+                                                        Err(_) => {}
                                                     }
                                                 }
                                             }
@@ -341,7 +363,7 @@ impl HttpClient {
                                         let connections = Arc::clone(&connections);
 
                                         tokio::spawn(async move {
-                                            if let Ok(handle) = Self::connect_inner(
+                                            match Self::connect_inner(
                                                 tls,
                                                 host,
                                                 IpAddr::V6(ip),
@@ -353,13 +375,27 @@ impl HttpClient {
                                             )
                                             .await
                                             {
-                                                match tx.send(Ok(handle)) {
+                                                Ok(handle) => match tx.send(Ok(handle)) {
                                                     Ok(()) => {
                                                         return;
                                                     }
 
                                                     Err(_) => {
                                                         panic!("")
+                                                    }
+                                                },
+
+                                                Err(e) => {
+                                                    platform_log(
+                                                        LOG_TAG,
+                                                        format!(
+                                                            "connect_inner failed with error {:?}",
+                                                            e
+                                                        ),
+                                                    );
+                                                    match tx.send(Err(e)) {
+                                                        Ok(()) => {}
+                                                        Err(_) => {}
                                                     }
                                                 }
                                             }
@@ -592,7 +628,7 @@ impl HttpClient {
                         ))
                         .await
                     {
-                        Ok(()) => request_rx.await.unwrap(),
+                        Ok(()) => request_rx.await.unwrap_or(Err(ErrorKind::BrokenPipe)),
 
                         Err(_) => Err(ErrorKind::BrokenPipe),
                     }
@@ -613,7 +649,7 @@ impl HttpClient {
                         ))
                         .await
                     {
-                        Ok(()) => request_rx.await.unwrap(),
+                        Ok(()) => request_rx.await.unwrap_or(Err(ErrorKind::BrokenPipe)),
 
                         Err(_) => Err(ErrorKind::BrokenPipe),
                     }
@@ -634,7 +670,7 @@ impl HttpClient {
                         ))
                         .await
                     {
-                        Ok(()) => request_rx.await.unwrap(),
+                        Ok(()) => request_rx.await.unwrap_or(Err(ErrorKind::BrokenPipe)),
 
                         Err(_) => Err(ErrorKind::BrokenPipe),
                     }
