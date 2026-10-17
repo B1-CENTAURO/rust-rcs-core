@@ -31,8 +31,15 @@ use std::sync::Arc;
 use std::thread;
 
 use futures::AsyncReadExt;
+use rustls::crypto::ring::cipher_suite::{
+    TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
+    TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+};
+use rustls::crypto::{ring, CryptoProvider};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+use rustls::{
+    ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned, SupportedCipherSuite,
+};
 use tokio::runtime::Runtime;
 use tokio::time::{timeout, Duration};
 use url::Url;
@@ -51,7 +58,13 @@ const V4_LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const V6_LOCALHOST: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
 
 fn server_config() -> Arc<ServerConfig> {
-    let config = ServerConfig::builder()
+    server_config_with(ring::default_provider())
+}
+
+fn server_config_with(provider: CryptoProvider) -> Arc<ServerConfig> {
+    let config = ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .unwrap()
         .with_no_client_auth()
         .with_single_cert(
             vec![CertificateDer::from(SERVER_CERT.to_vec())],
@@ -77,12 +90,16 @@ fn serve(stream: &mut (impl Read + Write)) {
 
 /// Serves one HTTPS request, returning the port.
 fn https_server() -> u16 {
+    https_server_with(server_config())
+}
+
+fn https_server_with(config: Arc<ServerConfig>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
     thread::spawn(move || {
         let (socket, _) = listener.accept().unwrap();
-        let conn = ServerConnection::new(server_config()).unwrap();
+        let conn = ServerConnection::new(config).unwrap();
         serve(&mut StreamOwned::new(conn, socket));
     });
 
@@ -187,6 +204,27 @@ fn https_to_trusted_server() {
         let conn = result.ok().expect("connect failed");
         assert!(conn.cipher_id().is_some());
         get_ok(&rt, &conn, host);
+    }
+}
+
+#[test]
+fn cipher_id_is_the_negotiated_suite() {
+    // what GBA puts in the NAF-ID; a TLS 1.3 suite as a TLS 1.2 one
+    let cases: [(SupportedCipherSuite, (u8, u8)); 3] = [
+        (TLS13_AES_256_GCM_SHA384, (0x13, 0x02)),
+        (TLS13_CHACHA20_POLY1305_SHA256, (0x13, 0x03)),
+        (TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, (0xC0, 0x2B)),
+    ];
+    for (suite, cipher_id) in cases {
+        let config = server_config_with(CryptoProvider {
+            cipher_suites: vec![suite],
+            ..ring::default_provider()
+        });
+        let port = https_server_with(config);
+        let (rt, result) = connect_once(SERVER_CERT, &format!("https://127.0.0.1:{}/", port));
+        let conn = result.ok().expect("connect failed");
+        assert_eq!(conn.cipher_id(), Some(cipher_id), "{:?}", suite);
+        get_ok(&rt, &conn, "127.0.0.1");
     }
 }
 
