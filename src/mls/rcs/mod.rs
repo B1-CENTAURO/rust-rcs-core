@@ -18,14 +18,20 @@
 //! The interface between a client and its Home KDS is vendor specific
 //! (RCC.16 section 5.1), so fetching and uploading KeyPackages is left to the caller.
 
+pub mod certificate;
 pub mod file;
 pub mod messaging;
 pub mod proto;
 pub mod wire;
 
 #[cfg(test)]
+mod certificate_tests;
+#[cfg(test)]
 mod tests;
 
+pub use certificate::{
+    x509_credential, CertificateError, ClientCertificate, RcsCredentialValidator,
+};
 pub use messaging::DecryptedMessage;
 pub use wire::{ClientFailureReason, SecretPayloadType};
 

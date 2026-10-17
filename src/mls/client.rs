@@ -30,9 +30,30 @@ const SNAPSHOT_VERSION: u8 = 1;
 /// MLS leaves authenticating members to the application (RFC 9420, Section 5.3.1).
 /// Every credential is passed through here before it enters local group state:
 /// KeyPackages about to be added, all members of a group joined through a Welcome,
-/// and every credential introduced by a Commit.
+/// every credential introduced by a Commit, and the credential of the committer.
+///
+/// `rcs::certificate::RcsCredentialValidator` implements the rules of RCC.16.
 pub trait CredentialValidator: Send + Sync {
     fn validate(&self, credential: &Credential, signature_key: &[u8]) -> bool;
+
+    /// Decides whether this client may add the owner of `credential` to a group,
+    /// which can be stricter than accepting one others added
+    fn validate_addition(&self, credential: &Credential, signature_key: &[u8]) -> bool {
+        self.validate(credential, signature_key)
+    }
+
+    /// Decides whether `new` may take the place of `old` in the same leaf, through
+    /// the committer's own update or a resync External Commit; unlike `old`, `new`
+    /// is not yet trusted
+    fn validate_replacement(
+        &self,
+        old: &Credential,
+        new: &Credential,
+        signature_key: &[u8],
+    ) -> bool {
+        let _ = old;
+        self.validate(new, signature_key)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
