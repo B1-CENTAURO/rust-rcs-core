@@ -657,6 +657,12 @@ fn gba_me_ks_naf(ks: &[u8], rand: &[u8], impi: &[u8], naf_id: &[u8]) -> Result<V
     gba_kdf(ks, b"gba-me", rand, impi, naf_id)
 }
 
+// The FQDN of the NAF followed by the Ua security protocol identifier of
+// 3GPP TS 33.220 Annex H: (0x01,0x00,0x01,yy,zz) for HTTP Digest over TLS
+// (TS 33.222 section 5.3), (yy,zz) being the code of the negotiated cipher
+// suite, or (0x01,0x00,0x00,0x00,0x02) for HTTP Digest without TLS
+// (TS 24.109). A TLS 1.3 suite is put in as a TLS 1.2 one is, e.g. 0x13,0x01
+// for TLS_AES_128_GCM_SHA256, as Android's GBA API (TlsParams) takes it.
 fn gba_get_naf_id(fqdn: &[u8], cipher_id: Option<(u8, u8)>) -> Vec<u8> {
     let mut naf_id = Vec::with_capacity(fqdn.len() + 5);
 
@@ -805,4 +811,26 @@ pub enum ErrorKind {
     Authentication,
     BadInput,
     Hmac,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gba_get_naf_id;
+
+    #[test]
+    fn naf_id_carries_the_cipher_suite() {
+        let fqdn = b"config.rcs.example.com";
+        let naf_id = |cipher_id| {
+            let naf_id = gba_get_naf_id(fqdn, cipher_id);
+            assert_eq!(&naf_id[..fqdn.len()], fqdn);
+            naf_id[fqdn.len()..].to_vec()
+        };
+
+        // TLS_AES_128_GCM_SHA256, TLS 1.3
+        assert_eq!(naf_id(Some((0x13, 0x01))), [0x01, 0x00, 0x01, 0x13, 0x01]);
+        // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS 1.2
+        assert_eq!(naf_id(Some((0xC0, 0x2B))), [0x01, 0x00, 0x01, 0xC0, 0x2B]);
+        // plain HTTP
+        assert_eq!(naf_id(None), [0x01, 0x00, 0x00, 0x00, 0x02]);
+    }
 }
