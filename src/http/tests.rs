@@ -26,7 +26,7 @@
 // that must reject the server.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
 use std::sync::Arc;
 use std::thread;
 
@@ -41,14 +41,16 @@ use crate::dns::DnsClient;
 use crate::io::network::stream;
 
 use super::request::{Request, GET};
-use super::{ErrorKind, HttpClient, HttpConnectionHandle, Result};
+use super::{ipv4_first, ErrorKind, HttpClient, HttpConnectionHandle, Result};
 
 const SERVER_CERT: &[u8] = include_bytes!("testdata/server.der");
 const SERVER_KEY: &[u8] = include_bytes!("testdata/server.key.der");
 const OTHER_CERT: &[u8] = include_bytes!("testdata/other.der");
 
-/// Serves one HTTPS request with a fixed "ok" body, returning the port.
-fn https_server() -> u16 {
+const V4_LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+const V6_LOCALHOST: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+fn server_config() -> Arc<ServerConfig> {
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
@@ -56,31 +58,59 @@ fn https_server() -> u16 {
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(SERVER_KEY.to_vec())),
         )
         .unwrap();
+    Arc::new(config)
+}
+
+/// Answers one request with a fixed "ok" body.
+fn serve(stream: &mut (impl Read + Write)) {
+    let mut request = Vec::new();
+    let mut buf = [0; 1024];
+    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return, // e.g. the client gave up on the handshake
+            Ok(size) => request.extend_from_slice(&buf[..size]),
+        }
+    }
+    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let _ = stream.flush();
+}
+
+/// Serves one HTTPS request, returning the port.
+fn https_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
     thread::spawn(move || {
         let (socket, _) = listener.accept().unwrap();
-        let conn = ServerConnection::new(Arc::new(config)).unwrap();
-        let mut tls = StreamOwned::new(conn, socket);
-        let mut request = Vec::new();
-        let mut buf = [0; 1024];
-        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-            match tls.read(&mut buf) {
-                Ok(0) | Err(_) => return, // the client gave up on the handshake
-                Ok(size) => request.extend_from_slice(&buf[..size]),
-            }
-        }
-        let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
-        let _ = tls.flush();
+        let conn = ServerConnection::new(server_config()).unwrap();
+        serve(&mut StreamOwned::new(conn, socket));
     });
 
     port
 }
 
-/// Connects to `url` with `root` as the only trusted certificate, resolving
-/// localhost without a DNS server.
-fn connect(root: &[u8], url: &str) -> (Arc<Runtime>, Result<HttpConnectionHandle>) {
+/// Serves one plain HTTP request and then, on a second connection to the
+/// same port, one HTTPS request, returning the port.
+fn http_then_https_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    thread::spawn(move || {
+        // kept open, so the client could reuse it
+        let (mut plain, _) = listener.accept().unwrap();
+        serve(&mut plain);
+
+        let (socket, _) = listener.accept().unwrap();
+        let conn = ServerConnection::new(server_config()).unwrap();
+        serve(&mut StreamOwned::new(conn, socket));
+    });
+
+    port
+}
+
+/// A client with `root` as the only trusted certificate, resolving localhost
+/// to `localhost` without a DNS server.
+fn client(root: &[u8], localhost: &[IpAddr]) -> (Arc<Runtime>, HttpClient) {
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(root.to_vec())).unwrap();
     let config = ClientConfig::builder()
@@ -89,16 +119,27 @@ fn connect(root: &[u8], url: &str) -> (Arc<Runtime>, Result<HttpConnectionHandle
 
     let rt = Arc::new(Runtime::new().unwrap());
     let dns_client = Arc::new(DnsClient::new(Arc::clone(&rt)));
-    dns_client.cache_address("localhost", IpAddr::V4(Ipv4Addr::LOCALHOST));
+    for ip in localhost {
+        dns_client.cache_address("localhost", *ip);
+    }
     let client = HttpClient::new(Arc::new(config), dns_client, Arc::clone(&rt));
 
+    (rt, client)
+}
+
+fn connect(rt: &Runtime, client: &HttpClient, url: &str) -> Result<HttpConnectionHandle> {
     let url = Url::parse(url).unwrap();
-    let result = rt.block_on(async {
+    rt.block_on(async {
         timeout(Duration::from_secs(10), client.connect(&url, false))
             .await
             .expect("connect timed out")
-    });
+    })
+}
 
+/// Connects to `url` with a new client, see `client()`.
+fn connect_once(root: &[u8], url: &str) -> (Arc<Runtime>, Result<HttpConnectionHandle>) {
+    let (rt, client) = client(root, &[V4_LOCALHOST]);
+    let result = connect(&rt, &client, url);
     (rt, result)
 }
 
@@ -129,7 +170,7 @@ fn is_handshake_failure(result: &Result<HttpConnectionHandle>) -> bool {
 fn https_to_trusted_server() {
     for host in ["127.0.0.1", "localhost"] {
         let port = https_server();
-        let (rt, result) = connect(SERVER_CERT, &format!("https://{}:{}/", host, port));
+        let (rt, result) = connect_once(SERVER_CERT, &format!("https://{}:{}/", host, port));
         let conn = result.ok().expect("connect failed");
         assert!(conn.cipher_id().is_some());
         get_ok(&rt, &conn, host);
@@ -140,21 +181,67 @@ fn https_to_trusted_server() {
 fn untrusted_certificate_is_a_handshake_failure() {
     for host in ["127.0.0.1", "localhost"] {
         let port = https_server();
-        let (_rt, result) = connect(OTHER_CERT, &format!("https://{}:{}/", host, port));
+        let (_rt, result) = connect_once(OTHER_CERT, &format!("https://{}:{}/", host, port));
         assert!(is_handshake_failure(&result), "{} {:?}", host, result.err());
     }
 }
 
+fn unused_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
 #[test]
 fn refused_connection_is_reported_for_ip_hosts() {
-    let port = {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
-    let (_rt, result) = connect(SERVER_CERT, &format!("http://127.0.0.1:{}/", port));
+    let port = unused_port();
+    let (_rt, result) = connect_once(SERVER_CERT, &format!("http://127.0.0.1:{}/", port));
     assert!(
         matches!(result, Err(ErrorKind::Stream(stream::ErrorKind::Io))),
         "{:?}",
         result.err()
     );
+}
+
+#[test]
+fn ipv6_addresses_are_tried() {
+    // refused, or unsupported where the host has no IPv6, but not skipped,
+    // which would leave nothing to try and report Dns
+    let (rt, client) = client(SERVER_CERT, &[V6_LOCALHOST]);
+    let result = connect(
+        &rt,
+        &client,
+        &format!("http://localhost:{}/", unused_port()),
+    );
+    assert!(
+        matches!(result, Err(ErrorKind::Stream(stream::ErrorKind::Io))),
+        "{:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn ipv4_addresses_are_tried_first() {
+    let v4 = |n| IpAddr::V4(Ipv4Addr::new(10, 0, 0, n));
+    let v6 = |n| IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, n));
+    let mut addresses = [v6(1), v4(1), v6(2), v4(2)];
+    ipv4_first(&mut addresses);
+    assert_eq!(addresses, [v4(1), v4(2), v6(1), v6(2)]);
+}
+
+#[test]
+fn https_does_not_reuse_a_plain_connection() {
+    let port = http_then_https_server();
+    let (rt, client) = client(SERVER_CERT, &[V4_LOCALHOST]);
+
+    let plain = connect(&rt, &client, &format!("http://localhost:{}/", port))
+        .ok()
+        .expect("connect failed");
+    assert!(plain.cipher_id().is_none());
+    get_ok(&rt, &plain, "localhost");
+
+    let tls = connect(&rt, &client, &format!("https://localhost:{}/", port))
+        .ok()
+        .expect("connect failed");
+    assert!(tls.cipher_id().is_some());
+    get_ok(&rt, &tls, "localhost");
 }

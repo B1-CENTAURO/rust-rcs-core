@@ -188,7 +188,7 @@ impl HttpClient {
                                     let mut guard = connections.lock().unwrap();
 
                                     for (conn, req_tx) in &mut *guard {
-                                        if conn.host == host && conn.port == port {
+                                        if conn.host == host && conn.port == port && conn.tls == tls {
                                             let mut conn_guard = conn.state.lock().unwrap();
                                             match &mut *conn_guard {
                                                 ConnectionState::Idle(_) if conn.can_pipeline == can_pipeline => {
@@ -245,15 +245,15 @@ impl HttpClient {
                                             let dns_config = DnsConfig { server_addrs: dns_servers };
 
                                             match dns_client.resolve(dns_config, domain.clone()).await {
-                                                Ok(mut stream) => {
+                                                Ok(stream) => {
+                                                    let mut addresses: Vec<IpAddr> = stream.collect().await;
+                                                    ipv4_first(&mut addresses);
+
                                                     // Dns unless an address was tried, then the
                                                     // last connect error, e.g. a TLS failure
                                                     let mut error = ErrorKind::Dns;
 
-                                                    while let Some(ip) = stream.next().await {
-                                                        if let IpAddr::V6(_) = ip {
-                                                            continue; // to-do: IPv6 not supported?
-                                                        }
+                                                    for ip in addresses {
                                                         let client_config = Arc::clone(&client_config);
                                                         match Self::connect_inner(
                                                             tls,
@@ -456,7 +456,7 @@ impl HttpClient {
             let (stream, cipher_id) =
                 Self::connect_tls(addr, port, client_config, server_name).await?;
             let now = Instant::now();
-            let conn = HttpConnection::new(host, port, cipher_id, can_pipeline, now);
+            let conn = HttpConnection::new(host, port, true, cipher_id, can_pipeline, now);
             let conn = Arc::new(conn);
             let conn_ = Arc::clone(&conn);
             let req_tx = setup_http_connection(connections, &conn, stream);
@@ -476,7 +476,7 @@ impl HttpClient {
         } else {
             let stream = Self::connect_tcp(addr, port).await?;
             let now = Instant::now();
-            let conn = HttpConnection::new(host, port, None, can_pipeline, now);
+            let conn = HttpConnection::new(host, port, false, None, can_pipeline, now);
             let conn = Arc::new(conn);
             let req_tx = setup_http_connection(connections, &conn, stream);
             let conn_ = Arc::clone(&conn);
@@ -742,6 +742,7 @@ pub struct HttpConnection {
     can_pipeline: bool,
     host: Host,
     port: u16,
+    tls: bool,
     cipher_id: Option<(u8, u8)>,
 }
 
@@ -749,6 +750,7 @@ impl HttpConnection {
     pub fn new(
         host: Host,
         port: u16,
+        tls: bool,
         cipher_id: Option<(u8, u8)>,
         can_pipeline: bool,
         now: Instant,
@@ -760,9 +762,17 @@ impl HttpConnection {
             can_pipeline,
             host,
             port,
+            tls,
             cipher_id,
         }
     }
+}
+
+// IPv4 addresses before IPv6 ones, each family in DNS order: IPv4 was the only
+// family tried before, so hosts with both still connect the way they did and
+// IPv6 is the fallback
+fn ipv4_first(addresses: &mut [IpAddr]) {
+    addresses.sort_by_key(|ip| ip.is_ipv6());
 }
 
 fn on_transaction_complete(
