@@ -322,16 +322,11 @@ impl DigestAnswerParams {
         with_empty_nonce: bool,
         with_empty_response: bool,
     ) -> Result<Vec<u8>, ErrorKind> {
-        platform_log(LOG_TAG, format!("make authorization header with algorithm={} username={} password={} method={} realm={} uri={} qop={} nonce={} cnonce={} nc={}", if let Some(hash_algorithm) = &hash_algorithm{
+        platform_log(LOG_TAG, format!("make authorization header with algorithm={} username={} method={} realm={} uri={} qop={} nonce={} cnonce={} nc={}", if let Some(hash_algorithm) = &hash_algorithm{
             String::from_utf8_lossy(hash_algorithm)
         } else {
             std::borrow::Cow::Borrowed("")
         }, String::from_utf8_lossy(&self.username),
-        if let Some(credentials) = &self.credentials {
-            HEXLOWER.encode(&credentials.password)
-        } else {
-            String::from("")
-        },
         if let Some(credentials) = &self.credentials {
             if let Some(client_data) = &credentials.client_data {
                 String::from_utf8_lossy(client_data)
