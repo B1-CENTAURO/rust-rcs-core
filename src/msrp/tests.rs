@@ -1839,3 +1839,119 @@ fn a_manager_stops_once_it_and_its_connections_are_gone() {
         }
     });
 }
+
+fn read_eof(rt: &Runtime, io: &mut DuplexStream) {
+    rt.block_on(async {
+        let mut buf = [0; 4096];
+        loop {
+            let size = timeout(Duration::from_secs(5), io.read(&mut buf))
+                .await
+                .expect("the connection stayed open")
+                .unwrap();
+            if size == 0 {
+                return;
+            }
+        }
+    })
+}
+
+fn bodiless_send(transaction_id: &str, to_path: &str, from_path: &str) -> Vec<u8> {
+    serialize(&request(
+        transaction_id,
+        "SEND",
+        &[
+            ("To-Path", to_path),
+            ("From-Path", from_path),
+            ("Message-ID", transaction_id),
+        ],
+        None,
+        ContinuationFlag::Complete,
+    ))
+}
+
+fn status_of(messages: Vec<Parsed>) -> Vec<(String, u16)> {
+    messages
+        .into_iter()
+        .map(|message| match message {
+            Parsed::Response(transaction_id, status_code, _, _) => (transaction_id, status_code),
+            other => panic!("{:?}", other),
+        })
+        .collect()
+}
+
+#[test]
+fn an_ended_session_is_removed_and_its_connection_closes_last() {
+    const BOB_2: &str = "msrp://biloxi.example.com:12763/second;tcp";
+    const ALICE_2: &str = "msrp://atlanta.example.com:7654/second;tcp";
+
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (_tx, rx) = mpsc::channel(8);
+    let bob = MsrpChannelManager::new(
+        rx,
+        |_: &[u8], _: &[u8]| -> DuplexStream { panic!("no connection is opened") },
+        Arc::clone(&rt),
+    );
+    for (local, remote) in [(BOB, ALICE), (BOB_2, ALICE_2)] {
+        bob.register_passive_channel(MsrpChannel::new(
+            local.as_bytes().to_vec(),
+            remote.as_bytes().to_vec(),
+            Arc::new(MsrpDemuxer::new(
+                local.as_bytes().to_vec(),
+                remote.as_bytes().to_vec(),
+            )),
+            muxer(&Log::default()),
+        ));
+    }
+
+    // both sessions bind the one connection
+    let (mut alice_io, bob_io) = tokio::io::duplex(64 * 1024);
+    bob.accept(bob_io);
+    let mut data = bodiless_send("s1", BOB, ALICE);
+    data.extend(bodiless_send("s2", BOB_2, ALICE_2));
+    rt.block_on(alice_io.write_all(&data)).unwrap();
+    let mut statuses = status_of(read_messages(&rt, &mut alice_io, 2));
+    statuses.sort();
+    assert_eq!(statuses, vec![("s1".into(), 200), ("s2".into(), 200)]);
+    wait_for("both sessions to be bound", || {
+        let bound = !bob.is_waiting(BOB.as_bytes(), ALICE.as_bytes())
+            && !bob.is_waiting(BOB_2.as_bytes(), ALICE_2.as_bytes());
+        bound.then_some(())
+    });
+
+    assert!(bob.unregister_channel(BOB.as_bytes(), ALICE.as_bytes()));
+    assert!(!bob.unregister_channel(BOB.as_bytes(), ALICE.as_bytes()));
+
+    // the other session keeps the connection
+    let mut data = bodiless_send("s3", BOB, ALICE);
+    data.extend(bodiless_send("s4", BOB_2, ALICE_2));
+    rt.block_on(alice_io.write_all(&data)).unwrap();
+    assert_eq!(
+        status_of(read_messages(&rt, &mut alice_io, 2)),
+        vec![("s3".into(), 481), ("s4".into(), 200)]
+    );
+    read_nothing(&rt, &mut alice_io);
+
+    assert!(bob.unregister_channel(BOB_2.as_bytes(), ALICE_2.as_bytes()));
+    read_eof(&rt, &mut alice_io);
+}
+
+#[test]
+fn an_ended_session_drops_what_it_held() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let bob_log = Log::default();
+    let (bob, bob_demuxer, bob_tx) = passive_bob(&rt, &bob_log);
+    let held = send_message(&bob_demuxer, BOB, ALICE, b"held".to_vec(), bob_tx, &rt);
+
+    assert!(bob.unregister_channel(BOB.as_bytes(), ALICE.as_bytes()));
+
+    let (mut alice_io, bob_io) = tokio::io::duplex(64 * 1024);
+    bob.accept(bob_io);
+    rt.block_on(alice_io.write_all(&bodiless_send("s1", BOB, ALICE)))
+        .unwrap();
+    assert_eq!(
+        status_of(read_messages(&rt, &mut alice_io, 1)),
+        vec![("s1".into(), 481)]
+    );
+    read_nothing(&rt, &mut alice_io);
+    assert!(result(&held).is_none());
+}

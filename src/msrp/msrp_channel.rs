@@ -201,10 +201,11 @@ struct Transport {
 
 type Transports = Arc<Mutex<Vec<Transport>>>;
 
-// what happens to connections, handled in order by the manager
+// what happens to connections and sessions, handled in order by the manager
 enum Event {
     Bound(Vec<u8>, Vec<u8>, Connection), // a request for a session arrived on it
     Released(Connection),                // it closed
+    Ended(Vec<u8>, Vec<u8>),             // a session was unregistered
 }
 
 pub struct MsrpChannelManager {
@@ -336,6 +337,10 @@ impl MsrpChannelManager {
                         }
 
                         Event::Released(tx) => release(&transports, &tx),
+
+                        Event::Ended(from_path, to_path) => {
+                            end(&transports, from_path, to_path).await;
+                        }
                     },
 
                     else => break,
@@ -378,6 +383,30 @@ impl MsrpChannelManager {
         }
 
         self.register_channel(channel);
+    }
+
+    /// Removes the channel of a session that ended, by its local and remote
+    /// paths, returning whether there was one. Requests for it are answered
+    /// 481 from now on. What it sent before still goes out, what it holds for
+    /// a remote end that has not connected is dropped, and its connection
+    /// closes unless another session uses it. The session sends nothing more.
+    pub fn unregister_channel(&self, from_path: &[u8], to_path: &[u8]) -> bool {
+        let removed = {
+            let mut guard = self.channels.lock().unwrap();
+            let len = guard.len();
+            guard.retain(|channel| !(channel.from_path == from_path && channel.to_path == to_path));
+            guard.len() < len
+        };
+
+        match self
+            .event_tx
+            .send(Event::Ended(from_path.to_vec(), to_path.to_vec()))
+        {
+            Ok(()) => {}
+            Err(_) => {}
+        }
+
+        removed
     }
 
     /// Takes a connection the remote end opened. What arrives on it goes to
@@ -508,6 +537,38 @@ async fn bind(transports: &Transports, from_path: Vec<u8>, to_path: Vec<u8>, tx:
         .find(|t| t.from_path == from_path && t.to_path == to_path)
     {
         t.link = Link::Connected(tx);
+    }
+}
+
+// an ended session sends nothing more, and its connection closes when no
+// other session sends over it
+async fn end(transports: &Transports, from_path: Vec<u8>, to_path: Vec<u8>) {
+    let tx = {
+        let mut guard = transports.lock().unwrap();
+        let idx = match guard
+            .iter()
+            .position(|t| t.from_path == from_path && t.to_path == to_path)
+        {
+            Some(idx) => idx,
+            None => return,
+        };
+
+        match guard.remove(idx).link {
+            Link::Connected(tx)
+                if !guard.iter().any(
+                    |t| matches!(&t.link, Link::Connected(other) if Arc::ptr_eq(other, &tx)),
+                ) =>
+            {
+                tx
+            }
+            _ => return,
+        }
+    };
+
+    // the transport shuts its side down, after what is queued
+    match tx.send(None).await {
+        Ok(()) => {}
+        Err(_) => {}
     }
 }
 
