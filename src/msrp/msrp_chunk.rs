@@ -433,7 +433,10 @@ impl MsrpChunk {
                 readers.push(Box::new(&b"\r\n"[..]));
                 headers_get_readers(headers, readers);
                 if let Some(body) = body {
+                    // 2CRLF data CRLF
+                    readers.push(Box::new(&b"\r\n"[..]));
                     readers.push(Box::new(&body[..]));
+                    readers.push(Box::new(&b"\r\n"[..]));
                 }
                 readers.push(Box::new(&b"-------"[..]));
                 readers.push(Box::new(&req_line.transaction_id[..]));
@@ -510,6 +513,7 @@ impl Serializable for MsrpChunk {
                 if let Some(body) = body {
                     size += 2;
                     size += body.len();
+                    size += 2;
                 }
                 size += 7;
                 size += req_line.transaction_id.len();

@@ -23,6 +23,9 @@ pub mod msrp_muxer;
 pub mod msrp_parser;
 pub mod msrp_transport;
 
+#[cfg(test)]
+mod tests;
+
 pub use msrp_channel::MsrpChannelManager;
 
 // pub use msrp_transport::MsrpTransport;
