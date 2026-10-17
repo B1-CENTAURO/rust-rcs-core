@@ -2006,3 +2006,119 @@ fn repeated_proposals() {
         IncomingMessage::Duplicate
     ));
 }
+
+#[test]
+fn self_remove() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    // a self_remove Proposal, under the type RCC.16 gives it
+    let proposal = bob_conversation.leave(&bob).unwrap();
+    assert!(proposal.windows(3).any(|w| w == [2, 0xF0, 0x03]));
+    assert!(matches!(
+        alice_conversation.process(&alice, &proposal).unwrap(),
+        IncomingMessage::Proposal { .. }
+    ));
+    let pending: Vec<u16> = alice_conversation
+        .mls_group()
+        .pending_proposals()
+        .map(|p| u16::from(p.proposal().proposal_type()))
+        .collect();
+    assert_eq!(pending, [PROPOSAL_SELF_REMOVE]);
+
+    // bob, being removed, does not reach the new epoch
+    let output = alice_conversation.commit_pending_proposals(&alice).unwrap();
+    deliver((&mut alice_conversation, &alice), vec![], &output);
+    match bob_conversation
+        .process_commit_bundle(&bob, &accept(&output))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit {
+            removed,
+            self_removed,
+            ..
+        }] => {
+            assert_eq!(removed.len(), 1);
+            assert_eq!(removed[0].serialized_content(), b"bob");
+            assert!(*self_removed);
+        }
+        _ => panic!("expected a Commit"),
+    }
+    assert!(!bob_conversation.is_active());
+    assert_eq!(alice_conversation.members().len(), 1);
+}
+
+#[test]
+fn self_remove_in_external_commit() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let carol = client("carol");
+
+    let key_packages = [
+        bob.generate_key_package(false).unwrap(),
+        carol.generate_key_package(false).unwrap(),
+    ];
+    let mut alice_conversation = alice.create_conversation(None, 2).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_packages[0], &key_packages[1]])
+        .unwrap();
+    let bundle = accept(&output);
+    let bob_conversation = bob
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    let mut carol_conversation = carol
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+
+    // carol leaves, while bob has lost the group
+    let proposal = carol_conversation.leave(&carol).unwrap();
+    alice_conversation.process(&alice, &proposal).unwrap();
+    bob_conversation.delete(&bob).unwrap();
+
+    // the External Commit of bob covers the pending Proposal
+    let (mut bob_conversation, output) = bob
+        .rejoin_conversation(&MlsGroupInfo {
+            group_info: output.group_info.clone(),
+            ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+            pending_proposals: wire::encode_message_list(&[&proposal]).unwrap(),
+        })
+        .unwrap();
+    let bundle = accept(&output);
+    match alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { removed, .. }] => {
+            let mut removed: Vec<&[u8]> = removed.iter().map(|c| c.serialized_content()).collect();
+            removed.sort();
+            assert_eq!(removed, [&b"bob"[..], b"carol"]);
+        }
+        _ => panic!("expected a Commit"),
+    }
+    match carol_conversation
+        .process_commit_bundle(&carol, &bundle)
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { self_removed, .. }] => assert!(*self_removed),
+        _ => panic!("expected a Commit"),
+    }
+
+    assert_eq!(alice_conversation.members().len(), 2);
+    assert_eq!(
+        bob_conversation.epoch_authenticator(),
+        alice_conversation.epoch_authenticator()
+    );
+    let message = bob_conversation
+        .encrypt_cpim(&bob, b"back", b"msg-1", b"")
+        .unwrap();
+    assert!(alice_conversation
+        .decrypt(&alice, &message, b"msg-1")
+        .is_ok());
+}

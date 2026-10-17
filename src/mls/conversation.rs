@@ -444,10 +444,12 @@ impl MlsConversation {
             .map_err(fail("discarding own Commit", ErrorKind::Storage))
     }
 
-    /// Proposes to remove this client; another member has to commit it
+    /// Proposes to remove this client with a self_remove Proposal, which is
+    /// what the Conversation Focus accepts (RCC.16 sections 6.2.3, 9.4); another
+    /// member has to commit it
     pub fn leave(&mut self, client: &MlsClient) -> Result<Vec<u8>> {
         self.group
-            .leave_group(client.provider(), client.signer())
+            .leave_group_via_self_remove(client.provider(), client.signer())
             .map_err(fail("leaving group", ErrorKind::InvalidState))?
             .to_bytes()
             .map_err(fail("proposal encoding", ErrorKind::BadFormat))
@@ -991,9 +993,18 @@ impl MlsConversation {
             })
             .collect();
 
+        let self_removed =
+            staged_commit
+                .queued_proposals()
+                .filter_map(|p| match (p.proposal(), p.sender()) {
+                    (Proposal::SelfRemove, Sender::Member(index)) => Some(*index),
+                    _ => None,
+                });
         let removed = staged_commit
             .remove_proposals()
-            .filter_map(|p| self.group.member(p.remove_proposal().removed()).cloned())
+            .map(|p| p.remove_proposal().removed())
+            .chain(self_removed)
+            .filter_map(|index| self.group.member(index).cloned())
             .collect();
 
         (added, removed)
