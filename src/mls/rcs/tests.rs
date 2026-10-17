@@ -2122,3 +2122,239 @@ fn self_remove_in_external_commit() {
         .decrypt(&alice, &message, b"msg-1")
         .is_ok());
 }
+
+/// server_remove Proposals in a Commit: ProposalOrRef of type proposal, then
+/// the type 0xF004 and a leaf index
+fn server_removes(commit: &[u8]) -> usize {
+    commit
+        .windows(6)
+        .filter(|w| w[..5] == [1, 0xF0, 0x04, 0, 0])
+        .count()
+}
+
+#[test]
+fn server_remove() {
+    let alice = client("alice");
+    let bob_phone = client("bob");
+    let bob_tablet = client("bob");
+    let carol = client("carol");
+
+    let key_packages = [
+        bob_phone.generate_key_package(false).unwrap(),
+        bob_tablet.generate_key_package(false).unwrap(),
+        carol.generate_key_package(false).unwrap(),
+    ];
+    let mut alice_conversation = alice.create_conversation(None, 2).unwrap();
+    let output = alice_conversation
+        .add_members(
+            &alice,
+            &[&key_packages[0], &key_packages[1], &key_packages[2]],
+        )
+        .unwrap();
+    let bundle = accept(&output);
+    let mut bob_conversation = bob_phone
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    let mut carol_conversation = carol
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    assert_eq!(alice_conversation.members().len(), 4);
+
+    // bob lost RCS: carol removes both his Clients, as the server asked
+    let output = carol_conversation
+        .remove_members_for_server(&carol, &[bob_phone.credential().clone()])
+        .unwrap();
+    assert_eq!(server_removes(&output.commit), 2);
+    deliver((&mut carol_conversation, &carol), vec![], &output);
+
+    match alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { removed, .. }] => {
+            assert_eq!(removed.len(), 2);
+            assert!(removed.iter().all(|c| c.serialized_content() == b"bob"));
+        }
+        _ => panic!("expected a Commit"),
+    }
+    assert_eq!(
+        alice_conversation.epoch_authenticator(),
+        carol_conversation.epoch_authenticator()
+    );
+    assert_eq!(alice_conversation.members().len(), 2);
+
+    match bob_conversation
+        .process_commit_bundle(&bob_phone, &accept(&output))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { self_removed, .. }] => assert!(*self_removed),
+        _ => panic!("expected a Commit"),
+    }
+    assert!(!bob_conversation.is_active());
+
+    assert_eq!(
+        carol_conversation
+            .remove_members_for_server(&carol, &[bob_phone.credential().clone()])
+            .err(),
+        Some(ErrorKind::UnknownMember)
+    );
+}
+
+#[test]
+fn self_heal_replacing_clients() {
+    let alice = client("alice");
+    let old_phone = client("bob-1");
+    let old_tablet = client("bob-2");
+
+    let key_packages = [
+        old_phone.generate_key_package(false).unwrap(),
+        old_tablet.generate_key_package(false).unwrap(),
+    ];
+    let mut alice_conversation = alice.create_conversation(None, 2).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_packages[0], &key_packages[1]])
+        .unwrap();
+    deliver((&mut alice_conversation, &alice), vec![], &output);
+
+    // bob comes back with a new Client, under a new key: his old Clients go,
+    // one with a Remove and the other with a server_remove
+    let new_phone = client("bob-3");
+    let (mut bob_conversation, output) = new_phone
+        .rejoin_conversation_replacing(
+            &MlsGroupInfo {
+                group_info: output.group_info.clone(),
+                ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+                pending_proposals: Vec::new(),
+            },
+            &[
+                old_phone.credential().clone(),
+                old_tablet.credential().clone(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(server_removes(&output.commit), 1);
+    assert_eq!(
+        output
+            .commit
+            .windows(6)
+            .filter(|w| w[..5] == [1, 0x00, 0x03, 0, 0])
+            .count(),
+        1
+    );
+
+    match alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit {
+            sender, removed, ..
+        }] => {
+            assert_eq!(sender.serialized_content(), b"bob-3");
+            let mut removed: Vec<&[u8]> = removed.iter().map(|c| c.serialized_content()).collect();
+            removed.sort();
+            assert_eq!(removed, [&b"bob-1"[..], b"bob-2"]);
+        }
+        _ => panic!("expected a Commit"),
+    }
+
+    let members: Vec<Vec<u8>> = alice_conversation
+        .members()
+        .iter()
+        .map(|c| c.serialized_content().to_vec())
+        .collect();
+    assert_eq!(members.len(), 2);
+    assert!(members.contains(&b"bob-3".to_vec()));
+    assert_eq!(
+        bob_conversation.epoch_authenticator(),
+        alice_conversation.epoch_authenticator()
+    );
+    let message = bob_conversation
+        .encrypt_cpim(&new_phone, b"new phone", b"msg-1", b"")
+        .unwrap();
+    assert!(alice_conversation
+        .decrypt(&alice, &message, b"msg-1")
+        .is_ok());
+}
+
+/// Lets a Client only replace Clients of the same Participant, named before the
+/// dash of their identity
+struct SameParticipant;
+
+impl CredentialValidator for SameParticipant {
+    fn validate(&self, _credential: &Credential, _signature_key: &[u8]) -> bool {
+        true
+    }
+
+    fn validate_replacement(&self, old: &Credential, new: &Credential, _key: &[u8]) -> bool {
+        let participant = |credential: &Credential| {
+            credential
+                .serialized_content()
+                .split(|b| *b == b'-')
+                .next()
+                .map(|p| p.to_vec())
+        };
+        participant(old) == participant(new)
+    }
+}
+
+#[test]
+fn external_commit_removals_are_validated() {
+    let alice = MlsClient::new(
+        b"alice",
+        CIPHERSUITE,
+        MlsConfig::default(),
+        Box::new(SameParticipant),
+    )
+    .unwrap();
+    let old_phone = client("bob-1");
+    let old_tablet = client("bob-2");
+
+    let key_packages = [
+        old_phone.generate_key_package(false).unwrap(),
+        old_tablet.generate_key_package(false).unwrap(),
+    ];
+    let mut alice_conversation = alice.create_conversation(None, 2).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_packages[0], &key_packages[1]])
+        .unwrap();
+    deliver((&mut alice_conversation, &alice), vec![], &output);
+    let group_info = MlsGroupInfo {
+        group_info: output.group_info.clone(),
+        ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+        pending_proposals: Vec::new(),
+    };
+    let replaced = [
+        old_phone.credential().clone(),
+        old_tablet.credential().clone(),
+    ];
+
+    // another Participant may not take bob's Clients out
+    let mallory = client("mallory-1");
+    let (_, output) = mallory
+        .rejoin_conversation_replacing(&group_info, &replaced)
+        .unwrap();
+    let epoch = alice_conversation.epoch_identifier();
+    assert_eq!(
+        alice_conversation
+            .process_commit_bundle(&alice, &accept(&output))
+            .err(),
+        Some(ErrorKind::InvalidCredential)
+    );
+    assert_eq!(alice_conversation.epoch_identifier(), epoch);
+
+    // bob may
+    let new_phone = client("bob-3");
+    let (_, output) = new_phone
+        .rejoin_conversation_replacing(&group_info, &replaced)
+        .unwrap();
+    assert!(alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .is_ok());
+    assert_eq!(alice_conversation.members().len(), 2);
+}

@@ -272,8 +272,9 @@ impl RcsCredentialValidator {
         Ok(certificate)
     }
 
-    /// Validation of a certificate replacing `old` in the same leaf, through a
-    /// self update or a resync Commit (A.4.1.5, A.4.1.6)
+    /// Validation of a certificate replacing `old`, through a self update or a
+    /// resync Commit (A.4.1.5, A.4.1.6), or an External Commit removing further
+    /// Clients of the Participant (RCC.16 section 10.1.1)
     ///
     /// The old certificate may have expired; the new one has to be for one of
     /// its tel URIs and issued after it.

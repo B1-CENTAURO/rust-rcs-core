@@ -13,7 +13,7 @@ Also, some code are half way through the sync-async conversion and require clean
 
 The `e2ee` feature adds the `mls` module, an MLS (RFC 9420) engine built on OpenMLS that covers identities, KeyPackages, group lifecycle, message protection and state persistence. It needs rustc 1.91 or newer.
 
-OpenMLS 0.9.1 is vendored under `vendor/openmls` with one change: its SelfRemove proposal goes by 0xF003, the code RCC.16 gives `self_remove`, instead of the 0x000a of draft-ietf-mls-extensions (see `vendor/openmls/VENDORED.md`).
+OpenMLS 0.9.1 is vendored under `vendor/openmls` with two changes for RCC.16 (see `vendor/openmls/VENDORED.md`): its SelfRemove proposal goes by 0xF003, the code RCC.16 gives `self_remove`, instead of the 0x000a of draft-ietf-mls-extensions, and it knows `server_remove` (0xF004), a Remove by another name that External Commits may carry next to their one Remove.
 
 Groups are set up as GSMA PRD RCC.16 (v4.0) requires: Era extension, Commits and Proposals as PublicMessages, Welcomes without ratchet tree, past epochs kept until pruned, PADME padding. `mls::rcs` adds what RCC.16 and RCC.07 (v15.0) define on top:
 
@@ -21,6 +21,7 @@ Groups are set up as GSMA PRD RCC.16 (v4.0) requires: Era extension, Commits and
 - the TLS structures (SecretPayload, AuthenticatedData with its Verifiable* content, Re-Sent Message, Commit and Proposal lists, commitments) and protobuf messages (FileInfo, `message/mls-rcs-client`, `message/mls-rcs-server` with AcceptedMlsRcsMessage, MlsEnhancedGroupInfo, EndMlsMetadata)
 - encrypted CPIM messages bound to their Message-ID, signed IMDNs (`rcs_signature`), Commit bundles for the Conversation Focus, Commits applied once accepted, moving to unencrypted (`end_mls` with its reason), self-healing through External Commits
 - leaving with `self_remove` Proposals (sections 6.2.3, 7.11.8, 9.4), which other members commit and External Commits cover when pending
+- `server_remove` Proposals (sections 7.11.9, 9.6, 10.1.1): removing the Clients of a Participant the Messaging Server removed, and self-healing with an External Commit that takes out several old Clients, e.g. those of a former Participant Key
 - enhanced self-healing (sections 6.3.2, 7.10, 10.1.2): the MLS-Enhanced-Group-Info-Pull request, applying the control messages of the response page by page, and telling when to fall back to an External Commit. Commits and Proposals handled before, through it or otherwise, come out as `Duplicate` when delivered again.
 - file, thumbnail, icon and subject encryption (Annex C.2, C.3)
 - Client Certificate validation (Annex A.4.1): `RcsCredentialValidator` checks X.509 credentials against the agreed roots, the certificate profiles, the ParticipantInformation signature and key rolls, and the Vendor ID, and applies the rules for KDS query results, additions and certificate updates. Revocation of intermediate CAs is checked through a callback, fetching CRLs is left to the caller.
@@ -46,7 +47,6 @@ Not covered yet:
 
 - asking for group metadata keys within the External Commit of a self-heal or the GroupInfo of a new Era (section 10.5.2); `request_group_metadata_keys()` makes a Commit of its own. `GroupMetadataKeys` is cut off in RCC.16 v4.0 and taken to end after its two fields; `GroupMetadataKeysRequested` is not defined, and not sent.
 - the XML of CPM group data requests and of conference-info NOTIFYs for the encrypted subject and icon (section 7.13)
-- the `server_remove` proposal (sections 7.11.9, 9.6, 10.1.1): OpenMLS has no counterpart of it, and cannot apply proposal types it doesn't know. Removing the Participant of a lost user, or the Clients of an old Participant Key in a self-heal, has to use Remove proposals for now.
 - the identity verification code (Annex C.5): `HASH_TO_DIGITS` is not defined
 - the interface to the KDS, which RCC.16 leaves vendor specific
 
