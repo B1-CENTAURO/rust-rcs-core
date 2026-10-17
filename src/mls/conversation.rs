@@ -14,7 +14,6 @@
 
 use std::time::Duration;
 
-use openmls::messages::group_info::GroupInfo;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
 use openmls_traits::OpenMlsProvider;
@@ -50,18 +49,23 @@ pub fn inspect(message: &[u8]) -> Result<MessageKind> {
 
 /// Messages to send out after creating a Commit
 ///
-/// The Commit only takes effect locally once it comes back from the Conversation
-/// Focus, or once `merge_pending_commit()` is called.
+/// The Commit only takes effect locally once the Conversation Focus accepted it
+/// or delivered it back, or once `merge_pending_commit()` is called.
 pub struct CommitOutput {
     /// For all members of the group, as it was before the Commit
     pub commit: Vec<u8>,
-    /// For the members being added, if any
+    /// For the members being added, if any; without the ratchet tree, which the
+    /// Conversation Focus sends along (RCC.16 sections 7.9.2, 7.9.3)
     pub welcome: Option<Vec<u8>>,
     /// MlsMessage holding the GroupInfo of the new epoch
     pub group_info: Vec<u8>,
     pub epoch_authenticator: Vec<u8>,
-    /// Ratchet tree of the new epoch, only for the first Commit of an Era
+    /// Ratchet tree of the new epoch, for the members joining through `welcome`
+    ///
+    /// Only the first Commit of an Era hands it to the Conversation Focus, which
+    /// reconstructs it from later Commits (RCC.16 sections 7.9.2, 7.9.3).
     pub ratchet_tree: Option<Vec<u8>>,
+    pub(crate) first_in_era: bool,
 }
 
 impl CommitOutput {
@@ -79,7 +83,10 @@ impl CommitOutput {
                     welcome: welcome.clone(),
                     group_info: self.group_info.clone(),
                     epoch_authenticator: self.epoch_authenticator.clone(),
-                    ratchet_tree: self.ratchet_tree.clone().unwrap_or_default(),
+                    ratchet_tree: match self.first_in_era {
+                        true => self.ratchet_tree.clone().unwrap_or_default(),
+                        false => Vec::new(),
+                    },
                 })
             }
             None => client_mls_rcs_message::Payload::CommitBundle(proto::CommitBundle {
@@ -108,7 +115,8 @@ pub enum IncomingMessage {
     Proposal { sender: Credential },
     /// A Commit, already applied: the group is now in a new epoch
     ///
-    /// This includes Commits of this client coming back from the Conversation Focus.
+    /// This includes Commits of this client the Conversation Focus accepted or
+    /// delivered back.
     Commit {
         sender: Credential,
         added: Vec<Credential>,
@@ -127,9 +135,11 @@ pub enum IncomingMessage {
 /// joined the group.
 pub struct MlsConversation {
     pub(crate) group: MlsGroup,
-    /// External Commit of this client already applied, to be recognised when the
+    /// Commit of this client already applied, to be recognised when the
     /// Conversation Focus delivers it back
     pub(crate) applied_commit: Option<Vec<u8>>,
+    /// Pending Commit of this client, as sent
+    pending_commit: Option<Vec<u8>>,
 }
 
 impl MlsConversation {
@@ -137,6 +147,7 @@ impl MlsConversation {
         MlsConversation {
             group,
             applied_commit: None,
+            pending_commit: None,
         }
     }
 
@@ -170,6 +181,44 @@ impl MlsConversation {
     /// Whether the conversation was moved to unencrypted (RCC.16 section 11.2)
     pub fn is_encryption_ended(&self) -> bool {
         self.group.extensions().iter().any(is_end_mls)
+    }
+
+    /// Why the conversation was moved to unencrypted, if it was (RCC.16 section
+    /// 7.11.2.2); Unset when the end_mls extension gives no reason
+    pub fn encryption_ended_reason(&self) -> Option<proto::EndMlsReason> {
+        self.group
+            .extensions()
+            .iter()
+            .find_map(|extension| match extension {
+                Extension::Unknown(rcs::EXTENSION_END_MLS, UnknownExtension(data)) => Some(
+                    proto::decode::<proto::EndMlsMetadata>(data)
+                        .ok()
+                        .and_then(|metadata| {
+                            proto::EndMlsReason::try_from(metadata.downgrade_reason).ok()
+                        })
+                        .unwrap_or(proto::EndMlsReason::Unset),
+                ),
+                _ => None,
+            })
+    }
+
+    /// TLS encoded ratchet tree of the current epoch, which the Conversation Focus
+    /// keeps for joiners and for self-healing (RCC.16 sections 7.9.3, 7.10.1)
+    pub fn ratchet_tree(&self) -> Result<Vec<u8>> {
+        self.group
+            .export_ratchet_tree()
+            .tls_serialize_detached()
+            .map_err(fail("ratchet tree encoding", ErrorKind::BadFormat))
+    }
+
+    /// Identifies the current epoch, as in an MLS-Enhanced-Group-Info-Pull
+    /// request (RCC.16 section 7.10.2)
+    pub fn epoch_identifier(&self) -> proto::EpochIdentifier {
+        proto::EpochIdentifier {
+            era_id: self.era().unwrap_or_default(),
+            epoch_id: self.epoch(),
+            epoch_authenticator: self.epoch_authenticator().to_vec(),
+        }
     }
 
     /// False once this client has been removed from the group
@@ -207,13 +256,9 @@ impl MlsConversation {
             validated.push(self.read_key_package(client, key_package)?);
         }
 
-        let first_in_era = self.epoch() == 0;
-        let (commit, welcome, group_info) = self
-            .group
-            .add_members(client.provider(), client.signer(), &validated)
-            .map_err(fail("adding members", ErrorKind::InvalidState))?;
-
-        self.commit_output(client, commit, Some(welcome), group_info, first_in_era)
+        let builder = self.group.commit_builder().propose_adds(validated);
+        let bundle = stage_commit(client, builder)?;
+        self.commit_output(client, bundle)
     }
 
     /// Removes every Client of the members holding one of `credentials`
@@ -235,41 +280,23 @@ impl MlsConversation {
             }
         }
 
-        let first_in_era = self.epoch() == 0;
-        let (commit, welcome, group_info) = self
-            .group
-            .remove_members(client.provider(), client.signer(), &leaf_indices)
-            .map_err(fail("removing members", ErrorKind::InvalidState))?;
-
-        self.commit_output(client, commit, welcome, group_info, first_in_era)
+        let builder = self.group.commit_builder().propose_removals(leaf_indices);
+        let bundle = stage_commit(client, builder)?;
+        self.commit_output(client, bundle)
     }
 
     /// Replaces this client's own key material, for post-compromise security
     /// (RCC.16 section 9.5.2)
     pub fn update_keys(&mut self, client: &MlsClient) -> Result<CommitOutput> {
-        let first_in_era = self.epoch() == 0;
-        let bundle = self
-            .group
-            .self_update(
-                client.provider(),
-                client.signer(),
-                LeafNodeParameters::default(),
-            )
-            .map_err(fail("updating own keys", ErrorKind::InvalidState))?;
-
-        let welcome = bundle.to_welcome_msg();
-        let (commit, _, group_info) = bundle.into_contents();
-
-        self.commit_output(client, commit, welcome, group_info, first_in_era)
+        let builder = self.group.commit_builder().force_self_update(true);
+        let bundle = stage_commit(client, builder)?;
+        self.commit_output(client, bundle)
     }
 
     /// Commits the proposals received so far
     pub fn commit_pending_proposals(&mut self, client: &MlsClient) -> Result<CommitOutput> {
-        let first_in_era = self.epoch() == 0;
-        let (commit, welcome, group_info) = self
-            .group
-            .commit_to_pending_proposals(client.provider(), client.signer())
-            .map_err(fail("committing proposals", ErrorKind::InvalidState))?;
+        let builder = self.group.commit_builder();
+        let bundle = stage_commit(client, builder)?;
 
         if let Some(staged_commit) = self.group.pending_commit() {
             if !proposals_valid(client.validator(), staged_commit) {
@@ -278,15 +305,16 @@ impl MlsConversation {
             }
         }
 
-        self.commit_output(client, commit, welcome, group_info, first_in_era)
+        self.commit_output(client, bundle)
     }
 
-    /// Moves the conversation to unencrypted (RCC.16 section 11.2), or back, by
-    /// committing the addition or removal of the end_mls extension
+    /// Moves the conversation to unencrypted for `reason` (RCC.16 section 11.2),
+    /// or with None back to encrypted (section 11.1.2), by committing the
+    /// addition or removal of the end_mls extension
     pub fn set_encryption_ended(
         &mut self,
         client: &MlsClient,
-        ended: bool,
+        reason: Option<proto::EndMlsReason>,
     ) -> Result<CommitOutput> {
         let current = self.group.extensions();
         let mut extensions: Vec<Extension> = current
@@ -296,10 +324,13 @@ impl MlsConversation {
             })
             .cloned()
             .collect();
-        if ended {
+        if let Some(reason) = reason {
+            let metadata = proto::EndMlsMetadata {
+                downgrade_reason: reason as i32,
+            };
             extensions.push(Extension::Unknown(
                 rcs::EXTENSION_END_MLS,
-                UnknownExtension(rcs::END_MLS_EXTENSION_DATA.to_vec()),
+                UnknownExtension(proto::encode(&metadata)),
             ));
         }
 
@@ -327,25 +358,28 @@ impl MlsConversation {
         let extensions = Extensions::from_vec(extensions)
             .map_err(fail("end_mls extension", ErrorKind::InvalidState))?;
 
-        let first_in_era = self.epoch() == 0;
-        let (commit, welcome, group_info) = self
+        let builder = self
             .group
-            .update_group_context_extensions(client.provider(), extensions, client.signer())
+            .commit_builder()
+            .propose_group_context_extensions(extensions)
             .map_err(fail("updating extensions", ErrorKind::InvalidState))?;
-
-        self.commit_output(client, commit, welcome, group_info, first_in_era)
+        let bundle = stage_commit(client, builder)?;
+        self.commit_output(client, bundle)
     }
 
     /// Applies the Commit last created by this client
     pub fn merge_pending_commit(&mut self, client: &MlsClient) -> Result<()> {
         self.group
             .merge_pending_commit(client.provider())
-            .map_err(fail("merging own Commit", ErrorKind::InvalidState))
+            .map_err(fail("merging own Commit", ErrorKind::InvalidState))?;
+        self.applied_commit = self.pending_commit.take();
+        Ok(())
     }
 
     /// Drops the Commit last created by this client, e.g. because the
     /// Conversation Focus rejected it
     pub fn discard_pending_commit(&mut self, client: &MlsClient) -> Result<()> {
+        self.pending_commit = None;
         self.group
             .clear_pending_commit(client.provider().storage())
             .map_err(fail("discarding own Commit", ErrorKind::Storage))
@@ -384,11 +418,53 @@ impl MlsConversation {
 
         self.group.set_aad(authenticated_data);
 
-        self.group
+        let key_generation = self.key_generation(client)?;
+        let message = self
+            .group
             .create_message(client.provider(), client.signer(), plaintext)
-            .map_err(fail("encrypting message", ErrorKind::InvalidState))?
+            .map_err(fail("encrypting message", ErrorKind::InvalidState))?;
+        self.set_key_generation(client, key_generation + 1)?;
+
+        message
             .to_bytes()
             .map_err(fail("message encoding", ErrorKind::BadFormat))
+    }
+
+    /// Generation of the key the next message of this client gets encrypted with
+    ///
+    /// OpenMLS does not tell, so the messages this client encrypted in the current
+    /// epoch are counted, in storage next to the group.
+    pub(crate) fn key_generation(&self, client: &MlsClient) -> Result<u32> {
+        let values = client
+            .provider()
+            .storage()
+            .values
+            .read()
+            .map_err(|_| ErrorKind::Storage)?;
+
+        let counted = values
+            .get(&key_generation_key(self.group_id()))
+            .and_then(|value| value.strip_prefix(self.epoch_authenticator()))
+            .and_then(|count| count.try_into().ok())
+            .map(u32::from_be_bytes);
+        Ok(counted.unwrap_or(0))
+    }
+
+    fn set_key_generation(&self, client: &MlsClient, key_generation: u32) -> Result<()> {
+        let mut values = client
+            .provider()
+            .storage()
+            .values
+            .write()
+            .map_err(|_| ErrorKind::Storage)?;
+
+        let value = [
+            self.epoch_authenticator(),
+            &key_generation.to_be_bytes()[..],
+        ]
+        .concat();
+        values.insert(key_generation_key(self.group_id()), value);
+        Ok(())
     }
 
     /// Handles a handshake or application message sent to the group
@@ -421,8 +497,46 @@ impl MlsConversation {
             Some(server_mls_rcs_message::Payload::ServerCommitBundle(bundle)) => {
                 self.process_commit_bundle(client, &bundle)
             }
+            Some(server_mls_rcs_message::Payload::AcceptedMlsRcsMessage(accepted)) => {
+                self.process_accepted(client, &accepted).map(|m| vec![m])
+            }
             _ => Err(ErrorKind::UnexpectedMessage),
         }
+    }
+
+    /// Applies the pending Commit of this client once the Conversation Focus
+    /// accepted it (RCC.16 section 6.2.4); should the Commit still be delivered
+    /// back later, it is recognised as Own
+    ///
+    /// Without a pending Commit, what was accepted needs no handling. Having a
+    /// ProposalList accepted while a Commit of the same epoch is pending is not
+    /// told apart, as the Message-ID of each is unknown here.
+    pub fn process_accepted(
+        &mut self,
+        client: &MlsClient,
+        accepted: &proto::AcceptedMlsRcsMessage,
+    ) -> Result<IncomingMessage> {
+        let Some(staged_commit) = self.group.pending_commit() else {
+            return Ok(IncomingMessage::Own);
+        };
+
+        let accepted_epoch = accepted
+            .previous_epoch_identifier
+            .as_ref()
+            .ok_or(ErrorKind::BadFormat)?;
+        if accepted_epoch != &self.epoch_identifier() {
+            return Err(ErrorKind::UnexpectedMessage);
+        }
+
+        let (added, removed) = self.membership_changes(staged_commit);
+        self.merge_pending_commit(client)?;
+
+        Ok(IncomingMessage::Commit {
+            sender: client.credential().clone(),
+            added,
+            removed,
+            self_removed: false,
+        })
     }
 
     /// Handles a Commit forwarded by the Conversation Focus (RCC.16 section 7.9.3)
@@ -520,6 +634,7 @@ impl MlsConversation {
                 let (added, removed) = self.membership_changes(staged_commit);
 
                 self.merge_pending_commit(client)?;
+                self.applied_commit = None;
 
                 Ok(IncomingMessage::Commit {
                     sender: client.credential().clone(),
@@ -583,21 +698,28 @@ impl MlsConversation {
 
     /// Erases the group from local state
     pub fn delete(mut self, client: &MlsClient) -> Result<()> {
+        client
+            .provider()
+            .storage()
+            .values
+            .write()
+            .map_err(|_| ErrorKind::Storage)?
+            .remove(&key_generation_key(self.group_id()));
+
         self.group
             .delete(client.provider().storage())
             .map_err(fail("deleting group", ErrorKind::Storage))
     }
 
     /// Collects what the Conversation Focus needs next to a Commit of this client
-    pub(crate) fn commit_output(
-        &self,
+    fn commit_output(
+        &mut self,
         client: &MlsClient,
-        commit: MlsMessageOut,
-        welcome: Option<MlsMessageOut>,
-        group_info: Option<GroupInfo>,
-        first_in_era: bool,
+        bundle: CommitMessageBundle,
     ) -> Result<CommitOutput> {
         let staged_commit = self.group.pending_commit().ok_or(ErrorKind::InvalidState)?;
+        let first_in_era = self.epoch() == 0;
+        let (commit, welcome, group_info) = bundle.into_messages();
 
         let epoch_authenticator = staged_commit
             .epoch_authenticator()
@@ -605,7 +727,7 @@ impl MlsConversation {
             .as_slice()
             .to_vec();
 
-        let ratchet_tree = if first_in_era {
+        let ratchet_tree = if first_in_era || welcome.is_some() {
             let ratchet_tree = staged_commit
                 .export_ratchet_tree(client.provider().crypto(), self.group.export_ratchet_tree())
                 .map_err(fail("ratchet tree export", ErrorKind::InvalidState))?
@@ -619,13 +741,15 @@ impl MlsConversation {
             None
         };
 
-        let group_info = MlsMessageOut::from(group_info.ok_or(ErrorKind::InvalidState)?)
+        let group_info = group_info
+            .ok_or(ErrorKind::InvalidState)?
             .to_bytes()
             .map_err(fail("GroupInfo encoding", ErrorKind::BadFormat))?;
 
         let commit = commit
             .to_bytes()
             .map_err(fail("Commit encoding", ErrorKind::BadFormat))?;
+        self.pending_commit = Some(commit.clone());
 
         let welcome = match welcome {
             Some(welcome) => Some(
@@ -642,6 +766,7 @@ impl MlsConversation {
             group_info,
             epoch_authenticator,
             ratchet_tree,
+            first_in_era,
         })
     }
 
@@ -697,6 +822,34 @@ impl MlsConversation {
 
         Ok(key_package)
     }
+}
+
+/// Storage key of the count behind `MlsConversation::key_generation()`, apart
+/// from the keys OpenMLS uses, which start with a label of its own
+fn key_generation_key(group_id: &[u8]) -> Vec<u8> {
+    [&b"RcsKeyGeneration"[..], group_id].concat()
+}
+
+/// Stages the Commit `builder` prepares, with the GroupInfo the Conversation
+/// Focus stores; the ratchet tree goes next to the Welcome instead of in it
+/// (RCC.16 section 7.9.2)
+fn stage_commit(
+    client: &MlsClient,
+    builder: CommitBuilder<'_, Initial>,
+) -> Result<CommitMessageBundle> {
+    builder
+        .load_psks(client.provider().storage())
+        .map_err(fail("loading PSKs", ErrorKind::Storage))?
+        .create_group_info(true)
+        .build(
+            client.provider().rand(),
+            client.provider().crypto(),
+            client.signer(),
+            |_| true,
+        )
+        .map_err(fail("creating Commit", ErrorKind::InvalidState))?
+        .stage_commit(client.provider())
+        .map_err(fail("staging Commit", ErrorKind::InvalidState))
 }
 
 fn is_end_mls(extension: &Extension) -> bool {

@@ -243,9 +243,12 @@ impl MlsClient {
             credentials.push(own);
         }
 
+        // including the types reserved for future use (RCC.16 section 7.11.11)
         let mut extensions: Vec<ExtensionType> = rcs::EXTENSIONS
             .iter()
-            .map(|e| ExtensionType::from(*e))
+            .copied()
+            .chain(rcs::RESERVED_FOR_FUTURE_USE)
+            .map(ExtensionType::from)
             .collect();
         if last_resort {
             extensions.push(ExtensionType::LastResort);
@@ -253,7 +256,9 @@ impl MlsClient {
 
         let proposals: Vec<ProposalType> = rcs::PROPOSALS
             .iter()
-            .map(|p| ProposalType::from(*p))
+            .copied()
+            .chain(rcs::RESERVED_FOR_FUTURE_USE)
+            .map(ProposalType::from)
             .collect();
 
         Capabilities::new(
@@ -274,13 +279,14 @@ impl MlsClient {
 
     /// Handshake messages go out as PublicMessages, which the Conversation Focus
     /// has to be able to validate (RCC.16 section 6.2.6), and application messages
-    /// are padded to `padding_size`
+    /// are padded to `padding_size`. Welcomes go without ratchet tree (section
+    /// 7.9.2).
     pub(crate) fn join_config(&self, padding_size: usize) -> MlsGroupJoinConfig {
         MlsGroupJoinConfig::builder()
             .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
             .set_past_epoch_deletion_policy(self.past_epoch_deletion_policy())
             .padding_size(padding_size)
-            .use_ratchet_tree_extension(true)
+            .use_ratchet_tree_extension(false)
             .build()
     }
 
@@ -335,7 +341,6 @@ impl MlsClient {
             .with_group_context_extensions(extensions)
             .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
             .set_past_epoch_deletion_policy(self.past_epoch_deletion_policy())
-            .use_ratchet_tree_extension(true)
             .build();
 
         let group_id = match group_id {
@@ -356,7 +361,16 @@ impl MlsClient {
     }
 
     /// Joins a group through a Welcome generated for one of this client's KeyPackages
-    pub fn join_conversation(&self, welcome: &[u8]) -> Result<MlsConversation> {
+    ///
+    /// `ratchet_tree` is the one the Conversation Focus sent along with the
+    /// Welcome (RCC.16 section 7.9.3); it may be left empty for a Welcome that
+    /// carries the tree in an extension. Any attempt uses up the KeyPackage
+    /// unless it is a last resort one, even one failing for lack of the tree.
+    pub fn join_conversation(
+        &self,
+        welcome: &[u8],
+        ratchet_tree: &[u8],
+    ) -> Result<MlsConversation> {
         let message = MlsMessageIn::tls_deserialize_exact(welcome)
             .map_err(fail("Welcome decoding", ErrorKind::BadFormat))?;
 
@@ -365,9 +379,14 @@ impl MlsClient {
             _ => return Err(ErrorKind::UnexpectedMessage),
         };
 
-        let builder =
+        let mut builder =
             StagedWelcome::build_from_welcome(&self.provider, &self.join_config(0), welcome)
                 .map_err(fail("Welcome processing", ErrorKind::Rejected))?;
+        if !ratchet_tree.is_empty() {
+            let ratchet_tree = RatchetTreeIn::tls_deserialize_exact(ratchet_tree)
+                .map_err(fail("ratchet tree decoding", ErrorKind::BadFormat))?;
+            builder = builder.with_ratchet_tree(ratchet_tree);
+        }
 
         // being added again to a group this client was removed from earlier; a
         // group still active locally is never replaced
@@ -442,6 +461,7 @@ impl MlsClient {
             )
             .load_psks(self.provider.storage())
             .map_err(fail("External Commit", ErrorKind::Storage))?
+            .create_group_info(true)
             .build(
                 self.provider.rand(),
                 self.provider.crypto(),
@@ -474,6 +494,7 @@ impl MlsClient {
             group_info,
             epoch_authenticator: conversation.epoch_authenticator().to_vec(),
             ratchet_tree: None,
+            first_in_era: false,
         };
         conversation.applied_commit = Some(commit);
 

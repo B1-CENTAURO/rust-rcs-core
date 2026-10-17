@@ -68,9 +68,10 @@ fn establish(
     conversation.merge_pending_commit(creator).unwrap();
 
     let welcome = output.welcome.unwrap();
+    let ratchet_tree = output.ratchet_tree.unwrap();
     let joined = others
         .iter()
-        .map(|c| c.join_conversation(&welcome).unwrap())
+        .map(|c| c.join_conversation(&welcome, &ratchet_tree).unwrap())
         .collect();
 
     (conversation, joined)
@@ -177,7 +178,9 @@ fn group_membership_changes() {
         _ => panic!("expected a commit"),
     }
 
-    let mut charlie_conversation = charlie.join_conversation(&output.welcome.unwrap()).unwrap();
+    let mut charlie_conversation = charlie
+        .join_conversation(&output.welcome.unwrap(), &output.ratchet_tree.unwrap())
+        .unwrap();
     let message = bob_conversation.encrypt(&bob, b"welcome back").unwrap();
     let (_, data) = decrypt(&mut charlie_conversation, &charlie, &message);
     assert_eq!(data, b"welcome back");
@@ -305,7 +308,9 @@ fn snapshot_and_restore() {
     let mut other = alice.create_conversation(None, 0).unwrap();
     let output = other.add_members(&alice, &[&key_package]).unwrap();
     other.merge_pending_commit(&alice).unwrap();
-    assert!(bob.join_conversation(&output.welcome.unwrap()).is_ok());
+    assert!(bob
+        .join_conversation(&output.welcome.unwrap(), &output.ratchet_tree.unwrap())
+        .is_ok());
 
     assert_eq!(
         bob.load_conversation(b"no such group").err(),
@@ -347,11 +352,13 @@ fn key_packages_are_consumed_unless_last_resort() {
     for key_package in [&one_time, &last_resort] {
         let mut first = alice.create_conversation(None, 0).unwrap();
         let output = first.add_members(&alice, &[key_package]).unwrap();
-        assert!(bob.join_conversation(&output.welcome.unwrap()).is_ok());
+        assert!(bob
+            .join_conversation(&output.welcome.unwrap(), &output.ratchet_tree.unwrap())
+            .is_ok());
 
         let mut second = alice.create_conversation(None, 0).unwrap();
         let output = second.add_members(&alice, &[key_package]).unwrap();
-        let joined = bob.join_conversation(&output.welcome.unwrap());
+        let joined = bob.join_conversation(&output.welcome.unwrap(), &output.ratchet_tree.unwrap());
 
         if key_package == &last_resort {
             assert!(joined.is_ok());
@@ -383,7 +390,8 @@ fn validator_guards_membership() {
     let key_package = bob.generate_key_package(false).unwrap();
     let output = conversation.add_members(&mallory, &[&key_package]).unwrap();
     assert_eq!(
-        bob.join_conversation(&output.welcome.unwrap()).err(),
+        bob.join_conversation(&output.welcome.unwrap(), &output.ratchet_tree.unwrap())
+            .err(),
         Some(ErrorKind::InvalidCredential)
     );
 
@@ -421,7 +429,9 @@ fn routing_and_malformed_input() {
         _ => panic!("expected a group message"),
     }
 
-    let mut bob_conversation = bob.join_conversation(&welcome).unwrap();
+    let mut bob_conversation = bob
+        .join_conversation(&welcome, &output.ratchet_tree.unwrap())
+        .unwrap();
     assert_eq!(
         inspect(b"\x00\x01garbage").err(),
         Some(ErrorKind::BadFormat)
@@ -435,7 +445,7 @@ fn routing_and_malformed_input() {
         Some(ErrorKind::UnexpectedMessage)
     );
     assert_eq!(
-        bob.join_conversation(&key_package).err(),
+        bob.join_conversation(&key_package, &[]).err(),
         Some(ErrorKind::UnexpectedMessage)
     );
 
@@ -544,7 +554,9 @@ fn other_credential_types() {
     let key_package = alice.generate_key_package(false).unwrap();
     let mut conversation = bob.create_conversation(None, 0).unwrap();
     let output = conversation.add_members(&bob, &[&key_package]).unwrap();
-    assert!(alice.join_conversation(&output.welcome.unwrap()).is_ok());
+    assert!(alice
+        .join_conversation(&output.welcome.unwrap(), &output.ratchet_tree.unwrap())
+        .is_ok());
 
     // the signature key has to match the ciphersuite
     let signer = SignatureKeyPair::new(SignatureScheme::ECDSA_SECP256R1_SHA256).unwrap();
