@@ -495,8 +495,10 @@ impl Future for Handshaker {
                                         Poll::Pending
                                     }
                                     io::ErrorKind::InvalidData => {
-                                        platform_log("ssl", "InvalidData");
-                                        Poll::Ready(Err(ErrorKind::Io))
+                                        // how rustls reports a failed handshake, e.g. a
+                                        // rejected certificate or a fatal alert
+                                        platform_log("ssl", format!("InvalidData: {:?}", e));
+                                        Poll::Ready(Err(ErrorKind::HandshakeFailure))
                                     }
                                     _ => Poll::Ready(Err(ErrorKind::Io)),
                                 },
@@ -586,8 +588,10 @@ impl Future for Handshaker {
                                         Poll::Pending
                                     }
                                     io::ErrorKind::InvalidData => {
-                                        platform_log("ssl", "InvalidData");
-                                        Poll::Ready(Err(ErrorKind::Io))
+                                        // how rustls reports a failed handshake, e.g. a
+                                        // rejected certificate or a fatal alert
+                                        platform_log("ssl", format!("InvalidData: {:?}", e));
+                                        Poll::Ready(Err(ErrorKind::HandshakeFailure))
                                     }
                                     _ => Poll::Ready(Err(ErrorKind::Io)),
                                 },

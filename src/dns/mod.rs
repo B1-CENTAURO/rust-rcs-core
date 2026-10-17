@@ -386,6 +386,15 @@ impl DnsClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn cache_address(&self, host: &str, ip: IpAddr) {
+        let mut guard = self.cache_a_aaaa.lock().unwrap();
+        guard
+            .entry(String::from(host))
+            .or_insert_with(Vec::new)
+            .push((Instant::now() + Duration::from_secs(60), ip));
+    }
+
     pub async fn resolve(
         &self,
         dns_config: DnsConfig,
