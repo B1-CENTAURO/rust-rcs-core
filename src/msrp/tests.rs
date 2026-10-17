@@ -13,11 +13,20 @@
 // limitations under the License.
 
 use std::io::Read;
+use std::sync::{Arc, Mutex};
+
+use tokio::runtime::{Builder, Runtime};
+use tokio::sync::mpsc;
+use tokio::time::{sleep, timeout, Duration};
 
 use crate::internet::header::Header;
+use crate::internet::headers::byte_range;
 use crate::io::DynamicChain;
 
+use super::msrp_channel::MsrpChannel;
 use super::msrp_chunk::{ContinuationFlag, MsrpChunk, MsrpRequestLine, MsrpResponseLine};
+use super::msrp_demuxer::MsrpDemuxer;
+use super::msrp_muxer::{MsrpDataWriter, MsrpMessageReceiver, MsrpMuxer};
 use super::msrp_parser::MsrpParser;
 
 // modelled on the Alice and Bob exchange in RFC 4975 section 4
@@ -410,4 +419,642 @@ fn serializes_continuation_flags_and_empty_bodies() {
         assert!(text(&data).ends_with(&format!("\r\n\r\n\r\n-------d93kswow{}\r\n", c)));
         assert_eq!(parse(&data, 1), vec![parsed(&chunk)]);
     }
+}
+
+#[derive(Clone, Default)]
+struct Log(Arc<Mutex<Vec<String>>>);
+
+impl Log {
+    fn push(&self, entry: String) {
+        self.0.lock().unwrap().push(entry);
+    }
+
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+struct Writer(Log, bool);
+
+impl MsrpDataWriter for Writer {
+    fn write(&mut self, data: &[u8]) -> Result<usize, (u16, &'static str)> {
+        if self.1 {
+            return Err((413, "Full"));
+        }
+        self.0
+            .push(format!("write {}", String::from_utf8_lossy(data)));
+        Ok(data.len())
+    }
+
+    fn complete(&mut self) -> Result<(), (u16, &'static str)> {
+        self.0.push("complete".into());
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        self.0.push("abort".into());
+    }
+}
+
+struct Receiver(Log, bool);
+
+impl MsrpMessageReceiver for Receiver {
+    fn on_message(
+        &mut self,
+        message_id: &[u8],
+        content_type: &[u8],
+    ) -> Result<Box<dyn MsrpDataWriter + Send + Sync>, (u16, &'static str)> {
+        self.0.push(format!(
+            "message {} {}",
+            text(message_id),
+            text(content_type)
+        ));
+        Ok(Box::new(Writer(self.0.clone(), self.1)))
+    }
+}
+
+fn muxer(log: &Log) -> MsrpMuxer {
+    MsrpMuxer::new(Receiver(log.clone(), false))
+}
+
+fn send(
+    message_id: &str,
+    byte_range: Option<&str>,
+    body: Option<&str>,
+    flag: ContinuationFlag,
+) -> MsrpChunk {
+    let mut h = vec![
+        ("To-Path", BOB),
+        ("From-Path", ALICE),
+        ("Message-ID", message_id),
+    ];
+    if let Some(byte_range) = byte_range {
+        h.push(("Byte-Range", byte_range));
+    }
+    if body.is_some() {
+        h.push(("Content-Type", "text/plain"));
+    }
+    request("t1", "SEND", &h, body.map(str::as_bytes), flag)
+}
+
+#[test]
+fn byte_range_total_may_be_unknown() {
+    let parse = |s: &[u8]| byte_range::parse(s).map(|r| (r.from, r.to, r.total));
+
+    assert_eq!(parse(b"1-11/11"), Some((1, Some(11), Some(11))));
+    assert_eq!(parse(b"1-*/11"), Some((1, None, Some(11))));
+    assert_eq!(parse(b"6-11/*"), Some((6, Some(11), None)));
+    assert_eq!(parse(b"1-*/*"), Some((1, None, None)));
+    assert_eq!(parse(b"1-0/0"), Some((1, Some(0), Some(0))));
+    assert_eq!(parse(b"6-5/11"), None);
+    assert_eq!(parse(b"1-12/11"), None);
+    assert_eq!(parse(b"1-x/11"), None);
+}
+
+#[test]
+fn muxer_completes_a_message_sent_in_one_chunk() {
+    let log = Log::default();
+    let mut muxer = muxer(&log);
+
+    assert_eq!(
+        muxer.feed(send(
+            "m1",
+            Some("1-11/11"),
+            Some("Hello world"),
+            ContinuationFlag::Complete
+        )),
+        Ok(Some(11))
+    );
+    assert_eq!(
+        log.take(),
+        vec!["message m1 text/plain", "write Hello world", "complete"]
+    );
+}
+
+#[test]
+fn muxer_reassembles_chunks() {
+    use ContinuationFlag::{Complete, Continuation};
+
+    let cases: Vec<(&str, Vec<(Option<&str>, &str, ContinuationFlag)>)> = vec![
+        (
+            "in order",
+            vec![
+                (Some("1-5/11"), "Hello", Continuation),
+                (Some("6-11/11"), " world", Complete),
+            ],
+        ),
+        (
+            "out of order",
+            vec![
+                (Some("6-11/11"), " world", Complete),
+                (Some("1-5/11"), "Hello", Continuation),
+            ],
+        ),
+        (
+            "total unknown",
+            vec![
+                (Some("1-5/*"), "Hello", Continuation),
+                (Some("6-*/*"), " world", Complete),
+            ],
+        ),
+        (
+            "sent again, overlapping",
+            vec![
+                (Some("1-5/11"), "Hello", Continuation),
+                (Some("1-5/11"), "Hello", Continuation),
+                (Some("4-11/11"), "lo world", Complete),
+            ],
+        ),
+        ("no Byte-Range", vec![(None, "Hello world", Complete)]),
+    ];
+
+    for (case, chunks) in cases {
+        let log = Log::default();
+        let mut muxer = muxer(&log);
+        let n = chunks.len();
+
+        for (i, (byte_range, body, flag)) in chunks.into_iter().enumerate() {
+            let expected = if i + 1 == n { Some(11) } else { None };
+            assert_eq!(
+                muxer.feed(send("m1", byte_range, Some(body), flag)),
+                Ok(expected),
+                "{} chunk {}",
+                case,
+                i
+            );
+        }
+
+        let log = log.take();
+        let written: String = log
+            .iter()
+            .filter_map(|entry| entry.strip_prefix("write "))
+            .collect();
+        assert_eq!(written, "Hello world", "{}", case);
+        assert_eq!(log.first().unwrap(), "message m1 text/plain", "{}", case);
+        assert_eq!(log.last().unwrap(), "complete", "{}", case);
+        assert_eq!(
+            log.iter().filter(|e| *e == "complete").count(),
+            1,
+            "{}",
+            case
+        );
+    }
+}
+
+#[test]
+fn muxer_accepts_a_send_without_body() {
+    let log = Log::default();
+    let mut muxer = muxer(&log);
+
+    assert_eq!(
+        muxer.feed(send("m1", None, None, ContinuationFlag::Complete)),
+        Ok(None)
+    );
+    assert_eq!(
+        muxer.feed(request(
+            "t1",
+            "SEND",
+            &[("To-Path", BOB), ("From-Path", ALICE)],
+            None,
+            ContinuationFlag::Complete
+        )),
+        Ok(None),
+        "without Message-ID"
+    );
+    assert!(log.take().is_empty());
+}
+
+#[test]
+fn muxer_aborts_a_message_ending_in_hash() {
+    let log = Log::default();
+    let mut muxer = muxer(&log);
+
+    assert_eq!(
+        muxer.feed(send(
+            "m1",
+            Some("1-5/11"),
+            Some("Hello"),
+            ContinuationFlag::Continuation
+        )),
+        Ok(None)
+    );
+    assert_eq!(
+        muxer.feed(send(
+            "m1",
+            Some("6-8/11"),
+            Some(" wo"),
+            ContinuationFlag::Abort
+        )),
+        Ok(None)
+    );
+    assert_eq!(
+        log.take(),
+        vec!["message m1 text/plain", "write Hello", "abort"]
+    );
+}
+
+#[test]
+fn muxer_rejects_what_it_cannot_take() {
+    let log = Log::default();
+    let mut muxer = muxer(&log);
+
+    assert_eq!(
+        muxer.feed(request(
+            "t1",
+            "SEND",
+            &[("To-Path", BOB), ("From-Path", ALICE), ("Message-ID", "m1")],
+            Some(b"Hello"),
+            ContinuationFlag::Complete
+        )),
+        Err((400, "Missing Content-Type header"))
+    );
+    assert_eq!(
+        muxer.feed(send(
+            "m1",
+            Some("6-5/11"),
+            Some("Hello"),
+            ContinuationFlag::Complete
+        )),
+        Err((400, "Invalid Byte-Range header"))
+    );
+
+    let mut failing = MsrpMuxer::new(Receiver(log.clone(), true));
+    assert_eq!(
+        failing.feed(send(
+            "m2",
+            Some("1-5/5"),
+            Some("Hello"),
+            ContinuationFlag::Complete
+        )),
+        Err((413, "Full"))
+    );
+    assert_eq!(log.take(), vec!["message m2 text/plain", "abort"]);
+}
+
+type Results = Arc<Mutex<Vec<(u16, String)>>>;
+
+fn start_sending<R>(
+    demuxer: &MsrpDemuxer,
+    reader: R,
+    total: usize,
+    rt: &Arc<Runtime>,
+) -> (mpsc::Receiver<MsrpChunk>, Results)
+where
+    R: Read + Send + Sync + 'static,
+{
+    let (tx, rx) = mpsc::channel(8);
+    let results: Results = Arc::default();
+    let results_ = Arc::clone(&results);
+    demuxer.start(
+        ALICE.as_bytes().to_vec(),
+        BOB.as_bytes().to_vec(),
+        Some(b"text/plain".to_vec()),
+        total,
+        reader,
+        move |status_code, reason_phrase| {
+            results_.lock().unwrap().push((status_code, reason_phrase));
+        },
+        tx,
+        rt,
+    );
+    (rx, results)
+}
+
+fn sent_chunks(rt: &Runtime, rx: &mut mpsc::Receiver<MsrpChunk>, n: usize) -> Vec<MsrpChunk> {
+    rt.block_on(async {
+        let mut chunks = Vec::new();
+        for _ in 0..n {
+            let chunk = timeout(Duration::from_secs(10), rx.recv()).await;
+            chunks.push(chunk.expect("no chunk sent").expect("channel closed"));
+        }
+        chunks
+    })
+}
+
+fn response_to(chunk: &MsrpChunk, status_code: u16, comment: &str) -> MsrpChunk {
+    let transaction_id = match chunk {
+        MsrpChunk::Request(req_line, _, _, _) => req_line.transaction_id.clone(),
+        MsrpChunk::Response(_, _) => panic!("not a request"),
+    };
+    MsrpChunk::new_response_chunk(
+        MsrpResponseLine {
+            transaction_id,
+            status_code,
+            comment: Some(comment.as_bytes().to_vec()),
+        },
+        vec![Header::new("To-Path", ALICE), Header::new("From-Path", BOB)],
+    )
+}
+
+fn demuxer() -> MsrpDemuxer {
+    MsrpDemuxer::new(ALICE.as_bytes().to_vec(), BOB.as_bytes().to_vec())
+}
+
+#[test]
+fn demuxer_reports_success_once_every_chunk_is_accepted() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = demuxer();
+    let body = vec![b'x'; 25 * 1024];
+    let (mut rx, results) = start_sending(&demuxer, std::io::Cursor::new(body), 25 * 1024, &rt);
+
+    let chunks = sent_chunks(&rt, &mut rx, 3);
+    let summary: Vec<_> = chunks
+        .iter()
+        .map(|chunk| match parsed(chunk) {
+            Parsed::Request(_, method, h, body, flag) => (
+                method,
+                h[0].clone(),
+                h[1].0.clone(),
+                h.iter().find(|(n, _)| n == "Byte-Range").unwrap().1.clone(),
+                body.unwrap().len(),
+                flag,
+            ),
+            other => panic!("{:?}", other),
+        })
+        .collect();
+    let to_path = ("To-Path".to_string(), BOB.to_string());
+    assert_eq!(
+        summary,
+        vec![
+            (
+                "SEND".into(),
+                to_path.clone(),
+                "From-Path".into(),
+                "1-10240/25600".into(),
+                10240,
+                '+'
+            ),
+            (
+                "SEND".into(),
+                to_path.clone(),
+                "From-Path".into(),
+                "10241-20480/25600".into(),
+                10240,
+                '+'
+            ),
+            (
+                "SEND".into(),
+                to_path,
+                "From-Path".into(),
+                "20481-25600/25600".into(),
+                5120,
+                '$'
+            ),
+        ]
+    );
+
+    for i in [2, 0] {
+        assert!(demuxer
+            .on_response(response_to(&chunks[i], 200, "OK"))
+            .is_ok());
+        assert!(results.lock().unwrap().is_empty(), "after chunk {}", i);
+    }
+    assert!(demuxer
+        .on_response(response_to(&chunks[1], 200, "OK"))
+        .is_ok());
+    assert_eq!(*results.lock().unwrap(), vec![(200, "Ok".to_string())]);
+
+    assert!(demuxer
+        .on_response(response_to(&chunks[1], 200, "OK"))
+        .is_err());
+    assert_eq!(results.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn demuxer_reports_the_first_failure() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = demuxer();
+    let body = vec![b'x'; 25 * 1024];
+    let (mut rx, results) = start_sending(&demuxer, std::io::Cursor::new(body), 25 * 1024, &rt);
+    let chunks = sent_chunks(&rt, &mut rx, 3);
+
+    assert!(demuxer
+        .on_response(response_to(&chunks[0], 200, "OK"))
+        .is_ok());
+    assert!(demuxer
+        .on_response(response_to(&chunks[1], 413, "Too big"))
+        .is_ok());
+    let _ = demuxer.on_response(response_to(&chunks[2], 200, "OK"));
+
+    assert_eq!(*results.lock().unwrap(), vec![(413, "Too big".to_string())]);
+}
+
+#[test]
+fn demuxer_sends_an_empty_message_as_a_send_without_body() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = demuxer();
+    let (mut rx, results) = start_sending(&demuxer, std::io::empty(), 0, &rt);
+    let chunks = sent_chunks(&rt, &mut rx, 1);
+
+    match parsed(&chunks[0]) {
+        Parsed::Request(_, method, h, body, flag) => {
+            assert_eq!((method.as_str(), body, flag), ("SEND", None, '$'));
+            let names: Vec<_> = h.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["To-Path", "From-Path", "Message-ID", "Failure-Report"]
+            );
+        }
+        other => panic!("{:?}", other),
+    }
+
+    assert!(demuxer
+        .on_response(response_to(&chunks[0], 200, "OK"))
+        .is_ok());
+    assert_eq!(*results.lock().unwrap(), vec![(200, "Ok".to_string())]);
+}
+
+struct FailingReader(Option<Vec<u8>>);
+
+impl Read for FailingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.take() {
+            Some(data) => {
+                buf[..data.len()].copy_from_slice(&data);
+                Ok(data.len())
+            }
+            None => Err(std::io::Error::from(std::io::ErrorKind::Other)),
+        }
+    }
+}
+
+#[test]
+fn demuxer_aborts_the_message_when_reading_fails() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = demuxer();
+    let reader = FailingReader(Some(b"Hello".to_vec()));
+    let (mut rx, results) = start_sending(&demuxer, reader, 11, &rt);
+    let chunks = sent_chunks(&rt, &mut rx, 1);
+
+    match parsed(&chunks[0]) {
+        Parsed::Request(_, _, h, body, flag) => {
+            assert_eq!((body, flag), (Some(b"Hello".to_vec()), '#'));
+            assert!(h.contains(&("Byte-Range".to_string(), "1-5/11".to_string())));
+        }
+        other => panic!("{:?}", other),
+    }
+    assert_eq!(
+        *results.lock().unwrap(),
+        vec![(500, "Internal Error".to_string())]
+    );
+}
+
+#[test]
+fn demuxer_times_out_without_a_response() {
+    let rt = Arc::new(
+        Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap(),
+    );
+    let demuxer = demuxer();
+    let (mut rx, results) =
+        start_sending(&demuxer, std::io::Cursor::new(b"Hello".to_vec()), 5, &rt);
+    let chunks = sent_chunks(&rt, &mut rx, 1);
+
+    rt.block_on(async { sleep(Duration::from_secs(29)).await });
+    assert!(results.lock().unwrap().is_empty());
+
+    rt.block_on(async { sleep(Duration::from_secs(2)).await });
+    assert_eq!(*results.lock().unwrap(), vec![(408, "Timeout".to_string())]);
+
+    assert!(demuxer
+        .on_response(response_to(&chunks[0], 200, "OK"))
+        .is_err());
+    assert_eq!(results.lock().unwrap().len(), 1);
+}
+
+fn channel(log: &Log) -> MsrpChannel {
+    MsrpChannel::new(
+        BOB.as_bytes().to_vec(),
+        ALICE.as_bytes().to_vec(),
+        Arc::new(MsrpDemuxer::new(
+            BOB.as_bytes().to_vec(),
+            ALICE.as_bytes().to_vec(),
+        )),
+        muxer(log),
+    )
+}
+
+fn with_headers(chunk: MsrpChunk, extra: &[(&'static str, &'static str)]) -> MsrpChunk {
+    let mut chunk = chunk;
+    for (name, value) in extra {
+        chunk.add_header(Header::new(*name, *value));
+    }
+    chunk
+}
+
+#[test]
+fn channel_sends_a_success_report_when_asked() {
+    let log = Log::default();
+    let mut channel = channel(&log);
+    let chunk = with_headers(
+        send(
+            "m1",
+            Some("1-11/11"),
+            Some("Hello world"),
+            ContinuationFlag::Complete,
+        ),
+        &[("Success-Report", "yes")],
+    );
+
+    let replies = channel.on_message(chunk).unwrap();
+    assert_eq!(replies.len(), 2);
+    assert!(matches!(
+        parsed(&replies[0]),
+        Parsed::Response(transaction_id, 200, _, _) if transaction_id == "t1"
+    ));
+    match parsed(&replies[1]) {
+        Parsed::Request(_, method, h, body, flag) => {
+            assert_eq!((method.as_str(), body, flag), ("REPORT", None, '$'));
+            assert_eq!(
+                h,
+                pairs(&[
+                    ("To-Path", ALICE),
+                    ("From-Path", BOB),
+                    ("Message-ID", "m1"),
+                    ("Byte-Range", "1-11/11"),
+                    ("Status", "000 200 OK"),
+                ])
+            );
+        }
+        other => panic!("{:?}", other),
+    }
+    assert_eq!(parse(&serialize(&replies[1]), 1), vec![parsed(&replies[1])]);
+
+    let chunk = with_headers(
+        send(
+            "m2",
+            Some("1-5/5"),
+            Some("Hello"),
+            ContinuationFlag::Complete,
+        ),
+        &[("Success-Report", "yes"), ("Failure-Report", "no")],
+    );
+    let replies = channel.on_message(chunk).unwrap();
+    assert_eq!(replies.len(), 1, "a REPORT but no response");
+    assert!(
+        matches!(parsed(&replies[0]), Parsed::Request(_, method, _, _, _) if method == "REPORT")
+    );
+}
+
+#[test]
+fn channel_accepts_a_send_without_body() {
+    let log = Log::default();
+    let mut channel = channel(&log);
+
+    let replies = channel
+        .on_message(send("m1", None, None, ContinuationFlag::Complete))
+        .unwrap();
+    assert_eq!(replies.len(), 1);
+    assert!(matches!(
+        parsed(&replies[0]),
+        Parsed::Response(_, 200, _, _)
+    ));
+    assert!(log.take().is_empty());
+}
+
+#[test]
+fn a_message_goes_from_demuxer_to_channel_and_back() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let alice_demuxer = Arc::new(demuxer());
+    let mut alice = MsrpChannel::new(
+        ALICE.as_bytes().to_vec(),
+        BOB.as_bytes().to_vec(),
+        Arc::clone(&alice_demuxer),
+        muxer(&Log::default()),
+    );
+    let bob_log = Log::default();
+    let mut bob = channel(&bob_log);
+
+    let body: Vec<u8> = (0..25 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
+    let (mut rx, results) = start_sending(
+        &alice_demuxer,
+        std::io::Cursor::new(body.clone()),
+        body.len(),
+        &rt,
+    );
+
+    // every chunk and every reply goes through the wire format
+    let mut to_bob = MsrpParser::new();
+    let mut to_alice = MsrpParser::new();
+    for chunk in sent_chunks(&rt, &mut rx, 3) {
+        to_bob.feed(&serialize(&chunk));
+        let chunk = to_bob.produce().unwrap().unwrap();
+        for reply in bob.on_message(chunk).unwrap() {
+            to_alice.feed(&serialize(&reply));
+            let reply = to_alice.produce().unwrap().unwrap();
+            assert!(alice.on_message(reply).unwrap().is_empty());
+        }
+    }
+
+    assert_eq!(*results.lock().unwrap(), vec![(200, "Ok".to_string())]);
+    let log = bob_log.take();
+    let received: String = log
+        .iter()
+        .filter_map(|entry| entry.strip_prefix("write "))
+        .collect();
+    assert_eq!(received.as_bytes(), &body[..]);
+    assert_eq!(log.last().unwrap(), "complete");
 }

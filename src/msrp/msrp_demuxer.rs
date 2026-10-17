@@ -48,20 +48,27 @@ enum TransactionStatus {
     DontCare,
 }
 
+type Callback = Arc<Mutex<Option<Box<dyn FnOnce(u16, String) + Send + Sync>>>>;
+
+// for each message being sent: its Message-ID, the reports it waits for, the
+// transactions of its chunks, whether all of its chunks are queued, and the
+// callback that is told how it ended
+type Waitlist = Arc<
+    Mutex<
+        Vec<(
+            Vec<u8>,
+            DeliveryStatus,
+            Vec<(Vec<u8>, TransactionStatus)>,
+            bool,
+            Callback,
+        )>,
+    >,
+>;
+
 pub struct MsrpDemuxer {
     pub from_path: Vec<u8>,
     pub to_path: Vec<u8>,
-    waitlist: Arc<
-        Mutex<
-            Vec<(
-                Vec<u8>,
-                DeliveryStatus,
-                Vec<(Vec<u8>, TransactionStatus)>,
-                bool,
-                Arc<Mutex<Option<Box<dyn FnOnce(u16, String) + Send + Sync>>>>,
-            )>,
-        >,
-    >,
+    waitlist: Waitlist,
 }
 
 impl MsrpDemuxer {
@@ -73,6 +80,8 @@ impl MsrpDemuxer {
         }
     }
 
+    /// Sends what `r` reads as one message, in chunks. `c` is called once: with
+    /// 200 when every chunk got a 200 response, otherwise with the failure.
     pub fn start<R, C>(
         &self,
         from_path: Vec<u8>,
@@ -90,8 +99,7 @@ impl MsrpDemuxer {
         R: std::io::Read + Send + Sync + 'static,
         C: FnOnce(u16, String) + Send + Sync + 'static,
     {
-        let c: Arc<Mutex<Option<Box<dyn FnOnce(u16, String) + Send + Sync>>>> =
-            Arc::new(Mutex::new(Some(Box::new(c))));
+        let c: Callback = Arc::new(Mutex::new(Some(Box::new(c))));
 
         let waitlist = Arc::clone(&self.waitlist);
 
@@ -99,14 +107,62 @@ impl MsrpDemuxer {
 
         rt.spawn(async move {
             let message_id = rand::create_raw_alpha_numeric_string(16);
+
+            {
+                let mut guard = waitlist.lock().unwrap();
+                guard.push((
+                    message_id.clone(),
+                    DeliveryStatus::AwaitNegativeReport,
+                    Vec::new(),
+                    false,
+                    c,
+                ));
+            }
+
             let mut sent: usize = 0;
-            // let mut buffer = None;
-            let mut read_complete = false;
             let mut buffer = [0; MAX_MSRP_CHUNK_SIZE];
             let mut filled_buffer: Option<Vec<u8>> = None;
-            while let Ok(result) = r.read(&mut buffer[..]) {
-                if result > 0 {
-                    if let Some(filled_buffer) = filled_buffer.take() {
+
+            // a chunk is held back until the next read tells whether it is the last
+            loop {
+                match r.read(&mut buffer[..]) {
+                    Ok(0) => break,
+
+                    Ok(size) => {
+                        if let Some(data) = filled_buffer.replace(buffer[..size].to_vec()) {
+                            let transaction_id = rand::create_raw_alpha_numeric_string(16);
+                            let chunk = build_msrp_chunk(
+                                &transaction_id,
+                                &from_path,
+                                &to_path,
+                                &message_id,
+                                &content_type,
+                                Some(data),
+                                &mut sent,
+                                total,
+                                ContinuationFlag::Continuation,
+                            );
+
+                            if !send_chunk(
+                                &waitlist,
+                                &message_id,
+                                transaction_id,
+                                chunk,
+                                false,
+                                &tx,
+                                &rt_,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                        }
+                    }
+
+                    Err(_) => {
+                        fail(&waitlist, &message_id, 500, "Internal Error");
+
+                        // tells the receiver that the message ends here
                         let transaction_id = rand::create_raw_alpha_numeric_string(16);
                         let chunk = build_msrp_chunk(
                             &transaction_id,
@@ -114,50 +170,19 @@ impl MsrpDemuxer {
                             &to_path,
                             &message_id,
                             &content_type,
-                            Some(filled_buffer),
+                            filled_buffer,
                             &mut sent,
                             total,
-                            ContinuationFlag::Continuation,
+                            ContinuationFlag::Abort,
                         );
-
-                        let transaction_id_ = transaction_id.clone();
-                        let transaction_status =
-                            (transaction_id_, TransactionStatus::AwaitResponseAndTimeout);
-                        let message_id_ = message_id.clone();
-                        let mut delivery_status = (
-                            message_id_,
-                            DeliveryStatus::AwaitNegativeReport,
-                            Vec::new(),
-                            false,
-                            Arc::clone(&c),
-                        );
-                        delivery_status.2.push(transaction_status);
-
-                        {
-                            let mut guard = waitlist.lock().unwrap();
-                            (*guard).push(delivery_status);
-                        }
 
                         match tx.send(chunk).await {
                             Ok(()) => {}
-                            Err(_) => {
-                                let mut guard = c.lock().unwrap();
-                                match (*guard).take() {
-                                    Some(c) => {
-                                        c(408, String::from("Timeout"));
-                                    }
-                                    None => {}
-                                }
-                            }
+                            Err(_) => {}
                         }
 
-                        start_timeout(&waitlist, transaction_id, &rt_);
+                        return;
                     }
-
-                    filled_buffer = Some(buffer[..result].to_vec());
-                } else {
-                    read_complete = true;
-                    break;
                 }
             }
 
@@ -174,57 +199,16 @@ impl MsrpDemuxer {
                 ContinuationFlag::Complete,
             );
 
-            let transaction_id_ = transaction_id.clone();
-            let transaction_status = (transaction_id_, TransactionStatus::AwaitResponseAndTimeout);
-            let message_id_ = message_id.clone();
-            let mut delivery_status = (
-                message_id_,
-                DeliveryStatus::AwaitNegativeReport,
-                Vec::new(),
-                false,
-                Arc::clone(&c),
-            );
-            delivery_status.2.push(transaction_status);
-
-            {
-                let mut guard = waitlist.lock().unwrap();
-                (*guard).push(delivery_status);
-            }
-
-            match tx.send(chunk).await {
-                Ok(()) => {}
-                Err(_) => {
-                    let mut guard = c.lock().unwrap();
-                    match (*guard).take() {
-                        Some(c) => {
-                            c(408, String::from("Timeout"));
-                        }
-                        None => {}
-                    }
-                }
-            }
-
-            start_timeout(&waitlist, transaction_id, &rt_);
-
-            if !read_complete {
-                let mut guard = waitlist.lock().unwrap();
-                let mut i = 0;
-                for (message_id_, _, _, _, _) in &mut *guard {
-                    if message_id_ == &message_id {
-                        let (_, _, _, _, _) = (*guard).remove(i);
-                        break;
-                    }
-                    i = i + 1;
-                }
-
-                let mut guard = c.lock().unwrap();
-                match (*guard).take() {
-                    Some(c) => {
-                        c(500, String::from("Internal Error"));
-                    }
-                    None => {}
-                }
-            }
+            send_chunk(
+                &waitlist,
+                &message_id,
+                transaction_id,
+                chunk,
+                true,
+                &tx,
+                &rt_,
+            )
+            .await;
         });
     }
 
@@ -245,7 +229,7 @@ impl MsrpDemuxer {
                                                 ranges,
                                                 total,
                                             ) => {
-                                                if byte_range.total != 0
+                                                if byte_range.total != Some(0)
                                                     && byte_range.from <= to
                                                     && byte_range.from > 1
                                                 {
@@ -323,65 +307,110 @@ impl MsrpDemuxer {
     }
 
     pub fn on_response(&self, message: MsrpChunk) -> Result<(), (u16, &'static str)> {
-        match message {
-            MsrpChunk::Response(resp_line, _) => {
-                let mut guard = self.waitlist.lock().unwrap();
-                let mut i = 0;
-                for (_, _, transaction_status_arr, all_sent, _) in &mut *guard {
-                    for (t, status) in transaction_status_arr.iter_mut() {
-                        if resp_line.transaction_id == *t {
-                            match status {
-                                TransactionStatus::AwaitResponse
-                                | TransactionStatus::AwaitResponseAndTimeout => {
-                                    if resp_line.status_code == 200 {
-                                        *status = TransactionStatus::Sent;
-                                        if *all_sent {
-                                            if !transaction_status_arr.iter().any(|(_, status)| {
-                                                match status {
-                                                    TransactionStatus::Sent => false,
-                                                    _ => true,
-                                                }
-                                            }) {
-                                                let (_, _, _, _, c) = (*guard).remove(i);
-                                                let mut guard = c.lock().unwrap();
-                                                match (*guard).take() {
-                                                    Some(c) => {
-                                                        c(200, String::from("Ok"));
-                                                    }
-                                                    None => {}
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        let (_, _, _, _, c) = (*guard).remove(i);
-                                        let mut guard = c.lock().unwrap();
-                                        match (*guard).take() {
-                                            Some(c) => {
-                                                let reason_phrase =
-                                                    if let Some(comment) = &resp_line.comment {
-                                                        String::from_utf8_lossy(comment).to_string()
-                                                    } else {
-                                                        String::from("")
-                                                    };
+        if let MsrpChunk::Response(resp_line, _) = message {
+            let mut guard = self.waitlist.lock().unwrap();
+            for i in 0..guard.len() {
+                let (_, _, transaction_status_arr, all_sent, _) = &mut guard[i];
+                if let Some((_, status)) = transaction_status_arr
+                    .iter_mut()
+                    .find(|(t, _)| *t == resp_line.transaction_id)
+                {
+                    match status {
+                        TransactionStatus::AwaitResponse
+                        | TransactionStatus::AwaitResponseAndTimeout => {}
+                        _ => return Ok(()),
+                    }
 
-                                                c(resp_line.status_code, reason_phrase);
-                                            }
-                                            None => {}
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
+                    if resp_line.status_code == 200 {
+                        *status = TransactionStatus::Sent;
+
+                        if !*all_sent
+                            || transaction_status_arr
+                                .iter()
+                                .any(|(_, status)| !matches!(status, TransactionStatus::Sent))
+                        {
                             return Ok(());
                         }
                     }
-                    i = i + 1;
+
+                    let (_, _, _, _, c) = guard.remove(i);
+                    drop(guard);
+
+                    if resp_line.status_code == 200 {
+                        report(&c, 200, String::from("Ok"));
+                    } else {
+                        let reason_phrase = if let Some(comment) = &resp_line.comment {
+                            String::from_utf8_lossy(comment).to_string()
+                        } else {
+                            String::from("")
+                        };
+                        report(&c, resp_line.status_code, reason_phrase);
+                    }
+
+                    return Ok(());
                 }
             }
-            _ => {}
         }
 
         Err((500, "Server Internal Error"))
+    }
+}
+
+// tracks the transaction of a chunk and queues the chunk, false when the
+// message has already failed and the rest of it should not be sent
+async fn send_chunk(
+    waitlist: &Waitlist,
+    message_id: &[u8],
+    transaction_id: Vec<u8>,
+    chunk: MsrpChunk,
+    last: bool,
+    tx: &mpsc::Sender<MsrpChunk>,
+    rt: &Arc<Runtime>,
+) -> bool {
+    {
+        let mut guard = waitlist.lock().unwrap();
+        match guard.iter_mut().find(|(id, _, _, _, _)| id == message_id) {
+            Some((_, _, transaction_status_arr, all_sent, _)) => {
+                transaction_status_arr.push((
+                    transaction_id.clone(),
+                    TransactionStatus::AwaitResponseAndTimeout,
+                ));
+                *all_sent = last;
+            }
+            None => return false,
+        }
+    }
+
+    match tx.send(chunk).await {
+        Ok(()) => {
+            start_timeout(waitlist, transaction_id, rt);
+            true
+        }
+
+        Err(_) => {
+            fail(waitlist, message_id, 408, "Timeout");
+            false
+        }
+    }
+}
+
+// drops the message from the waitlist and reports how it ended
+fn fail(waitlist: &Waitlist, message_id: &[u8], status_code: u16, reason_phrase: &str) {
+    let c = {
+        let mut guard = waitlist.lock().unwrap();
+        match guard.iter().position(|(id, _, _, _, _)| id == message_id) {
+            Some(i) => guard.remove(i).4,
+            None => return,
+        }
+    };
+
+    report(&c, status_code, String::from(reason_phrase));
+}
+
+fn report(c: &Callback, status_code: u16, reason_phrase: String) {
+    let callback = c.lock().unwrap().take();
+    if let Some(callback) = callback {
+        callback(status_code, reason_phrase);
     }
 }
 
@@ -406,9 +435,9 @@ fn build_msrp_chunk(
         continuation_flag,
     );
 
-    message.add_header(Header::new(b"From-Path", from_path.to_vec()));
-
     message.add_header(Header::new(b"To-Path", to_path.to_vec()));
+
+    message.add_header(Header::new(b"From-Path", from_path.to_vec()));
 
     message.add_header(Header::new(b"Message-ID", message_id.to_vec()));
 
@@ -434,71 +463,26 @@ fn build_msrp_chunk(
     message
 }
 
-fn start_timeout(
-    waitlist: &Arc<
-        Mutex<
-            Vec<(
-                Vec<u8>,
-                DeliveryStatus,
-                Vec<(Vec<u8>, TransactionStatus)>,
-                bool,
-                Arc<Mutex<Option<Box<dyn FnOnce(u16, String) + Send + Sync>>>>,
-            )>,
-        >,
-    >,
-    transaction_id: Vec<u8>,
-    rt: &Arc<Runtime>,
-) {
+fn start_timeout(waitlist: &Waitlist, transaction_id: Vec<u8>, rt: &Arc<Runtime>) {
     let waitlist = Arc::clone(&waitlist);
-    // timer.schedule(Duration::from_secs(30), move || {
-    //     let mut guard = waitlist.lock().unwrap();
-    //     for (_, _, transaction_status_arr, _, c) in &mut *guard {
-    //         let mut i = 0;
-    //         for (t, status) in transaction_status_arr.iter() {
-    //             if *t == transaction_id {
-    //                 match status {
-    //                     TransactionStatus::AwaitResponseAndTimeout => {
-    //                         let (_, _) = transaction_status_arr.remove(i);
-    //                         let mut guard = c.lock().unwrap();
-    //                         match (*guard).take() {
-    //                             Some(c) => {
-    //                                 c(408);
-    //                             }
-    //                             None => {}
-    //                         }
-    //                     }
-    //                     _ => {}
-    //                 }
-    //                 return;
-    //             }
-    //             i = i + 1;
-    //         }
-    //     }
-    // });
     rt.spawn(async move {
         sleep(Duration::from_secs(30)).await;
-        let mut guard = waitlist.lock().unwrap();
-        for (_, _, transaction_status_arr, _, c) in &mut *guard {
-            let mut i = 0;
-            for (t, status) in transaction_status_arr.iter() {
-                if *t == transaction_id {
-                    match status {
-                        TransactionStatus::AwaitResponseAndTimeout => {
-                            let (_, _) = transaction_status_arr.remove(i);
-                            let mut guard = c.lock().unwrap();
-                            match (*guard).take() {
-                                Some(c) => {
-                                    c(408, String::from("Timeout"));
-                                }
-                                None => {}
-                            }
-                        }
-                        _ => {}
-                    }
-                    return;
-                }
-                i = i + 1;
+        let c = {
+            let mut guard = waitlist.lock().unwrap();
+            let position = guard
+                .iter()
+                .position(|(_, _, transaction_status_arr, _, _)| {
+                    transaction_status_arr.iter().any(|(t, status)| {
+                        *t == transaction_id
+                            && matches!(status, TransactionStatus::AwaitResponseAndTimeout)
+                    })
+                });
+            match position {
+                Some(i) => guard.remove(i).4,
+                None => return,
             }
-        }
+        };
+
+        report(&c, 408, String::from("Timeout"));
     });
 }

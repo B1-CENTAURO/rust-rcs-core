@@ -59,6 +59,9 @@ spki = { version = "0.7", optional = true }
 tls_codec = { version = "0.5", features = ["derive"], optional = true }
 x509-cert = { version = "0.2", optional = true }
 
+[dev-dependencies]
+tokio = { version = "1.35", features = ["test-util"] }
+
 [features]
 default = []
 android = []

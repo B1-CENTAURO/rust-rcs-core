@@ -25,9 +25,14 @@ use crate::internet::header::Header;
 
 use crate::io::{DynamicChain, Serializable};
 
+use crate::util::rand;
+
+use super::msrp_chunk::ContinuationFlag;
 use super::msrp_chunk::MsrpChunk;
+use super::msrp_chunk::MsrpRequestLine;
 use super::msrp_chunk::MsrpResponseLine;
 use super::msrp_chunk::ReportFailure;
+use super::msrp_chunk::ReportSuccess;
 use super::msrp_demuxer::MsrpDemuxer;
 use super::msrp_muxer::MsrpMuxer;
 use super::msrp_transport::msrp_transport_start;
@@ -56,10 +61,7 @@ impl MsrpChannel {
         }
     }
 
-    pub fn on_message<'a>(
-        &mut self,
-        message: MsrpChunk,
-    ) -> Result<Option<MsrpChunk>, &'static str> {
+    pub fn on_message<'a>(&mut self, message: MsrpChunk) -> Result<Vec<MsrpChunk>, &'static str> {
         match &message {
             MsrpChunk::Request(req_line, _, _, _) => {
                 if let Some(chunk_info) = message.get_chunk_info() {
@@ -70,8 +72,15 @@ impl MsrpChannel {
                     resp_headers.push(Header::new(b"To-Path", chunk_info.to_path.to_vec()));
 
                     if req_line.request_method == b"SEND" {
+                        let mut success_report = None;
+
                         if let Some(message_id) = chunk_info.message_id {
                             resp_headers.push(Header::new(b"Message-ID", message_id.to_vec()));
+
+                            if let Some(ReportSuccess::Yes) = chunk_info.success_report {
+                                success_report =
+                                    Some((chunk_info.from_path.to_vec(), message_id.to_vec()));
+                            }
                         }
 
                         let mut failure_report = ReportFailure::Yes;
@@ -80,59 +89,100 @@ impl MsrpChannel {
                         }
 
                         match self.muxer.feed(message) {
-                            Ok(_) => match failure_report {
-                                ReportFailure::Yes => Ok(Some(MsrpChunk::new_response_chunk(
-                                    MsrpResponseLine {
-                                        transaction_id,
-                                        status_code: 200,
-                                        comment: Some(b"OK".to_vec()),
-                                    },
-                                    resp_headers,
-                                ))),
-                                _ => Ok(None),
-                            },
+                            Ok(size) => {
+                                let mut chunks = Vec::new();
+
+                                if let ReportFailure::Yes = failure_report {
+                                    chunks.push(MsrpChunk::new_response_chunk(
+                                        MsrpResponseLine {
+                                            transaction_id,
+                                            status_code: 200,
+                                            comment: Some(b"OK".to_vec()),
+                                        },
+                                        resp_headers,
+                                    ));
+                                }
+
+                                if let (Some(size), Some((to_path, message_id))) =
+                                    (size, success_report)
+                                {
+                                    chunks.push(make_success_report(
+                                        to_path,
+                                        self.from_path.clone(),
+                                        message_id,
+                                        size,
+                                    ));
+                                }
+
+                                Ok(chunks)
+                            }
 
                             Err((status_code, comment)) => match failure_report {
                                 ReportFailure::Yes | ReportFailure::Partial => {
-                                    Ok(Some(MsrpChunk::new_response_chunk(
+                                    Ok(vec![MsrpChunk::new_response_chunk(
                                         MsrpResponseLine {
                                             transaction_id,
                                             status_code,
                                             comment: Some(comment.as_bytes().to_vec()),
                                         },
                                         resp_headers,
-                                    )))
+                                    )])
                                 }
-                                _ => Ok(None),
+                                _ => Ok(Vec::new()),
                             },
                         }
                     } else if req_line.request_method == b"REPORT" {
                         if let Ok(_) = self.demuxer.on_report(message) {
-                            Ok(None)
+                            Ok(Vec::new())
                         } else {
-                            Ok(None)
+                            Ok(Vec::new())
                         }
                     } else {
-                        Ok(Some(MsrpChunk::new_response_chunk(
+                        Ok(vec![MsrpChunk::new_response_chunk(
                             MsrpResponseLine {
                                 transaction_id,
                                 status_code: 501,
                                 comment: Some(b"Unknown request method".to_vec()),
                             },
                             resp_headers,
-                        )))
+                        )])
                     }
                 } else {
                     Err("Bad Format")
                 }
             }
             MsrpChunk::Response(_, _) => match self.demuxer.on_response(message) {
-                Ok(_) => Ok(None),
+                Ok(_) => Ok(Vec::new()),
 
-                Err(_) => Ok(None),
+                Err(_) => Ok(Vec::new()),
             },
         }
     }
+}
+
+// RFC 4975 section 7.1.2, a REPORT covering the whole message back along the
+// From-Path of the SEND
+fn make_success_report(
+    to_path: Vec<u8>,
+    from_path: Vec<u8>,
+    message_id: Vec<u8>,
+    size: usize,
+) -> MsrpChunk {
+    MsrpChunk::new_request_chunk(
+        MsrpRequestLine {
+            transaction_id: rand::create_raw_alpha_numeric_string(16),
+            request_method: b"REPORT".to_vec(),
+        },
+        vec![
+            Header::new(b"To-Path", to_path),
+            Header::new(b"From-Path", from_path),
+            Header::new(b"Message-ID", message_id),
+            Header::new(b"Byte-Range", format!("1-{}/{}", size, size)),
+            Header::new(b"Status", b"000 200 OK"),
+        ],
+        None,
+        ContinuationFlag::Complete,
+    )
 }
 
 pub struct MsrpChannelManager {

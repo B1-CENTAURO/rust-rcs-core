@@ -39,7 +39,7 @@ use crate::util::raw_string::ToInt;
 pub struct ByteRange {
     pub from: usize,
     pub to: Option<usize>,
-    pub total: usize,
+    pub total: Option<usize>, // None for "*", the total is not known yet
 }
 
 pub fn parse(s: &[u8]) -> Option<ByteRange> {
@@ -50,27 +50,39 @@ pub fn parse(s: &[u8]) -> Option<ByteRange> {
             let s2 = &s[i1 + 1..i1 + 1 + i2];
             let s3 = &s[i1 + 1 + i2 + 1..];
 
-            if let Ok(from) = s1.to_int() {
-                if let Ok(total) = s3.to_int() {
-                    if total >= from || (from == 1 && total == 0) {
-                        if s2 == b"*" {
-                            return Some(ByteRange {
-                                from,
-                                to: None,
-                                total,
-                            });
-                        } else if let Ok(to) = s2.to_int() {
-                            if total >= to && (to >= from || (from == 1 && to == 0)) {
-                                return Some(ByteRange {
-                                    from,
-                                    to: Some(to),
-                                    total,
-                                });
-                            }
-                        }
+            let from: usize = s1.to_int().ok()?;
+
+            let to: Option<usize> = if s2 == b"*" {
+                None
+            } else {
+                Some(s2.to_int().ok()?)
+            };
+
+            let total: Option<usize> = if s3 == b"*" {
+                None
+            } else {
+                Some(s3.to_int().ok()?)
+            };
+
+            if let Some(total) = total {
+                if !(total >= from || (from == 1 && total == 0)) {
+                    return None;
+                }
+
+                if let Some(to) = to {
+                    if to > total {
+                        return None;
                     }
                 }
             }
+
+            if let Some(to) = to {
+                if !(to >= from || (from == 1 && to == 0)) {
+                    return None;
+                }
+            }
+
+            return Some(ByteRange { from, to, total });
         }
     }
 
