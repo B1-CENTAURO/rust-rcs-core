@@ -7,7 +7,7 @@ This library itself should prove a suitable base for building a SIP/RCS client. 
 
 SIP sessions had not gone through any testing and we should re-work FFI functions since they are heavily Android-biased now.
 
-MSRP is tested in `src/msrp/tests.rs` (wire format, chunking, reports, sessions over an in-memory connection, SDP) but not yet against other implementations. For the passive side, `MsrpChannelManager::accept` takes connections the remote end opens; listening for them is left to the caller. For CEMA (RFC 6714), `MsrpInfo` reads and writes `a=msrp-cema`, and `MsrpInfo::connection_address` gives the address a `socket_factory` should connect to. There is no relay (RFC 4976) support.
+MSRP is tested in `src/msrp/tests.rs` (wire format, chunking, reports, sessions over an in-memory connection, SDP) but not yet against other implementations. For the passive side, `MsrpChannelManager::accept` takes connections the remote end opens; listening for them is left to the caller. For CEMA (RFC 6714), `MsrpInfo` reads and writes `a=msrp-cema`, and `MsrpInfo::connection_address` gives the address a `socket_factory` should connect to. MSRP relays (RFC 4976: AUTH, Use-Path, a shared connection to the relay) are not supported, by choice: RCS over IMS does not use them, as the network anchors MSRP at its border elements instead (CEMA, above). Paths of several URIs, as a peer behind a relay may give, are still parsed and routed (responses go to the first hop, sessions are matched on the endpoints), but this has not been tried with a relay.
 
 Also, some code are half way through the sync-async conversion and require clean ups.
 
