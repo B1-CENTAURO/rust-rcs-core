@@ -50,6 +50,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use tokio::time::sleep_until;
+use tokio::time::timeout;
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -78,6 +79,10 @@ const LOG_TAG: &str = "http_client";
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 
 const MAX_CONCURRENT_REQUEST_IN_CONNECTIONS: usize = 16;
+
+/// How long to wait for a TCP connection to an address, and for the TLS
+/// handshake on it, before going on to the next address.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 enum ConnectMessage {
     Request(
@@ -152,10 +157,23 @@ impl HttpClient {
     /// `client_config` may be shared with other protocols: the client keeps a
     /// copy that offers only HTTP/1.1 in ALPN (RFC 7301), the one version it
     /// speaks, so that no server switches its connections to HTTP/2.
+    ///
+    /// Each address of a host gets 15 seconds to accept the connection and, for
+    /// https, to complete the TLS handshake; a connect fails with `Timeout`
+    /// when the last address tried took too long.
     pub fn new(
         client_config: Arc<ClientConfig>,
         dns_client: Arc<DnsClient>,
         rt: Arc<Runtime>,
+    ) -> HttpClient {
+        Self::with_connect_timeout(client_config, dns_client, rt, CONNECT_TIMEOUT)
+    }
+
+    fn with_connect_timeout(
+        client_config: Arc<ClientConfig>,
+        dns_client: Arc<DnsClient>,
+        rt: Arc<Runtime>,
+        connect_timeout: Duration,
     ) -> HttpClient {
         let client_config = {
             let mut config = ClientConfig::clone(&client_config);
@@ -272,6 +290,7 @@ impl HttpClient {
                                                             client_config,
                                                             &domain,
                                                             can_pipeline,
+                                                            connect_timeout,
                                                             &connections,
                                                         )
                                                         .await
@@ -336,6 +355,7 @@ impl HttpClient {
                                                 client_config,
                                                 &ip.to_string(),
                                                 can_pipeline,
+                                                connect_timeout,
                                                 &connections,
                                             )
                                             .await
@@ -380,6 +400,7 @@ impl HttpClient {
                                                 client_config,
                                                 &ip.to_string(),
                                                 can_pipeline,
+                                                connect_timeout,
                                                 &connections,
                                             )
                                             .await
@@ -436,6 +457,7 @@ impl HttpClient {
         client_config: Arc<ClientConfig>,
         server_name: &str,
         can_pipeline: bool,
+        connect_timeout: Duration,
         connections: &Arc<
             Mutex<
                 Vec<(
@@ -462,8 +484,12 @@ impl HttpClient {
         );
 
         if tls {
-            let (stream, cipher_id) =
-                Self::connect_tls(addr, port, client_config, server_name).await?;
+            let (stream, cipher_id) = timeout(
+                connect_timeout,
+                Self::connect_tls(addr, port, client_config, server_name),
+            )
+            .await
+            .map_err(|_| ErrorKind::Timeout)??;
             let now = Instant::now();
             let conn = HttpConnection::new(host, port, true, cipher_id, can_pipeline, now);
             let conn = Arc::new(conn);
@@ -483,7 +509,9 @@ impl HttpClient {
 
             return Ok(handle);
         } else {
-            let stream = Self::connect_tcp(addr, port).await?;
+            let stream = timeout(connect_timeout, Self::connect_tcp(addr, port))
+                .await
+                .map_err(|_| ErrorKind::Timeout)??;
             let now = Instant::now();
             let conn = HttpConnection::new(host, port, false, None, can_pipeline, now);
             let conn = Arc::new(conn);
@@ -698,6 +726,7 @@ pub enum ErrorKind {
     BrokenPipe,
     ConnectionLost,
     ProtocolError,
+    Timeout,
 }
 
 impl Copy for ErrorKind {}
@@ -733,6 +762,10 @@ impl fmt::Debug for ErrorKind {
 
             ErrorKind::ProtocolError => {
                 write!(f, "ProtocolError")
+            }
+
+            ErrorKind::Timeout => {
+                write!(f, "Timeout")
             }
         }
     }
