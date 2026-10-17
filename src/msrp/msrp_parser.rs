@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::internet::header;
+use std::ops::Range;
+
 use crate::internet::header::Header;
-use crate::internet::headers::byte_range;
 use crate::internet::syntax;
 
 use crate::util::raw_string::{StrFind, ToInt};
@@ -30,7 +30,7 @@ enum MsrpFirstLine {
 }
 
 impl MsrpFirstLine {
-    fn transaction_id(&self) -> &Vec<u8> {
+    fn transaction_id(&self) -> &[u8] {
         match self {
             MsrpFirstLine::Request(req_line) => &req_line.transaction_id,
             MsrpFirstLine::Response(resp_line) => &resp_line.transaction_id,
@@ -38,31 +38,20 @@ impl MsrpFirstLine {
     }
 }
 
-fn new_msrp_chunk(
-    first_line: MsrpFirstLine,
-    headers: Vec<Header>,
-    body: Option<Vec<u8>>,
-    continuation_flag: ContinuationFlag,
-) -> MsrpChunk {
-    match first_line {
-        MsrpFirstLine::Request(req_line) => {
-            MsrpChunk::new_request_chunk(req_line, headers, body, continuation_flag)
-        }
-        MsrpFirstLine::Response(resp_line) => MsrpChunk::new_response_chunk(resp_line, headers),
-    }
-}
-
 enum ParsingState {
     ReadingFirstLine,
-    ReadingHeaders(Option<MsrpFirstLine>, Option<Vec<Header>>),
-    ReadingBody(
-        Option<MsrpRequestLine>,
-        Option<Vec<Header>>,
-        Option<usize>,
-        usize,
-    ),
+    ReadingHeaders(MsrpFirstLine, Vec<Header>),
+    // the body starts at the parser position, the end-line is searched for
+    // from the offset so that bytes are not searched twice
+    ReadingBody(MsrpRequestLine, Vec<Header>, usize),
 }
 
+/// Parses MSRP requests and responses (RFC 4975 section 9) out of a byte
+/// stream.
+///
+/// A body ends at the first CRLF end-line with the request's transaction id,
+/// since a sender may interrupt a chunk before the end of its Byte-Range;
+/// checking Byte-Range is left to whoever reassembles the message.
 pub struct MsrpParser {
     buffer: Vec<u8>,
     p: usize,
@@ -82,282 +71,200 @@ impl MsrpParser {
         self.buffer.extend_from_slice(data);
     }
 
-    pub fn produce(&mut self) -> Result<Option<MsrpChunk>, &str> {
-        'outer: loop {
-            match &mut self.state {
-                ParsingState::ReadingFirstLine => {
-                    let mut i = 0;
-                    while self.p + i < self.buffer.len() {
-                        let b1 = self.buffer[self.p + i];
-                        if b1 == b'\r' {
-                            if self.p + i + 1 < self.buffer.len() {
-                                let b2 = self.buffer[self.p + i + 1];
-                                if b2 == b'\n' {
-                                    let mut iter =
-                                        self.buffer[self.p..self.p + i].splitn(3, |c| *c == b' ');
-                                    if let Some(s1) = iter.next() {
-                                        if s1 == b"MSRP" {
-                                            if let Some(s2) = iter.next() {
-                                                if let Some(s3) = iter.next() {
-                                                    let s4;
-                                                    let s5;
-                                                    if let Some(idx) =
-                                                        s3.iter().position(|c| *c == b' ')
-                                                    {
-                                                        s4 = &s3[..idx];
-                                                        s5 = Some(s3[idx + 1..].to_vec());
-                                                    } else {
-                                                        s4 = s3;
-                                                        s5 = None;
-                                                    }
+    /// Returns the next complete message, or None until more data is fed.
+    /// One feed can carry several messages, so call it until it returns None.
+    pub fn produce(&mut self) -> Result<Option<MsrpChunk>, &'static str> {
+        loop {
+            match std::mem::replace(&mut self.state, ParsingState::ReadingFirstLine) {
+                ParsingState::ReadingFirstLine => match self.next_line() {
+                    Some(line) => {
+                        let first_line = parse_first_line(&self.buffer[line])?;
+                        self.state = ParsingState::ReadingHeaders(first_line, Vec::new());
+                    }
 
-                                                    if s4.len() == 3
-                                                        && s4[0] >= b'0'
-                                                        && s4[0] <= b'9'
-                                                        && s4[1] >= b'0'
-                                                        && s4[1] <= b'9'
-                                                        && s4[2] >= b'0'
-                                                        && s4[2] <= b'9'
-                                                    {
-                                                        if let Ok(status_code) = s4.to_int() {
-                                                            let resp_line = MsrpResponseLine {
-                                                                transaction_id: s2.to_vec(),
-                                                                status_code,
-                                                                comment: s5,
-                                                            };
+                    None => return Ok(None),
+                },
 
-                                                            self.state =
-                                                                ParsingState::ReadingHeaders(
-                                                                    Some(MsrpFirstLine::Response(
-                                                                        resp_line,
-                                                                    )),
-                                                                    Some(Vec::new()),
-                                                                );
-                                                            self.p = self.p + i + 2;
+                ParsingState::ReadingHeaders(first_line, mut headers) => {
+                    let line = match self.next_line() {
+                        Some(line) => line,
+                        None => {
+                            self.state = ParsingState::ReadingHeaders(first_line, headers);
+                            return Ok(None);
+                        }
+                    };
 
-                                                            continue 'outer;
-                                                        }
-                                                    } else {
-                                                        if let None = s5 {
-                                                            let req_line = MsrpRequestLine {
-                                                                transaction_id: s2.to_vec(),
-                                                                request_method: s4.to_vec(),
-                                                            };
+                    if let Some(continuation_flag) =
+                        end_line(&self.buffer[line.clone()], first_line.transaction_id())
+                    {
+                        self.consume();
+                        return Ok(Some(match first_line {
+                            MsrpFirstLine::Request(req_line) => MsrpChunk::new_request_chunk(
+                                req_line,
+                                headers,
+                                None,
+                                continuation_flag,
+                            ),
+                            MsrpFirstLine::Response(resp_line) => {
+                                MsrpChunk::new_response_chunk(resp_line, headers)
+                            }
+                        }));
+                    }
 
-                                                            self.state =
-                                                                ParsingState::ReadingHeaders(
-                                                                    Some(MsrpFirstLine::Request(
-                                                                        req_line,
-                                                                    )),
-                                                                    Some(Vec::new()),
-                                                                );
-                                                            self.p = self.p + i + 2;
+                    let line = &self.buffer[line];
 
-                                                            continue 'outer;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                    if line.is_empty() {
+                        match first_line {
+                            MsrpFirstLine::Request(req_line) => {
+                                self.state = ParsingState::ReadingBody(req_line, headers, self.p);
+                            }
 
-                                    return Err("Bad format");
-                                }
+                            MsrpFirstLine::Response(_) => {
+                                return Err("MSRP Responses are not allowed to have body");
                             }
                         }
-
-                        i = i + 1;
+                    } else if let Some(idx) = line.iter().position(|c| *c == b':') {
+                        headers.push(Header::new(
+                            syntax::trim(&line[..idx]).to_vec(),
+                            syntax::trim(&line[idx + 1..]).to_vec(),
+                        ));
+                        self.state = ParsingState::ReadingHeaders(first_line, headers);
+                    } else {
+                        return Err("Bad format");
                     }
                 }
 
-                ParsingState::ReadingHeaders(first_line, headers) => {
-                    let mut i = 0;
-                    while self.p + i < self.buffer.len() {
-                        let b1 = self.buffer[self.p + i];
-                        if b1 == b'\r' {
-                            if self.p + i + 1 < self.buffer.len() {
-                                let b2 = self.buffer[self.p + i + 1];
-                                if b2 == b'\n' {
-                                    if let Some(first_line_) = first_line {
-                                        let transaction_id = first_line_.transaction_id();
+                ParsingState::ReadingBody(req_line, headers, from) => {
+                    // data CRLF end-line
+                    let mut boundary = b"\r\n-------".to_vec();
+                    boundary.extend_from_slice(&req_line.transaction_id);
 
-                                        if let Some(idx) =
-                                            self.buffer[self.p..self.p + i].index_of(b"-------")
-                                        {
-                                            if idx + 7 + transaction_id.len() == i {
-                                                if &self.buffer[self.p + idx + 7..self.p + i]
-                                                    == transaction_id
-                                                {
-                                                    self.buffer =
-                                                        self.buffer.split_off(self.p + i + 2);
-                                                    self.p = 0;
-                                                    let ok = Ok(Some(new_msrp_chunk(
-                                                        first_line.take().unwrap(),
-                                                        headers.take().unwrap(),
-                                                        None,
-                                                        ContinuationFlag::Complete,
-                                                    )));
-                                                    self.state = ParsingState::ReadingFirstLine;
-                                                    return ok;
-                                                }
-                                            }
-                                        }
+                    match self.buffer[from..].index_of(&boundary) {
+                        Some(idx) => {
+                            let end = from + idx;
+                            let flag = end + boundary.len();
 
-                                        if i == 0 {
-                                            if let Some(first_line) = first_line.take() {
-                                                match first_line {
-                                                    MsrpFirstLine::Request(req_line) => {
-                                                        if let Some(headers) = headers.take() {
-                                                            if let Some(byte_range_header) = header::search(&headers, b"Byte-Range", false) {
-                                                                let byte_range_header_value = byte_range_header.get_value();
-                                                                if let Some(byte_range) = byte_range::parse(byte_range_header_value) {
-                                                                    if let Some(to) = byte_range.to {
-                                                                        self.state = ParsingState::ReadingBody(Some(req_line), Some(headers), Some(to + 1 - byte_range.from), byte_range.total + 1 - byte_range.from);
-                                                                        self.p = self.p + 2;
-                                                                        continue 'outer;
-                                                                    } else {
-                                                                        self.state = ParsingState::ReadingBody(Some(req_line), Some(headers), None, byte_range.total + 1 - byte_range.from);
-                                                                        self.p = self.p + 2;
-                                                                        continue 'outer;
-                                                                    }
-                                                                }
-                                                            }
-
-                                                            self.state = ParsingState::ReadingBody(Some(req_line), Some(headers), None, 0);
-                                                            self.p = self.p + 2;
-                                                            continue 'outer;
-
-                                                        } else {
-                                                            return Err("impossible condition");
-                                                        }
-                                                    }
-
-                                                    MsrpFirstLine::Response(_) => {
-                                                        return Err("MSRP Responses are not allowed to have body")
-                                                    }
-                                                }
-                                            } else {
-                                                return Err("impossible condition");
-                                            }
-                                        } else {
-                                            let line = &self.buffer[self.p..self.p + i];
-
-                                            if let Some(idx) = line.iter().position(|c| *c == b':')
-                                            {
-                                                match headers {
-                                                    Some(headers) => {
-                                                        headers.push(Header::new(
-                                                            syntax::trim(&line[..idx]).to_vec(),
-                                                            syntax::trim(&line[idx + 1..]).to_vec(),
-                                                        ));
-                                                        self.p = self.p + i + 2;
-                                                        continue 'outer;
-                                                    }
-                                                    _ => {
-                                                        return Err("impossible condition");
-                                                    }
-                                                }
-                                            } else {
-                                                return Err("Bad format");
-                                            }
-                                        }
-                                    } else {
-                                        return Err("impossible condition");
-                                    }
-                                }
-                            }
-                        }
-
-                        i = i + 1;
-                    }
-                }
-
-                ParsingState::ReadingBody(req_line, headers, content_length, range_limit) => {
-                    if let Some(req_line_) = req_line {
-                        if let Some(content_length) = content_length {
-                            let mut boundary = b"\r\n-------".to_vec();
-                            boundary.extend(&req_line_.transaction_id);
-                            boundary.extend(b"\r\n");
-
-                            if self.buffer[self.p + *content_length..].start_with(&boundary) {
-                                let data = self.buffer[self.p..self.p + *content_length].to_vec();
-                                self.buffer = self
-                                    .buffer
-                                    .split_off(self.p + *content_length + boundary.len());
-                                self.p = 0;
-                                return Ok(Some(MsrpChunk::new_request_chunk(
-                                    req_line.take().unwrap(),
-                                    headers.take().unwrap(),
-                                    Some(data),
-                                    ContinuationFlag::Complete,
-                                )));
-                            }
-
-                            if self.p + *content_length + boundary.len() <= self.buffer.len() {
-                                return Err("Missing closing boundary");
-                            } else {
+                            if self.buffer.len() < flag + 3 {
+                                self.state = ParsingState::ReadingBody(req_line, headers, end);
                                 return Ok(None);
                             }
-                        } else {
-                            let mut continuation_flag = None;
 
-                            if let Some(idx) = self.buffer[self.p..].index_of(b"\r\n-------") {
-                                if self.buffer[self.p + idx + 9..]
-                                    .start_with(&req_line_.transaction_id)
+                            match continuation_flag(self.buffer[flag]) {
+                                Some(continuation_flag)
+                                    if &self.buffer[flag + 1..flag + 3] == b"\r\n" =>
                                 {
-                                    if self.buffer
-                                        [self.p + idx + 9 + req_line_.transaction_id.len()..]
-                                        .start_with(b"$\r\n")
-                                    {
-                                        continuation_flag = Some((idx, ContinuationFlag::Complete));
-                                    } else if self.buffer
-                                        [self.p + idx + 9 + req_line_.transaction_id.len()..]
-                                        .start_with(b"#\r\n")
-                                    {
-                                        continuation_flag = Some((idx, ContinuationFlag::Abort));
-                                    } else if self.buffer
-                                        [self.p + idx + 9 + req_line_.transaction_id.len()..]
-                                        .start_with(b"+\r\n")
-                                    {
-                                        continuation_flag =
-                                            Some((idx, ContinuationFlag::Continuation));
-                                    }
-                                }
-                            }
-
-                            if let Some((idx, continuation_flag)) = continuation_flag {
-                                if idx < *range_limit {
-                                    let data = self.buffer[self.p..self.p + idx].to_vec();
-                                    self.buffer = self.buffer.split_off(
-                                        self.p + idx + 9 + req_line_.transaction_id.len() + 3,
-                                    );
-                                    self.p = 0;
-                                    let ok = Ok(Some(MsrpChunk::new_request_chunk(
-                                        req_line.take().unwrap(),
-                                        headers.take().unwrap(),
-                                        Some(data),
+                                    let body = self.buffer[self.p..end].to_vec();
+                                    self.p = flag + 3;
+                                    self.consume();
+                                    return Ok(Some(MsrpChunk::new_request_chunk(
+                                        req_line,
+                                        headers,
+                                        Some(body),
                                         continuation_flag,
                                     )));
-                                    self.state = ParsingState::ReadingFirstLine;
-                                    return ok;
-                                } else {
-                                    return Err("More data than declared");
-                                }
-                            } else {
-                                if self.p + *range_limit + 9 + req_line_.transaction_id.len() + 3
-                                    <= self.buffer.len()
-                                {
-                                    return Err("Missing closing boundary");
                                 }
 
-                                return Ok(None);
+                                _ => {
+                                    // content that only looks like an end-line
+                                    self.state =
+                                        ParsingState::ReadingBody(req_line, headers, end + 1);
+                                }
                             }
                         }
-                    } else {
-                        return Err("impossible condition");
+
+                        None => {
+                            // the boundary may be split across feeds
+                            let from = std::cmp::max(
+                                from,
+                                (self.buffer.len() + 1).saturating_sub(boundary.len()),
+                            );
+                            self.state = ParsingState::ReadingBody(req_line, headers, from);
+                            return Ok(None);
+                        }
                     }
                 }
             }
         }
+    }
+
+    // the next CRLF terminated line, without the CRLF, moving past it
+    fn next_line(&mut self) -> Option<Range<usize>> {
+        let idx = self.buffer[self.p..].index_of(b"\r\n")?;
+        let line = self.p..self.p + idx;
+        self.p = self.p + idx + 2;
+        Some(line)
+    }
+
+    // drops the message that was just produced
+    fn consume(&mut self) {
+        self.buffer.drain(..self.p);
+        self.p = 0;
+    }
+}
+
+// req-start  = "MSRP" SP transact-id SP method CRLF
+// resp-start = "MSRP" SP transact-id SP status-code [SP comment] CRLF
+fn parse_first_line(line: &[u8]) -> Result<MsrpFirstLine, &'static str> {
+    let mut iter = line.splitn(3, |c| *c == b' ');
+    let (pmsrp, transaction_id, rest) = match (iter.next(), iter.next(), iter.next()) {
+        (Some(pmsrp), Some(transaction_id), Some(rest)) => (pmsrp, transaction_id, rest),
+        _ => return Err("Bad format"),
+    };
+
+    if pmsrp != b"MSRP" || !is_ident(transaction_id) {
+        return Err("Bad format");
+    }
+
+    if rest.len() >= 3
+        && rest[..3].iter().all(u8::is_ascii_digit)
+        && (rest.len() == 3 || rest[3] == b' ')
+    {
+        let status_code: u16 = rest[..3].to_int().map_err(|_| "Bad format")?;
+        return Ok(MsrpFirstLine::Response(MsrpResponseLine {
+            transaction_id: transaction_id.to_vec(),
+            status_code,
+            comment: if rest.len() > 4 {
+                Some(rest[4..].to_vec())
+            } else {
+                None
+            },
+        }));
+    }
+
+    if !rest.is_empty() && rest.iter().all(u8::is_ascii_uppercase) {
+        return Ok(MsrpFirstLine::Request(MsrpRequestLine {
+            transaction_id: transaction_id.to_vec(),
+            request_method: rest.to_vec(),
+        }));
+    }
+
+    Err("Bad format")
+}
+
+// ident-char = ALPHANUM / "." / "-" / "+" / "%" / "="
+fn is_ident(s: &[u8]) -> bool {
+    !s.is_empty()
+        && s.iter()
+            .all(|c| c.is_ascii_alphanumeric() || b".-+%=".contains(c))
+}
+
+// end-line = "-------" transact-id continuation-flag CRLF, given without the CRLF
+fn end_line(line: &[u8], transaction_id: &[u8]) -> Option<ContinuationFlag> {
+    if line.len() == 7 + transaction_id.len() + 1
+        && line.start_with(b"-------")
+        && &line[7..7 + transaction_id.len()] == transaction_id
+    {
+        return continuation_flag(line[line.len() - 1]);
+    }
+
+    None
+}
+
+fn continuation_flag(c: u8) -> Option<ContinuationFlag> {
+    match c {
+        b'$' => Some(ContinuationFlag::Complete),
+        b'+' => Some(ContinuationFlag::Continuation),
+        b'#' => Some(ContinuationFlag::Abort),
+        _ => None,
     }
 }
