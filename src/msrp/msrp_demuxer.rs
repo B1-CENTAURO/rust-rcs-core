@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 // use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::runtime::Runtime;
@@ -33,6 +34,9 @@ use super::msrp_chunk::MsrpChunk;
 use super::msrp_chunk::MsrpRequestLine;
 
 const MAX_MSRP_CHUNK_SIZE: usize = 10 * 1024;
+
+// how many messages that ended a late failure REPORT is still taken for
+pub(crate) const ENDED_MESSAGES_KEPT: usize = 1024;
 
 // the 30 seconds a chunk's response may take, and as long again for the
 // success REPORTs that follow
@@ -54,28 +58,43 @@ enum TransactionStatus {
 
 type Callback = Arc<Mutex<Option<Box<dyn FnOnce(u16, String) + Send + Sync>>>>;
 
-// for each message being sent: its Message-ID, the reports it waits for, the
-// transactions of its chunks, whether all of its chunks are queued, and the
-// callback that is told how it ended
-type Waitlist = Arc<
-    Mutex<
-        Vec<(
-            Vec<u8>,
-            DeliveryStatus,
-            Vec<(Vec<u8>, TransactionStatus)>,
-            bool,
-            Callback,
-        )>,
-    >,
->;
+type Waitlist = Arc<Mutex<Messages>>;
+
+#[derive(Default)]
+struct Messages {
+    // for each message being sent: its Message-ID, the reports it waits for,
+    // the transactions of its chunks, whether all of its chunks are queued,
+    // and the callback that is told how it ended
+    pending: Vec<(
+        Vec<u8>,
+        DeliveryStatus,
+        Vec<(Vec<u8>, TransactionStatus)>,
+        bool,
+        Callback,
+    )>,
+    // the Message-IDs of the last messages that ended, oldest first
+    ended: VecDeque<Vec<u8>>,
+    // the status of the failure REPORT that failed the session
+    failure: Option<(u16, String)>,
+}
+
+impl Messages {
+    // takes the message out, keeping its Message-ID for a failure REPORT that
+    // comes after it ended
+    fn end(&mut self, i: usize) -> Callback {
+        let (message_id, _, _, _, c) = self.pending.remove(i);
+        if self.ended.len() == ENDED_MESSAGES_KEPT {
+            self.ended.pop_front();
+        }
+        self.ended.push_back(message_id);
+        c
+    }
+}
 
 pub struct MsrpDemuxer {
     pub from_path: Vec<u8>,
     pub to_path: Vec<u8>,
     waitlist: Waitlist,
-    // the status of the failure REPORT that failed the session; set and read
-    // with the waitlist locked, so that no message starts after it
-    failure: Arc<Mutex<Option<(u16, String)>>>,
 }
 
 impl MsrpDemuxer {
@@ -83,18 +102,18 @@ impl MsrpDemuxer {
         MsrpDemuxer {
             from_path,
             to_path,
-            waitlist: Arc::new(Mutex::new(Vec::new())),
-            failure: Arc::new(Mutex::new(None)),
+            waitlist: Arc::default(),
         }
     }
 
     /// The status of the failure REPORT that failed this session, if one
     /// did. RFC 4975 section 7.3.2 has the session treated as failed then:
     /// the messages pending on it and those started after it end with that
-    /// status, and sending again takes negotiating a new session.
+    /// status, and sending again takes negotiating a new session. That holds
+    /// too for a failure REPORT on one of the last 1024 messages that ended,
+    /// as a gateway may send after accepting all of a message.
     pub fn session_failure(&self) -> Option<(u16, String)> {
-        let _guard = self.waitlist.lock().unwrap();
-        self.failure.lock().unwrap().clone()
+        self.waitlist.lock().unwrap().failure.clone()
     }
 
     /// Sends what `r` reads as one message, in chunks. `c` is called once: with
@@ -163,7 +182,6 @@ impl MsrpDemuxer {
         let success_report = success_report && total > 0;
 
         let waitlist = Arc::clone(&self.waitlist);
-        let failure = Arc::clone(&self.failure);
 
         let rt_ = Arc::clone(rt);
 
@@ -172,14 +190,13 @@ impl MsrpDemuxer {
 
             {
                 let mut guard = waitlist.lock().unwrap();
-                let failed = failure.lock().unwrap().clone();
-                if let Some((status_code, reason_phrase)) = failed {
+                if let Some((status_code, reason_phrase)) = guard.failure.clone() {
                     drop(guard);
                     report(&c, status_code, reason_phrase);
                     return;
                 }
 
-                guard.push((
+                guard.pending.push((
                     message_id.clone(),
                     if success_report {
                         DeliveryStatus::AwaitPositiveAndNegativeReport(Vec::new(), total)
@@ -295,23 +312,41 @@ impl MsrpDemuxer {
     /// Takes a REPORT for a message being sent: a success REPORT counts the
     /// bytes it covers until they are the whole message, a failure REPORT
     /// fails the session (RFC 4975 section 7.3.2), ending every message on it
-    /// with its status.
+    /// with its status. A failure REPORT for one of the last messages that
+    /// ended fails the session too.
     pub fn on_report(&self, message: MsrpChunk) -> Result<(), &'static str> {
         let report_status = match message.get_report_status() {
             Some(report_status) if report_status.ns == 0 => report_status,
             _ => return Err("Server Internal Error"),
         };
 
+        let reason_phrase = match report_status.comment {
+            Some(comment) => String::from_utf8_lossy(comment).to_string(),
+            None => String::new(),
+        };
+
         let mut guard = self.waitlist.lock().unwrap();
         let i = match guard
+            .pending
             .iter()
             .position(|(message_id, _, _, _, _)| message_id == report_status.message_id)
         {
             Some(i) => i,
-            None => return Err("Server Internal Error"),
+            None => {
+                if report_status.status_code != 200
+                    && guard
+                        .ended
+                        .iter()
+                        .any(|message_id| message_id == report_status.message_id)
+                {
+                    fail_session(guard, report_status.status_code, reason_phrase);
+                    return Ok(());
+                }
+                return Err("Server Internal Error");
+            }
         };
 
-        let ended = match (&mut guard[i].1, report_status.status_code) {
+        let ended = match (&mut guard.pending[i].1, report_status.status_code) {
             (
                 DeliveryStatus::AwaitPositiveReport(ranges, total)
                 | DeliveryStatus::AwaitPositiveAndNegativeReport(ranges, total),
@@ -361,24 +396,11 @@ impl MsrpDemuxer {
         }
 
         if report_status.status_code == 200 {
-            let (_, _, _, _, c) = guard.remove(i);
+            let c = guard.end(i);
             drop(guard);
             report(&c, 200, String::from("Ok"));
         } else {
-            let reason_phrase = if let Some(comment) = report_status.comment {
-                String::from_utf8_lossy(comment).to_string()
-            } else {
-                String::from("")
-            };
-
-            *self.failure.lock().unwrap() =
-                Some((report_status.status_code, reason_phrase.clone()));
-            let callbacks: Vec<Callback> = guard.drain(..).map(|(_, _, _, _, c)| c).collect();
-            drop(guard);
-
-            for c in callbacks {
-                report(&c, report_status.status_code, reason_phrase.clone());
-            }
+            fail_session(guard, report_status.status_code, reason_phrase);
         }
 
         Ok(())
@@ -387,8 +409,9 @@ impl MsrpDemuxer {
     pub fn on_response(&self, message: MsrpChunk) -> Result<(), (u16, &'static str)> {
         if let MsrpChunk::Response(resp_line, _) = message {
             let mut guard = self.waitlist.lock().unwrap();
-            for i in 0..guard.len() {
-                let (_, delivery_status, transaction_status_arr, all_sent, _) = &mut guard[i];
+            for i in 0..guard.pending.len() {
+                let (_, delivery_status, transaction_status_arr, all_sent, _) =
+                    &mut guard.pending[i];
                 if let Some((_, status)) = transaction_status_arr
                     .iter_mut()
                     .find(|(t, _)| *t == resp_line.transaction_id)
@@ -418,7 +441,7 @@ impl MsrpDemuxer {
                         }
                     }
 
-                    let (_, _, _, _, c) = guard.remove(i);
+                    let c = guard.end(i);
                     drop(guard);
 
                     if resp_line.status_code == 200 {
@@ -455,7 +478,11 @@ async fn send_chunk(
 ) -> bool {
     let pending = {
         let mut guard = waitlist.lock().unwrap();
-        match guard.iter_mut().find(|(id, _, _, _, _)| id == message_id) {
+        match guard
+            .pending
+            .iter_mut()
+            .find(|(id, _, _, _, _)| id == message_id)
+        {
             Some((_, _, transaction_status_arr, all_sent, _)) => {
                 transaction_status_arr.push((
                     transaction_id.clone(),
@@ -493,13 +520,31 @@ async fn send_chunk(
 fn fail(waitlist: &Waitlist, message_id: &[u8], status_code: u16, reason_phrase: &str) {
     let c = {
         let mut guard = waitlist.lock().unwrap();
-        match guard.iter().position(|(id, _, _, _, _)| id == message_id) {
-            Some(i) => guard.remove(i).4,
+        match guard
+            .pending
+            .iter()
+            .position(|(id, _, _, _, _)| id == message_id)
+        {
+            Some(i) => guard.end(i),
             None => return,
         }
     };
 
     report(&c, status_code, String::from(reason_phrase));
+}
+
+// the session has failed (RFC 4975 section 7.3.2): every message pending on
+// it ends with the status, and so will those started after
+fn fail_session(mut guard: MutexGuard<Messages>, status_code: u16, reason_phrase: String) {
+    if guard.failure.is_none() {
+        guard.failure = Some((status_code, reason_phrase.clone()));
+    }
+    let callbacks: Vec<Callback> = guard.pending.drain(..).map(|(_, _, _, _, c)| c).collect();
+    drop(guard);
+
+    for c in callbacks {
+        report(&c, status_code, reason_phrase.clone());
+    }
 }
 
 fn report(c: &Callback, status_code: u16, reason_phrase: String) {
@@ -579,6 +624,7 @@ fn start_timeout(waitlist: &Waitlist, transaction_id: Vec<u8>, rt: &Arc<Runtime>
         let c = {
             let mut guard = waitlist.lock().unwrap();
             let position = guard
+                .pending
                 .iter()
                 .position(|(_, _, transaction_status_arr, _, _)| {
                     transaction_status_arr.iter().any(|(t, status)| {
@@ -587,7 +633,7 @@ fn start_timeout(waitlist: &Waitlist, transaction_id: Vec<u8>, rt: &Arc<Runtime>
                     })
                 });
             match position {
-                Some(i) => guard.remove(i).4,
+                Some(i) => guard.end(i),
                 None => return,
             }
         };
