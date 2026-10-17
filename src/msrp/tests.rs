@@ -1589,3 +1589,253 @@ fn writes_sdp_that_reads_back() {
     assert!(sdp.contains("\r\na=inactive\r\n") && !sdp.contains("a=sendrecv"));
     assert_eq!(msrp_sdp(&sdp).unwrap()[4], "direction inactive");
 }
+
+fn read_nothing(rt: &Runtime, io: &mut DuplexStream) {
+    rt.block_on(async {
+        let mut buf = [0; 4096];
+        match timeout(Duration::from_millis(300), io.read(&mut buf)).await {
+            Err(_) => {}
+            Ok(read) => panic!("read {:?}", read.map(|size| text(&buf[..size]))),
+        }
+    })
+}
+
+/// A manager that must not open connections, with a passive channel for Bob.
+fn passive_bob(
+    rt: &Arc<Runtime>,
+    log: &Log,
+) -> (
+    MsrpChannelManager,
+    Arc<MsrpDemuxer>,
+    mpsc::Sender<MsrpChunk>,
+) {
+    let (tx, rx) = mpsc::channel(8);
+    let manager = MsrpChannelManager::new(
+        rx,
+        |_: &[u8], _: &[u8]| -> DuplexStream { panic!("a passive session opened a connection") },
+        Arc::clone(rt),
+    );
+    let demuxer = Arc::new(MsrpDemuxer::new(
+        BOB.as_bytes().to_vec(),
+        ALICE.as_bytes().to_vec(),
+    ));
+    manager.register_passive_channel(MsrpChannel::new(
+        BOB.as_bytes().to_vec(),
+        ALICE.as_bytes().to_vec(),
+        Arc::clone(&demuxer),
+        muxer(log),
+    ));
+    (manager, demuxer, tx)
+}
+
+#[test]
+fn a_passive_session_sends_once_the_remote_end_connects() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (alice_io, bob_io) = tokio::io::duplex(64 * 1024);
+
+    let bob_log = Log::default();
+    let (bob, bob_demuxer, bob_tx) = passive_bob(&rt, &bob_log);
+
+    // Bob has something to say before Alice connects
+    let first: Vec<u8> = (0..25 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
+    let first_results = send_message(&bob_demuxer, BOB, ALICE, first.clone(), bob_tx.clone(), &rt);
+
+    let alice_io = Mutex::new(Some(alice_io));
+    let (alice_tx, alice_rx) = mpsc::channel(8);
+    let alice = MsrpChannelManager::new(
+        alice_rx,
+        move |_: &[u8], _: &[u8]| alice_io.lock().unwrap().take().unwrap(),
+        Arc::clone(&rt),
+    );
+    let alice_log = Log::default();
+    let alice_demuxer = Arc::new(demuxer());
+    alice.register_channel(MsrpChannel::new(
+        ALICE.as_bytes().to_vec(),
+        BOB.as_bytes().to_vec(),
+        Arc::clone(&alice_demuxer),
+        muxer(&alice_log),
+    ));
+
+    bob.accept(bob_io);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(result(&first_results).is_none(), "nothing went out yet");
+
+    // Alice's first SEND binds the connection to the session
+    let to_bob = b"Hey Bob, are you there?".to_vec();
+    let alice_results = send_message(&alice_demuxer, ALICE, BOB, to_bob.clone(), alice_tx, &rt);
+    assert_eq!(wait_for("Bob to receive", || received(&bob_log)), to_bob);
+    assert_eq!(
+        wait_for("Alice's result", || result(&alice_results)),
+        vec![(200, "Ok".to_string())]
+    );
+
+    assert_eq!(wait_for("Alice to receive", || received(&alice_log)), first);
+    assert_eq!(
+        wait_for("Bob's first result", || result(&first_results)),
+        vec![(200, "Ok".to_string())]
+    );
+
+    alice_log.take();
+    let second = b"Yes, I am".to_vec();
+    let second_results = send_message(&bob_demuxer, BOB, ALICE, second.clone(), bob_tx, &rt);
+    assert_eq!(
+        wait_for("Alice to receive", || received(&alice_log)),
+        second
+    );
+    assert_eq!(
+        wait_for("Bob's second result", || result(&second_results)),
+        vec![(200, "Ok".to_string())]
+    );
+}
+
+#[test]
+fn a_connection_binds_a_session_only_from_its_remote_end() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let bob_log = Log::default();
+    let (bob, bob_demuxer, bob_tx) = passive_bob(&rt, &bob_log);
+    let held = send_message(
+        &bob_demuxer,
+        BOB,
+        ALICE,
+        b"held".to_vec(),
+        bob_tx.clone(),
+        &rt,
+    );
+
+    let (mut alice_io, bob_io) = tokio::io::duplex(64 * 1024);
+    bob.accept(bob_io);
+
+    // To-Path is Bob's but From-Path is not Alice's: delivered, not bound
+    let mallory = "msrp://mallory.example.com:2855/9fjskh3;tcp";
+    let chunk = request(
+        "mx1",
+        "SEND",
+        &[
+            ("To-Path", BOB),
+            ("From-Path", mallory),
+            ("Message-ID", "m1"),
+        ],
+        None,
+        ContinuationFlag::Complete,
+    );
+    rt.block_on(alice_io.write_all(&serialize(&chunk))).unwrap();
+    assert!(matches!(
+        &read_messages(&rt, &mut alice_io, 1)[..],
+        [Parsed::Response(transaction_id, 200, _, _)] if transaction_id == "mx1"
+    ));
+    read_nothing(&rt, &mut alice_io);
+    assert!(result(&held).is_none());
+
+    // a path through a relay that ends with Alice binds it
+    let from_path = format!("msrp://relay.example.com:2855/r1;tcp {}", ALICE);
+    let chunk = request(
+        "ax1",
+        "SEND",
+        &[
+            ("To-Path", BOB),
+            ("From-Path", &from_path),
+            ("Message-ID", "m2"),
+        ],
+        None,
+        ContinuationFlag::Complete,
+    );
+    rt.block_on(alice_io.write_all(&serialize(&chunk))).unwrap();
+    let mut messages = read_messages(&rt, &mut alice_io, 2);
+    messages.sort_by_key(|message| matches!(message, Parsed::Request(..)));
+    assert!(
+        matches!(&messages[0], Parsed::Response(transaction_id, 200, _, _) if transaction_id == "ax1")
+    );
+    match &messages[1] {
+        Parsed::Request(_, method, _, body, _) => {
+            assert_eq!(
+                (method.as_str(), body.as_deref()),
+                ("SEND", Some(&b"held"[..]))
+            );
+        }
+        other => panic!("{:?}", other),
+    }
+}
+
+#[test]
+fn a_passive_session_waits_again_when_its_connection_closes() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let bob_log = Log::default();
+    let (bob, bob_demuxer, bob_tx) = passive_bob(&rt, &bob_log);
+
+    let bind = |io: &mut DuplexStream, transaction_id: &str| {
+        let chunk = request(
+            transaction_id,
+            "SEND",
+            &[("To-Path", BOB), ("From-Path", ALICE), ("Message-ID", "m1")],
+            None,
+            ContinuationFlag::Complete,
+        );
+        rt.block_on(io.write_all(&serialize(&chunk))).unwrap();
+    };
+
+    let (mut first_io, bob_io) = tokio::io::duplex(64 * 1024);
+    bob.accept(bob_io);
+    bind(&mut first_io, "c1");
+    assert!(matches!(
+        &read_messages(&rt, &mut first_io, 1)[..],
+        [Parsed::Response(_, 200, _, _)]
+    ));
+    let waiting = |waiting: bool| {
+        if bob.is_waiting(BOB.as_bytes(), ALICE.as_bytes()) == waiting {
+            Some(())
+        } else {
+            None
+        }
+    };
+    wait_for("the connection to be bound", || waiting(false));
+    drop(first_io);
+    wait_for("the connection to be released", || waiting(true));
+
+    // the panicking socket factory shows that nothing tries to connect; the
+    // last sender of chunks goes away while the chunk is held
+    let held = send_message(&bob_demuxer, BOB, ALICE, b"held".to_vec(), bob_tx, &rt);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(result(&held).is_none());
+
+    // the response and the held chunk go out in either order
+    let (mut second_io, bob_io) = tokio::io::duplex(64 * 1024);
+    bob.accept(bob_io);
+    bind(&mut second_io, "c2");
+    let mut messages = read_messages(&rt, &mut second_io, 2);
+    messages.sort_by_key(|message| matches!(message, Parsed::Request(..)));
+    assert!(matches!(&messages[0], Parsed::Response(_, 200, _, _)));
+    match &messages[1] {
+        Parsed::Request(_, _, _, body, _) => assert_eq!(body.as_deref(), Some(&b"held"[..])),
+        other => panic!("{:?}", other),
+    }
+}
+
+#[test]
+fn a_manager_stops_once_it_and_its_connections_are_gone() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (tx, rx) = mpsc::channel::<MsrpChunk>(8);
+    let manager = MsrpChannelManager::new(
+        rx,
+        |_: &[u8], _: &[u8]| -> DuplexStream { panic!("no connection is opened") },
+        Arc::clone(&rt),
+    );
+    let (io, peer) = tokio::io::duplex(1024);
+    manager.accept(io);
+
+    drop(tx);
+    drop(manager);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        rt.metrics().num_alive_tasks() > 0,
+        "the accepted connection is open"
+    );
+
+    drop(peer);
+    wait_for("every task to end", || {
+        if rt.metrics().num_alive_tasks() == 0 {
+            Some(())
+        } else {
+            None
+        }
+    });
+}

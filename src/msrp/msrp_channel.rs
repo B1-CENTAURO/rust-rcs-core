@@ -42,8 +42,7 @@ use super::msrp_transport::msrp_transport_start;
 
 pub struct MsrpChannel {
     from_path: Vec<u8>, // local_path
-    #[allow(dead_code)] // routing only needs the local path
-    to_path: Vec<u8>, // remote_path
+    to_path: Vec<u8>,   // remote_path
     demuxer: Arc<MsrpDemuxer>,
     muxer: MsrpMuxer,
 }
@@ -184,17 +183,42 @@ fn make_success_report(
     )
 }
 
-type Transports = Arc<Mutex<Vec<(Vec<u8>, Vec<u8>, Arc<mpsc::Sender<Option<Vec<u8>>>>)>>>;
+type Connection = Arc<mpsc::Sender<Option<Vec<u8>>>>;
+
+enum Link {
+    Connected(Connection),
+    Waiting(Vec<Vec<u8>>), // until the remote end connects, what to send then
+}
+
+// the connection that carries what a session sends, by its local and remote
+// paths; for a passive session the remote end opens it
+struct Transport {
+    from_path: Vec<u8>,
+    to_path: Vec<u8>,
+    passive: bool,
+    link: Link,
+}
+
+type Transports = Arc<Mutex<Vec<Transport>>>;
+
+// what happens to connections, handled in order by the manager
+enum Event {
+    Bound(Vec<u8>, Vec<u8>, Connection), // a request for a session arrived on it
+    Released(Connection),                // it closed
+}
 
 pub struct MsrpChannelManager {
     // tx: mpsc::Sender<MsrpChunk>,
-    // transports: Arc<Mutex<Vec<(Vec<u8>, Vec<u8>, Arc<mpsc::Sender<Option<Vec<u8>>>>)>>>,
+    transports: Transports,
     channels: Arc<Mutex<Vec<MsrpChannel>>>,
+    event_tx: mpsc::UnboundedSender<Event>,
+    rt: Arc<Runtime>,
 }
 
 impl MsrpChannelManager {
     /// Sends the chunks it receives on `rx`, over one connection per pair of
-    /// From-Path and To-Path, which the first chunk opens with `socket_factory`.
+    /// From-Path and To-Path. The first chunk of a session opens it with
+    /// `socket_factory`, unless the session was registered as passive.
     /// What arrives on a connection goes to the registered channels.
     pub fn new<F, T>(
         mut rx: mpsc::Receiver<MsrpChunk>,
@@ -206,95 +230,179 @@ impl MsrpChannelManager {
         T: AsyncRead + AsyncWrite + Send + 'static,
     {
         let transports: Transports = Arc::new(Mutex::new(Vec::new()));
+        let transports_ = Arc::clone(&transports);
 
         let channels: Arc<Mutex<Vec<MsrpChannel>>> = Arc::new(Mutex::new(Vec::new()));
         let channels_ = Arc::clone(&channels);
 
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        // weak, so that the loop ends once the manager and its connections are gone
+        let event_tx_ = event_tx.downgrade();
+
         let rt_ = Arc::clone(&rt);
         rt.spawn(async move {
-            while let Some(message) = rx.recv().await {
-                if let Some(chunk_info) = message.get_chunk_info() {
-                    let tx = {
-                        let mut guard = transports.lock().unwrap();
-                        match guard.iter().find(|(from_path, to_path, _)| {
-                            *from_path == chunk_info.from_path && *to_path == chunk_info.to_path
-                        }) {
-                            Some((_, _, tx)) => Arc::clone(tx),
+            let transports = transports_;
 
-                            None => {
-                                let t = socket_factory(chunk_info.from_path, chunk_info.to_path);
-                                let t_id = format!(
-                                    "{}-{}",
-                                    String::from_utf8_lossy(chunk_info.from_path),
-                                    String::from_utf8_lossy(chunk_info.to_path),
-                                );
+            // chunks and events are handled here one at a time, so a session's
+            // chunks keep their order and a connection is bound before it is
+            // released; held chunks still go out once rx has closed
+            let mut sending = true;
+            loop {
+                tokio::select! {
+                    message = rx.recv(), if sending => match message {
+                        Some(message) => {
+                            if let Some(chunk_info) = message.get_chunk_info() {
+                                let data_size = message.estimated_size();
+                                let mut data = Vec::with_capacity(data_size);
+                                {
+                                    let mut readers = Vec::new();
+                                    message.get_readers(&mut readers);
+                                    match DynamicChain::new(readers).read_to_end(&mut data) {
+                                        Ok(_) => {}
+                                        Err(_) => {} // to-do: early failure
+                                    }
+                                }
 
-                                let (data_tx, data_rx) = mpsc::channel(8);
-                                let data_tx = Arc::new(data_tx);
-                                let data_tx_r = Arc::clone(&data_tx);
+                                let tx = {
+                                    let mut guard = transports.lock().unwrap();
+                                    match guard.iter_mut().find(|t| {
+                                        t.from_path == chunk_info.from_path
+                                            && t.to_path == chunk_info.to_path
+                                    }) {
+                                        Some(Transport {
+                                            link: Link::Connected(tx),
+                                            ..
+                                        }) => Arc::clone(tx),
 
-                                let channels = Arc::clone(&channels_);
-                                let transports = Arc::clone(&transports);
-
-                                msrp_transport_start(
-                                    t,
-                                    t_id,
-                                    data_tx.as_ref().clone(),
-                                    data_rx,
-                                    move |message| route(&channels, message),
-                                    move || {
-                                        let mut guard = transports.lock().unwrap();
-                                        if let Some(idx) = guard
-                                            .iter()
-                                            .position(|(_, _, tx)| Arc::ptr_eq(&tx, &data_tx_r))
-                                        {
-                                            guard.swap_remove(idx);
+                                        Some(Transport {
+                                            link: Link::Waiting(pending),
+                                            ..
+                                        }) => {
+                                            pending.push(data);
+                                            continue;
                                         }
-                                    },
-                                    &rt_,
-                                );
 
-                                guard.push((
-                                    chunk_info.from_path.to_vec(),
-                                    chunk_info.to_path.to_vec(),
-                                    Arc::clone(&data_tx),
-                                ));
+                                        None => {
+                                            let t = socket_factory(
+                                                chunk_info.from_path,
+                                                chunk_info.to_path,
+                                            );
+                                            let t_id = format!(
+                                                "{}-{}",
+                                                String::from_utf8_lossy(chunk_info.from_path),
+                                                String::from_utf8_lossy(chunk_info.to_path),
+                                            );
 
-                                data_tx
+                                            // without the manager, nothing needs its events
+                                            let event_tx = event_tx_
+                                                .upgrade()
+                                                .unwrap_or_else(|| mpsc::unbounded_channel().0);
+
+                                            let tx = start_transport(
+                                                t,
+                                                t_id,
+                                                &channels_,
+                                                &event_tx,
+                                                false,
+                                                &rt_,
+                                            );
+
+                                            guard.push(Transport {
+                                                from_path: chunk_info.from_path.to_vec(),
+                                                to_path: chunk_info.to_path.to_vec(),
+                                                passive: false,
+                                                link: Link::Connected(Arc::clone(&tx)),
+                                            });
+
+                                            tx
+                                        }
+                                    }
+                                };
+
+                                // in order, and waiting while the connection is busy
+                                match tx.send(Some(data)).await {
+                                    Ok(()) => {}
+                                    Err(_) => {}
+                                }
                             }
                         }
-                    };
 
-                    let data_size = message.estimated_size();
-                    let mut data = Vec::with_capacity(data_size);
-                    {
-                        let mut readers = Vec::new();
-                        message.get_readers(&mut readers);
-                        match DynamicChain::new(readers).read_to_end(&mut data) {
-                            Ok(_) => {}
-                            Err(_) => {} // to-do: early failure
+                        None => sending = false,
+                    },
+
+                    Some(event) = event_rx.recv() => match event {
+                        Event::Bound(from_path, to_path, tx) => {
+                            bind(&transports, from_path, to_path, tx).await;
                         }
-                    }
 
-                    // in order, and waiting while the connection is busy
-                    match tx.send(Some(data)).await {
-                        Ok(()) => {}
-                        Err(_) => {}
-                    }
+                        Event::Released(tx) => release(&transports, &tx),
+                    },
+
+                    else => break,
                 }
             }
         });
 
         MsrpChannelManager {
             // tx,
-            // transports,
+            transports,
             channels,
+            event_tx,
+            rt,
         }
     }
 
     pub fn register_channel(&self, channel: MsrpChannel) {
         let mut guard = self.channels.lock().unwrap();
         (*guard).push(channel);
+    }
+
+    /// Registers a channel for a session that the remote end connects, as for
+    /// an a=setup:passive of ours. What the session sends waits until one of
+    /// its requests arrives on a connection given to accept(), and again after
+    /// that connection closes.
+    pub fn register_passive_channel(&self, channel: MsrpChannel) {
+        {
+            let mut guard = self.transports.lock().unwrap();
+            if !guard
+                .iter()
+                .any(|t| t.from_path == channel.from_path && t.to_path == channel.to_path)
+            {
+                guard.push(Transport {
+                    from_path: channel.from_path.clone(),
+                    to_path: channel.to_path.clone(),
+                    passive: true,
+                    link: Link::Waiting(Vec::new()),
+                });
+            }
+        }
+
+        self.register_channel(channel);
+    }
+
+    /// Takes a connection the remote end opened. What arrives on it goes to
+    /// the registered channels, and a session it carries a request for sends
+    /// over it from then on (RFC 4975 section 5.4).
+    pub fn accept<T>(&self, t: T)
+    where
+        T: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        start_transport(
+            t,
+            String::from("accepted"),
+            &self.channels,
+            &self.event_tx,
+            true,
+            &self.rt,
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_waiting(&self, from_path: &[u8], to_path: &[u8]) -> bool {
+        let guard = self.transports.lock().unwrap();
+        guard.iter().any(|t| {
+            t.from_path == from_path && t.to_path == to_path && matches!(t.link, Link::Waiting(_))
+        })
     }
 
     // pub fn register_transport(&self, from_path: Vec<u8>, to_path: Vec<u8>, t: Arc<MsrpTransport>) {
@@ -305,6 +413,136 @@ impl MsrpChannelManager {
     // pub fn get_tx(&self) -> mpsc::Sender<(MsrpChunk, Option<Arc<MsrpTransport>>)> {
     //     self.tx.clone()
     // }
+}
+
+// starts a transport on t, returning what writes to it; when it was accepted,
+// its requests bind it to their sessions
+fn start_transport<T>(
+    t: T,
+    t_id: String,
+    channels: &Arc<Mutex<Vec<MsrpChannel>>>,
+    event_tx: &mpsc::UnboundedSender<Event>,
+    accepted: bool,
+    rt: &Arc<Runtime>,
+) -> Connection
+where
+    T: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (data_tx, data_rx) = mpsc::channel(8);
+    let data_tx = Arc::new(data_tx);
+    let connection = Arc::clone(&data_tx);
+    let connection_r = Arc::clone(&data_tx);
+
+    let channels = Arc::clone(channels);
+    let event_tx = event_tx.clone();
+    let event_tx_r = event_tx.clone();
+
+    msrp_transport_start(
+        t,
+        t_id,
+        data_tx.as_ref().clone(),
+        data_rx,
+        move |message| {
+            if accepted {
+                if let Some((from_path, to_path)) = session_of(&channels, &message) {
+                    match event_tx.send(Event::Bound(from_path, to_path, Arc::clone(&connection))) {
+                        Ok(()) => {}
+                        Err(_) => {}
+                    }
+                }
+            }
+            route(&channels, message)
+        },
+        move || match event_tx_r.send(Event::Released(connection_r)) {
+            Ok(()) => {}
+            Err(_) => {}
+        },
+        rt,
+    );
+
+    data_tx
+}
+
+// RFC 4975 section 5.4: a session sends over the connection its request
+// arrived on, unless it has one already; what a passive session held back
+// goes first
+async fn bind(transports: &Transports, from_path: Vec<u8>, to_path: Vec<u8>, tx: Connection) {
+    let pending = {
+        let mut guard = transports.lock().unwrap();
+        match guard
+            .iter_mut()
+            .find(|t| t.from_path == from_path && t.to_path == to_path)
+        {
+            Some(Transport {
+                link: Link::Connected(_),
+                ..
+            }) => return,
+
+            Some(Transport {
+                link: Link::Waiting(pending),
+                ..
+            }) => std::mem::take(pending),
+
+            None => {
+                guard.push(Transport {
+                    from_path: from_path.clone(),
+                    to_path: to_path.clone(),
+                    passive: false,
+                    link: Link::Waiting(Vec::new()),
+                });
+                Vec::new()
+            }
+        }
+    };
+
+    for data in pending {
+        match tx.send(Some(data)).await {
+            Ok(()) => {}
+            Err(_) => {}
+        }
+    }
+
+    let mut guard = transports.lock().unwrap();
+    if let Some(t) = guard
+        .iter_mut()
+        .find(|t| t.from_path == from_path && t.to_path == to_path)
+    {
+        t.link = Link::Connected(tx);
+    }
+}
+
+// a closed connection carries nothing more: a passive session waits for the
+// remote end again, any other opens a new one when it next sends
+fn release(transports: &Transports, connection: &Connection) {
+    let mut guard = transports.lock().unwrap();
+    guard.retain_mut(|t| match &t.link {
+        Link::Connected(tx) if Arc::ptr_eq(tx, connection) => {
+            if t.passive {
+                t.link = Link::Waiting(Vec::new());
+            }
+            t.passive
+        }
+        _ => true,
+    });
+}
+
+// the local and remote paths of the channel a request is for, when its
+// From-Path ends with the channel's remote endpoint
+fn session_of(
+    channels: &Mutex<Vec<MsrpChannel>>,
+    message: &MsrpChunk,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    if let MsrpChunk::Request(_, _, _, _) = message {
+        let chunk_info = message.get_chunk_info()?;
+        let guard = channels.lock().unwrap();
+        let channel = guard.iter().find(|channel| {
+            uri_eq(first_uri(&channel.from_path), first_uri(chunk_info.to_path))
+                && uri_eq(last_uri(&channel.to_path), last_uri(chunk_info.from_path))
+        })?;
+        return Some((channel.from_path.clone(), channel.to_path.clone()));
+    }
+
+    None
 }
 
 // RFC 4975 section 7.3: what arrives on a connection belongs to the session
@@ -364,6 +602,13 @@ fn response_headers(chunk_info: &MsrpChunkInfo) -> Vec<Header> {
 fn first_uri(path: &[u8]) -> &[u8] {
     path.split(|c| *c == b' ')
         .find(|uri| !uri.is_empty())
+        .unwrap_or(path)
+}
+
+fn last_uri(path: &[u8]) -> &[u8] {
+    path.split(|c| *c == b' ')
+        .filter(|uri| !uri.is_empty())
+        .last()
         .unwrap_or(path)
 }
 
