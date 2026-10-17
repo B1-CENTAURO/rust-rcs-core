@@ -14,14 +14,16 @@
 
 //! Messaging Layer Security (RFC 9420) on top of OpenMLS
 //!
-//! Universal Profile 3.0 bases end-to-end encryption on MLS. This module covers the
-//! protocol side only: identities, KeyPackages, group lifecycle and message
-//! protection. How the resulting MLS messages are carried over SIP / MSRP, how
-//! KeyPackages are distributed and how credentials are certified is left to the caller.
+//! Universal Profile 3.0 bases end-to-end encryption on MLS. `MlsClient` and
+//! `MlsConversation` cover identities, KeyPackages, group lifecycle and message
+//! protection, set up the way GSMA RCC.16 requires; the `rcs` module holds the
+//! RCC.16 wire formats and procedures. Carrying the results over SIP / MSRP,
+//! talking to the KDS and certifying credentials is left to the caller.
 
 pub mod client;
 pub mod conversation;
 pub mod provider;
+pub mod rcs;
 
 #[cfg(test)]
 mod tests;
@@ -35,9 +37,6 @@ pub use provider::MlsProvider;
 use crate::ffi::log::platform_log;
 
 const LOG_TAG: &str = "mls";
-
-/// Capability indication of E2EE support (RCC.71 R5-45-26, defined in section 2.6.1.3 of RCC.07)
-pub const MLS_VERSION_FEATURE_TAG: &[u8] = b"+g.gsma.rcs.mls.mls-version";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
