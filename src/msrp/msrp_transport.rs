@@ -293,7 +293,7 @@ pub fn msrp_transport_start<T, MC, TRC>(
     rt: &Arc<Runtime>,
 ) where
     T: AsyncRead + AsyncWrite + Send + 'static,
-    MC: FnMut(MsrpChunk) -> Result<Option<MsrpChunk>, &'static str> + Send + Sync + 'static,
+    MC: FnMut(MsrpChunk) -> Result<Vec<MsrpChunk>, &'static str> + Send + Sync + 'static,
     TRC: FnOnce() + Send + Sync + 'static,
 {
     let (mut rh, mut wh) = tokio::io::split(t);
@@ -307,8 +307,8 @@ pub fn msrp_transport_start<T, MC, TRC>(
                 match parser.produce() {
                     Ok(message) => {
                         if let Some(message) = message {
-                            if let Ok(resp_message) = message_callback(message) {
-                                if let Some(resp_message) = resp_message {
+                            if let Ok(resp_messages) = message_callback(message) {
+                                for resp_message in resp_messages {
                                     let data_size = resp_message.estimated_size();
                                     let mut data = Vec::with_capacity(data_size);
                                     {
