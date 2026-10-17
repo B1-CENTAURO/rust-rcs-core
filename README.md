@@ -20,10 +20,12 @@ Groups are set up as GSMA PRD RCC.16 (v3.0) requires: Era extension, Commits and
 - encrypted CPIM messages bound to their Message-ID, signed IMDNs (`rcs_signature`), Commit bundles for the Conversation Focus, moving to unencrypted (`end_mls`), self-healing through External Commits
 - file, thumbnail, icon and subject encryption (Annex C.2, C.3)
 - Client Certificate validation (Annex A.4.1): `RcsCredentialValidator` checks X.509 credentials against the agreed roots, the certificate profiles, the ParticipantInformation signature and key rolls, and the Vendor ID, and applies the rules for KDS query results, additions and certificate updates. Revocation of intermediate CAs is checked through a callback, fetching CRLs is left to the caller.
+- Re-Sent Messages after a Fail to Decrypt (sections 10.3, 10.4, Annex C.4): the Original Message is sealed with HPKE to the leaf key of the client that failed, then encrypted to the group. 1-to-1 group ids are GUIDs in 32 hex digits so they fill `group_id[32]` as they are; other group ids are hashed with SHA-256 to fit, which RCC.16 does not define. `original_message_hmac` is left empty, its computation is not specified either. A Re-Sent Message can only be read with the leaf key it was sealed to, so before a key update of the receiver.
+- the failure reasons of Negative-Delivery IMDNs (section 7.7.2): reading the server or client reason out of an IMDN, and building the `<status>` of a client generated one
 
 Not covered yet:
 
-- Re-Sent Messages after a Fail to Decrypt (Annex C.4): the `group_id[32]` fields don't fit group ids of other lengths
+- the FTD message itself, whose format refers to a missing section, and the decision when to send or honour one
 - the identity verification code (Annex C.5): `HASH_TO_DIGITS` is not defined
 - group icon and subject keys (section 9.7.1): RCC.16 puts them in GroupContext extensions while leaving them out of the GroupInfo, which the GroupInfo signature does not allow
 - the `self_remove` and `server_remove` proposals: OpenMLS cannot apply proposal types it doesn't know; leaving uses a Remove proposal, which section 6.2.3 accepts

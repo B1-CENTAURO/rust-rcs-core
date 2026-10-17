@@ -99,6 +99,8 @@ impl CommitOutput {
 pub enum IncomingMessage {
     Application {
         sender: Credential,
+        /// Leaf of the sending client in the ratchet tree
+        sender_leaf_index: u32,
         data: Vec<u8>,
         authenticated_data: Vec<u8>,
     },
@@ -479,16 +481,18 @@ impl MlsConversation {
             .map_err(fail("message processing", ErrorKind::Rejected))?;
 
         let sender = processed.credential().clone();
-        let committer = match processed.sender() {
-            Sender::Member(index) => self.group.member_at(*index),
+        let sender_index = match processed.sender() {
+            Sender::Member(index) => Some(*index),
             _ => None,
         };
+        let committer = sender_index.and_then(|index| self.group.member_at(index));
         let authenticated_data = processed.aad().to_vec();
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(application_message) => {
                 Ok(IncomingMessage::Application {
                     sender,
+                    sender_leaf_index: sender_index.ok_or(ErrorKind::UnexpectedMessage)?.u32(),
                     data: application_message.into_bytes(),
                     authenticated_data,
                 })

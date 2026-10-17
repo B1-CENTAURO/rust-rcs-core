@@ -26,8 +26,9 @@ use super::PROPOSAL_RCS_SIGNATURE;
 pub struct DecryptedMessage {
     pub sender: Credential,
     pub payload_type: SecretPayloadType,
-    /// For Application payloads, the CPIM message without its unencrypted headers
-    pub payload: Vec<u8>,
+    /// The CPIM message without its unencrypted headers; for a Re-Sent Message,
+    /// the Original Message, or None when it was re-sent to another client
+    pub payload: Option<Vec<u8>>,
     /// Original-Message-Id bound to the message, empty unless re-sent
     pub original_message_id: Vec<u8>,
 }
@@ -79,14 +80,16 @@ impl MlsConversation {
         if message.content_type() != ContentType::Application {
             return Err(ErrorKind::UnexpectedMessage);
         }
+        let epoch = message.epoch().as_u64();
 
-        let (sender, data, authenticated_data) =
+        let (sender, sender_leaf_index, data, authenticated_data) =
             match self.process_protocol_message(client, message)? {
                 IncomingMessage::Application {
                     sender,
+                    sender_leaf_index,
                     data,
                     authenticated_data,
-                } => (sender, data, authenticated_data),
+                } => (sender, sender_leaf_index, data, authenticated_data),
                 _ => return Err(ErrorKind::UnexpectedMessage),
             };
 
@@ -99,10 +102,20 @@ impl MlsConversation {
 
         let secret_payload: SecretPayload = wire::decode(&data)?;
 
+        let payload = match secret_payload.payload_type {
+            SecretPayloadType::Application => Some(secret_payload.payload.into()),
+            SecretPayloadType::Hpke1To1Message => self.open_resent(
+                client,
+                secret_payload.payload.as_slice(),
+                epoch,
+                sender_leaf_index,
+            )?,
+        };
+
         Ok(DecryptedMessage {
             sender,
             payload_type: secret_payload.payload_type,
-            payload: secret_payload.payload.into(),
+            payload,
             original_message_id: authenticated_data.original_message_id.into(),
         })
     }
