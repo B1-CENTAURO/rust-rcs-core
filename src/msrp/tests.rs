@@ -30,7 +30,7 @@ use super::info::msrp_info_reader::AsMsrpInfo;
 use super::info::{MsrpDirection, MsrpFileInfo, MsrpInfo, MsrpInterfaceType, MsrpSetupMethod};
 use super::msrp_channel::{route, MsrpChannel, MsrpChannelManager};
 use super::msrp_chunk::{ContinuationFlag, MsrpChunk, MsrpRequestLine, MsrpResponseLine};
-use super::msrp_demuxer::MsrpDemuxer;
+use super::msrp_demuxer::{MsrpDemuxer, ENDED_MESSAGES_KEPT};
 use super::msrp_muxer::{MsrpDataWriter, MsrpMessageReceiver, MsrpMuxer};
 use super::msrp_parser::MsrpParser;
 use super::msrp_transport::msrp_transport_start;
@@ -996,6 +996,60 @@ fn a_failure_report_fails_the_session() {
 
     // and those started after it, which send nothing
     let (mut rx, later) = start_sending(&demuxer, hello(), 5, &rt);
+    let sent = rt.block_on(async {
+        timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the sender hangs")
+    });
+    assert!(sent.is_none());
+    assert_eq!(*later.lock().unwrap(), vec![failure]);
+}
+
+#[test]
+fn a_late_failure_report_fails_the_session() {
+    // a gateway may accept all of a message and send a failure REPORT once it
+    // fails further on (RFC 4975 section 7.1.4)
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = demuxer();
+    let send_accepted = || {
+        let (mut rx, results) =
+            start_sending(&demuxer, std::io::Cursor::new(b"Hello".to_vec()), 5, &rt);
+        let chunk = sent_chunks(&rt, &mut rx, 1).remove(0);
+        assert!(demuxer.on_response(response_to(&chunk, 200, "OK")).is_ok());
+        assert_eq!(*results.lock().unwrap(), vec![(200, "Ok".to_string())]);
+        (header_of(&chunk, "Message-ID").unwrap(), results)
+    };
+
+    let (forgotten, _) = send_accepted();
+    let mut last = send_accepted();
+    for _ in 1..ENDED_MESSAGES_KEPT {
+        last = send_accepted();
+    }
+    let (message_id, results) = last;
+
+    assert!(
+        demuxer
+            .on_report(report_for(&forgotten, "1-5/5", "000 500 Gateway failure"))
+            .is_err(),
+        "too old: ignored as for an unknown Message-ID"
+    );
+    assert!(demuxer
+        .on_report(report_for("unknown", "1-5/5", "000 500 Gateway failure"))
+        .is_err());
+    assert_eq!(demuxer.session_failure(), None);
+
+    assert!(demuxer
+        .on_report(report_for(&message_id, "1-5/5", "000 500 Gateway failure"))
+        .is_ok());
+    let failure = (500, "Gateway failure".to_string());
+    assert_eq!(demuxer.session_failure(), Some(failure.clone()));
+    assert_eq!(
+        *results.lock().unwrap(),
+        vec![(200, "Ok".to_string())],
+        "told once, when it ended"
+    );
+
+    let (mut rx, later) = start_sending(&demuxer, std::io::Cursor::new(b"Hello".to_vec()), 5, &rt);
     let sent = rt.block_on(async {
         timeout(Duration::from_secs(10), rx.recv())
             .await
