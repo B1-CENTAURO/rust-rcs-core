@@ -24,12 +24,13 @@ use super::super::{
     MlsClient, MlsConfig, MlsConversation,
 };
 use super::proto::{
-    client_mls_rcs_message, server_mls_rcs_message, ClientMlsRcsMessage, FileEncryptionInfo,
-    FileInfo, FileMetadata, MlsGroupInfo, ServerCommitBundle, ServerMlsRcsMessage,
+    client_mls_rcs_message, server_mls_rcs_message, AcceptedMlsRcsMessage, ClientMlsRcsMessage,
+    EpochIdentifier, FileEncryptionInfo, FileInfo, FileMetadata, MlsGroupInfo, ServerCommitBundle,
+    ServerMlsRcsMessage,
 };
 use super::wire::{
-    AuthenticatedData, DeliveryNotificationStatus, SecretPayload, VerifiableDeliveryImdn,
-    VerifiableDisplayImdn,
+    AuthenticatedData, DeliveryNotificationStatus, DisplayNotificationStatus, SecretPayload,
+    VerifiableDeliveryImdn, VerifiableDisplayImdn, VerifiableResentMessage,
 };
 use super::*;
 
@@ -61,20 +62,24 @@ fn hex(s: &str) -> Vec<u8> {
 }
 
 /// What the Conversation Focus forwards once it accepted a Commit: the bundle
-/// without GroupInfo, ratchet tree and epoch authenticator (RCC.16 section 7.9.3)
+/// without GroupInfo and epoch authenticator, with the ratchet tree for joiners
+/// (RCC.16 section 7.9.3)
 fn accept(output: &CommitOutput) -> ServerCommitBundle {
     let message: ClientMlsRcsMessage =
         proto::decode(&output.to_client_message(None).unwrap()).unwrap();
     match message.payload.unwrap() {
+        // the ratchet tree is either the one sent along or reconstructed
         client_mls_rcs_message::Payload::WelcomeCommitBundle(bundle) => ServerCommitBundle {
             commit_list: bundle.commit_list,
             welcome: bundle.welcome,
             private_message: Vec::new(),
+            ratchet_tree: output.ratchet_tree.clone().unwrap(),
         },
         client_mls_rcs_message::Payload::CommitBundle(bundle) => ServerCommitBundle {
             commit_list: bundle.commit_list,
             welcome: Vec::new(),
             private_message: bundle.private_message,
+            ratchet_tree: Vec::new(),
         },
         _ => panic!("expected a Commit"),
     }
@@ -97,7 +102,9 @@ fn establish(alice: &MlsClient, bob: &MlsClient) -> (MlsConversation, MlsConvers
         .unwrap();
 
     let bundle = accept(&output);
-    let bob_conversation = bob.join_conversation(&bundle.welcome).unwrap();
+    let bob_conversation = bob
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
     let events = alice_conversation
         .process_commit_bundle(alice, &bundle)
         .unwrap();
@@ -136,6 +143,7 @@ fn unencrypted_cpim_headers() {
         b"<urn:ietf:params:imdn>.Message-ID",
         b"<urn:ietf:params:imdn>.disposition-notification",
         b"<http://www.gsma.com/rcs>.advised-action",
+        b"<http://www.gsma.com/rcs>.User-Profile-Config-Data",
         b"<http://www.gsma.com/rcs/mls>.Epoch-Authenticator",
         b"<http://www.gsma.com/rcs/mls/>.Epoch-Authenticator",
     ] {
@@ -145,7 +153,7 @@ fn unencrypted_cpim_headers() {
     for name in [
         &b"Subject"[..],
         b"<http://www.openmobilealliance.org/cpm/>.Payload-Type",
-        b"<http://www.gsma.com/rcs/mls>.Original-Message-Id",
+        b"<http://www.gsma.com/rcs/mls>.Original-Message-ID",
         b"<urn:ietf:params:imdn>.Message-ID-Suffix",
     ] {
         assert!(!is_unencrypted_cpim_header(name), "{:?}", name);
@@ -173,37 +181,89 @@ fn failure_reasons() {
         ClientFailureReason::from_xml_name(b"commit-in-privatemessage"),
         Some(ClientFailureReason::CommitInPrivateMessage)
     );
+
+    // added by RCC.16 v4.0
+    assert_eq!(
+        ServerFailureReason::from_xml_name(b"missing-mls-control-message"),
+        Some(ServerFailureReason::MissingMlsControlMessage)
+    );
+    assert_eq!(
+        ServerFailureReason::EpochAdvancementQuotaReached.xml_name(),
+        "epoch-advancement-quota-reached"
+    );
+    assert_eq!(
+        ClientFailureReason::InnerResentMessageFailureToDecrypt.xml_name(),
+        Some("inner-resent-message-failed-to-decrypt")
+    );
+    for name in [
+        &b"inner-resent-message-failed-to-decrypt"[..],
+        b"inner-resent-message-decrypt",
+        b"hpke-fail-to-decrypt",
+    ] {
+        assert_eq!(
+            ClientFailureReason::from_xml_name(name),
+            Some(ClientFailureReason::InnerResentMessageFailureToDecrypt)
+        );
+    }
+    assert_eq!(
+        wire::encode(&ClientFailureReason::ControlMessageFailed).unwrap(),
+        [0, 13]
+    );
 }
 
 #[test]
 fn wire_structures() {
-    let payload = SecretPayload::new(SecretPayloadType::Application, b"hi".to_vec());
+    let payload = SecretPayload::new(SecretPayloadType::Application, 7, b"hi".to_vec());
     let encoded = wire::encode(&payload).unwrap();
-    assert_eq!(encoded, [0, 1, 0, 1, 2, b'h', b'i']);
+    assert_eq!(encoded, [0, 1, 0, 1, 0, 0, 0, 7, 2, b'h', b'i']);
     assert_eq!(wire::decode::<SecretPayload>(&encoded).unwrap(), payload);
 
-    let authenticated_data = AuthenticatedData::new(b"abc", b"", 3);
+    let authenticated_data = AuthenticatedData::new(b"abc", b"", 3, VerifiableDerivedContent::None);
     let encoded = wire::encode(&authenticated_data).unwrap();
-    assert_eq!(encoded, [0, 1, 3, b'a', b'b', b'c', 0, 0, 0, 0, 3]);
+    assert_eq!(encoded, [0, 1, 3, b'a', b'b', b'c', 0, 0, 0, 0, 3, 0, 0]);
     assert_eq!(
         wire::decode::<AuthenticatedData>(&encoded).unwrap(),
         authenticated_data
     );
 
+    // the FTD of the illustration in RCC.16 section 7.5.3.3
     let imdn = VerifiableDeliveryImdn::new(
         DeliveryNotificationStatus::Failed,
-        b"id",
+        b"7",
+        b"",
         ClientFailureReason::FailureToDecrypt,
     );
+    assert_eq!(wire::encode(&imdn).unwrap(), [0, 1, 0, 2, 1, b'7', 0, 0, 4]);
+    let authenticated_data =
+        AuthenticatedData::new(b"42", b"", 1, VerifiableDerivedContent::DeliveryImdn(imdn));
+    let encoded = wire::encode(&authenticated_data).unwrap();
     assert_eq!(
-        wire::encode(&imdn).unwrap(),
-        [0, 1, 0, 2, 2, b'i', b'd', 0, 4]
+        encoded,
+        [0, 1, 2, b'4', b'2', 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 2, 1, b'7', 0, 0, 4]
+    );
+    assert_eq!(
+        wire::decode::<AuthenticatedData>(&encoded).unwrap(),
+        authenticated_data
     );
 
-    // unknown version, unknown type, trailing data
-    assert!(wire::decode::<SecretPayload>(&[0, 2, 0, 1, 0]).is_err());
-    assert!(wire::decode::<SecretPayload>(&[0, 1, 0, 3, 0]).is_err());
-    assert!(wire::decode::<SecretPayload>(&[0, 1, 0, 1, 0, 0]).is_err());
+    let display = VerifiableDisplayImdn::new(DisplayNotificationStatus::Displayed, b"77", b"7");
+    assert_eq!(
+        wire::encode(&VerifiableDerivedContent::DisplayImdn(display)).unwrap(),
+        [0, 2, 0, 1, 0, 1, 2, b'7', b'7', 1, b'7']
+    );
+    assert_eq!(
+        wire::encode(&VerifiableDerivedContent::ResentMessage(
+            VerifiableResentMessage::new(b"7")
+        ))
+        .unwrap(),
+        [0, 3, 0, 1, 1, b'7']
+    );
+
+    // unknown version, deprecated type, unknown derived content, trailing data
+    assert!(wire::decode::<SecretPayload>(&[0, 2, 0, 1, 0, 0, 0, 0, 0]).is_err());
+    assert!(wire::decode::<SecretPayload>(&[0, 1, 0, 3, 0, 0, 0, 0, 0]).is_err());
+    assert!(wire::decode::<AuthenticatedData>(&[0, 1, 0, 0, 0, 0, 0, 1, 0, 4]).is_err());
+    assert!(wire::decode::<SecretPayload>(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 0]).is_err());
 }
 
 #[test]
@@ -379,6 +439,11 @@ fn file_encryption() {
         Some(ErrorKind::BadFormat)
     );
 
+    // RCC.16 v4.0 dropped the hint
+    let mut no_hint = info.clone();
+    no_hint.file_length_hint = 0;
+    assert!(file::decrypt_file(&encrypted.ciphertext, GROUP_SUBJECT_FILE_NAME, &no_hint).is_ok());
+
     let mut unspecified = info.clone();
     unspecified.algorithm = proto::Algorithm::Unspecified as i32;
     assert_eq!(
@@ -433,7 +498,9 @@ fn conversation_creation() {
     // applied once the Conversation Focus delivered it back
     assert_eq!(alice_conversation.epoch(), 0);
     let server_bundle = accept(&output);
-    let mut bob_conversation = bob.join_conversation(&server_bundle.welcome).unwrap();
+    let mut bob_conversation = bob
+        .join_conversation(&server_bundle.welcome, &server_bundle.ratchet_tree)
+        .unwrap();
     match alice_conversation
         .process_commit_bundle(&alice, &server_bundle)
         .unwrap()
@@ -557,10 +624,17 @@ fn signed_messages() {
     let bob = client("bob");
     let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
 
-    let delivered = wire::encode(&VerifiableDeliveryImdn::new(
-        DeliveryNotificationStatus::Delivered,
-        b"msg-1",
-        ClientFailureReason::Unset,
+    // signed content as in the illustration of RCC.16 section 7.5.3.3
+    let delivered = wire::encode(&AuthenticatedData::new(
+        b"imdn-1",
+        b"",
+        2,
+        VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+            DeliveryNotificationStatus::Delivered,
+            b"msg-1",
+            b"",
+            ClientFailureReason::Unset,
+        )),
     ))
     .unwrap();
     let signature = bob_conversation.sign(&bob, &delivered).unwrap();
@@ -576,9 +650,15 @@ fn signed_messages() {
         .unwrap();
     assert_eq!(signer.serialized_content(), b"bob");
 
-    let displayed = wire::encode(&VerifiableDisplayImdn::new(
-        wire::DisplayNotificationStatus::Displayed,
-        b"msg-1",
+    let displayed = wire::encode(&AuthenticatedData::new(
+        b"imdn-2",
+        b"",
+        2,
+        VerifiableDerivedContent::DisplayImdn(VerifiableDisplayImdn::new(
+            DisplayNotificationStatus::Displayed,
+            b"msg-1",
+            b"",
+        )),
     ))
     .unwrap();
     assert_eq!(
@@ -618,7 +698,10 @@ fn ending_encryption() {
     assert!(!alice_conversation.is_encryption_ended());
 
     let output = alice_conversation
-        .set_encryption_ended(&alice, true)
+        .set_encryption_ended(
+            &alice,
+            Some(proto::EndMlsReason::GroupMemberFailsCapabilitiesCheck),
+        )
         .unwrap();
     let bundle = accept(&output);
     alice_conversation
@@ -630,6 +713,10 @@ fn ending_encryption() {
 
     for conversation in [&alice_conversation, &bob_conversation] {
         assert!(conversation.is_encryption_ended());
+        assert_eq!(
+            conversation.encryption_ended_reason(),
+            Some(proto::EndMlsReason::GroupMemberFailsCapabilitiesCheck)
+        );
         assert_eq!(conversation.era(), Some(2));
     }
     assert_eq!(
@@ -639,7 +726,7 @@ fn ending_encryption() {
         Some(ErrorKind::InvalidState)
     );
 
-    let output = bob_conversation.set_encryption_ended(&bob, false).unwrap();
+    let output = bob_conversation.set_encryption_ended(&bob, None).unwrap();
     let bundle = accept(&output);
     alice_conversation
         .process_commit_bundle(&alice, &bundle)
@@ -648,6 +735,7 @@ fn ending_encryption() {
         .process_commit_bundle(&bob, &bundle)
         .unwrap();
     assert!(!alice_conversation.is_encryption_ended());
+    assert_eq!(alice_conversation.encryption_ended_reason(), None);
     assert!(bob_conversation
         .encrypt_cpim(&bob, b"hi", b"msg-2", b"")
         .is_ok());
@@ -666,7 +754,7 @@ fn self_heal() {
     let (mut bob_conversation, output) = bob
         .rejoin_conversation(&MlsGroupInfo {
             group_info,
-            ratchet_tree: Vec::new(),
+            ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
             pending_proposals: Vec::new(),
         })
         .unwrap();
@@ -787,8 +875,12 @@ fn resent_messages() {
         .add_members(&alice, &[&key_packages[0], &key_packages[1]])
         .unwrap();
     let bundle = accept(&output);
-    let mut bob_conversation = bob.join_conversation(&bundle.welcome).unwrap();
-    let mut carol_conversation = carol.join_conversation(&bundle.welcome).unwrap();
+    let mut bob_conversation = bob
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    let mut carol_conversation = carol
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
     alice_conversation
         .process_commit_bundle(&alice, &bundle)
         .unwrap();
@@ -804,6 +896,9 @@ fn resent_messages() {
     assert_eq!(decrypted.payload_type, SecretPayloadType::Hpke1To1Message);
     assert_eq!(decrypted.payload.as_deref(), Some(&original[..]));
     assert_eq!(decrypted.original_message_id, b"msg-1");
+    assert!(bob_conversation
+        .resent_matches(&bob, &decrypted.original_message_hmac, original)
+        .unwrap());
 
     // the rest of the group sees that a message was re-sent, but not which
     let decrypted = carol_conversation
@@ -812,6 +907,21 @@ fn resent_messages() {
     assert_eq!(decrypted.payload_type, SecretPayloadType::Hpke1To1Message);
     assert_eq!(decrypted.payload, None);
     assert_eq!(decrypted.original_message_id, b"msg-1");
+
+    // members that decrypted the Original Message check they got the same one
+    let hmac = &decrypted.original_message_hmac;
+    assert!(carol_conversation
+        .resent_matches(&carol, hmac, original)
+        .unwrap());
+    assert!(!carol_conversation
+        .resent_matches(&carol, hmac, b"something else")
+        .unwrap());
+    assert_eq!(
+        carol_conversation
+            .resent_matches(&carol, &hmac[32..], original)
+            .err(),
+        Some(ErrorKind::BadFormat)
+    );
 
     // padded as files are
     let short = alice_conversation
@@ -922,4 +1032,226 @@ fn imdn_failure_reasons() {
     ] {
         assert_eq!(imdn::failure_reason(imdn), None);
     }
+}
+
+#[test]
+fn welcome_without_ratchet_tree() {
+    let alice = client("alice");
+    let bob = client("bob");
+
+    // last resort, which a failed attempt to join does not use up
+    let key_package = bob.generate_key_package(true).unwrap();
+    let mut alice_conversation = alice.create_conversation(None, 2).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_package])
+        .unwrap();
+
+    // the tree only travels next to the Welcome (RCC.16 section 7.9.2)
+    assert_eq!(
+        bob.join_conversation(output.welcome.as_ref().unwrap(), &[])
+            .err(),
+        Some(ErrorKind::Rejected)
+    );
+    let bundle = accept(&output);
+    assert!(bob
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .is_ok());
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+
+    // later additions leave it to the Conversation Focus to reconstruct the tree
+    let carol = client("carol");
+    let key_package = carol.generate_key_package(false).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_package])
+        .unwrap();
+    let message: ClientMlsRcsMessage =
+        proto::decode(&output.to_client_message(None).unwrap()).unwrap();
+    match message.payload {
+        Some(client_mls_rcs_message::Payload::WelcomeCommitBundle(bundle)) => {
+            assert!(bundle.ratchet_tree.is_empty())
+        }
+        _ => panic!("expected a WelcomeCommitBundle"),
+    }
+    let bundle = accept(&output);
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    assert_eq!(
+        bundle.ratchet_tree,
+        alice_conversation.ratchet_tree().unwrap()
+    );
+    assert!(carol
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .is_ok());
+}
+
+#[test]
+fn accepted_commits() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    let accepted = |epoch: EpochIdentifier| {
+        proto::encode(&ServerMlsRcsMessage {
+            payload: Some(server_mls_rcs_message::Payload::AcceptedMlsRcsMessage(
+                AcceptedMlsRcsMessage {
+                    message_id: "cpim-1".to_string(),
+                    previous_epoch_identifier: Some(epoch),
+                },
+            )),
+        })
+    };
+
+    // nothing to apply, e.g. for a ProposalList
+    let before = alice_conversation.epoch_identifier();
+    assert_eq!(before.era_id, 2);
+    assert_eq!(before.epoch_id, 1);
+    assert!(matches!(
+        alice_conversation
+            .process_server_message(&alice, &accepted(before.clone()))
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Own]
+    ));
+
+    let output = alice_conversation.update_keys(&alice).unwrap();
+
+    // accepted in another epoch
+    let mut other = before.clone();
+    other.epoch_id += 1;
+    assert_eq!(
+        alice_conversation
+            .process_server_message(&alice, &accepted(other))
+            .err(),
+        Some(ErrorKind::UnexpectedMessage)
+    );
+    assert!(alice_conversation.has_pending_commit());
+
+    match alice_conversation
+        .process_server_message(&alice, &accepted(before))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { sender, .. }] => {
+            assert_eq!(sender.serialized_content(), b"alice")
+        }
+        _ => panic!("expected a Commit"),
+    }
+    assert!(!alice_conversation.has_pending_commit());
+    assert_eq!(
+        alice_conversation.epoch_authenticator(),
+        output.epoch_authenticator
+    );
+
+    // should the Commit still be delivered back, it is recognised
+    let bundle = accept(&output);
+    assert!(matches!(
+        alice_conversation
+            .process_commit_bundle(&alice, &bundle)
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Own]
+    ));
+    bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .unwrap();
+    assert_eq!(
+        bob_conversation.epoch_authenticator(),
+        alice_conversation.epoch_authenticator()
+    );
+}
+
+#[test]
+fn key_generations() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    let key_generation =
+        |conversation: &mut MlsConversation, client: &MlsClient, message: &[u8]| match conversation
+            .process(client, message)
+            .unwrap()
+        {
+            IncomingMessage::Application { data, .. } => {
+                wire::decode::<SecretPayload>(&data).unwrap().key_generation
+            }
+            _ => panic!("expected an application message"),
+        };
+
+    for expected in 0..3 {
+        let message = alice_conversation
+            .encrypt_cpim(&alice, b"hi", b"msg", b"")
+            .unwrap();
+        assert_eq!(
+            key_generation(&mut bob_conversation, &bob, &message),
+            expected
+        );
+    }
+
+    // other messages use up generations as well
+    alice_conversation.encrypt(&alice, b"raw").unwrap();
+    let message = alice_conversation
+        .encrypt_cpim(&alice, b"hi", b"msg", b"")
+        .unwrap();
+    assert_eq!(key_generation(&mut bob_conversation, &bob, &message), 4);
+
+    // the count is part of the snapshot
+    let restored = MlsClient::restore(
+        &alice.snapshot().unwrap(),
+        MlsConfig::default(),
+        Box::new(AllowAll),
+    )
+    .unwrap();
+    let mut restored_conversation = restored
+        .load_conversation(alice_conversation.group_id())
+        .unwrap();
+    let message = restored_conversation
+        .encrypt_cpim(&restored, b"hi", b"msg", b"")
+        .unwrap();
+    assert_eq!(key_generation(&mut bob_conversation, &bob, &message), 5);
+
+    // and starts over in every epoch
+    let output = bob_conversation.update_keys(&bob).unwrap();
+    let bundle = accept(&output);
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .unwrap();
+    let message = alice_conversation
+        .encrypt_cpim(&alice, b"hi", b"msg", b"")
+        .unwrap();
+    assert_eq!(key_generation(&mut bob_conversation, &bob, &message), 0);
+}
+
+#[test]
+fn reserved_extension_types() {
+    let alice = client("alice");
+    let key_package = alice.generate_key_package(false).unwrap();
+    let key_package = match MlsMessageIn::tls_deserialize_exact(&key_package)
+        .unwrap()
+        .extract()
+    {
+        MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+        _ => panic!("expected a KeyPackage"),
+    };
+    let key_package = key_package
+        .validate(
+            alice.provider().crypto(),
+            openmls::prelude::ProtocolVersion::Mls10,
+        )
+        .unwrap();
+    let capabilities = key_package.leaf_node().capabilities().clone();
+
+    for code in [EXTENSION_CONTINUITY_TOKEN_COMMITMENT, 0xF012, 0xF030] {
+        assert!(capabilities
+            .extensions()
+            .contains(&openmls::prelude::ExtensionType::from(code)));
+    }
+    assert!(capabilities
+        .proposals()
+        .contains(&openmls::prelude::ProposalType::from(0xF020)));
 }

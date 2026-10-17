@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Protocol Buffer messages of RCC.16 (sections 7.8.1 and 7.9.1)
+//! Protocol Buffer messages of RCC.16 (sections 7.8.1, 7.9.1, 7.10 and 7.11.2)
 
 use prost::Message;
 
@@ -43,7 +43,9 @@ pub struct FileEncryptionInfo {
     pub hmac_tag: Vec<u8>,
     #[prost(enumeration = "Algorithm", tag = "4")]
     pub algorithm: i32,
-    /// Declared as `fixedint32` in RCC.16, which is taken to mean `fixed32`
+    /// Dropped from the message by RCC.16 v4.0 while Annex C.3 still checks it;
+    /// kept for files from v3.0 clients, 0 when absent. Declared as `fixedint32`
+    /// in v3.0, which is taken to mean `fixed32`.
     #[prost(fixed32, tag = "5")]
     pub file_length_hint: u32,
 }
@@ -115,6 +117,30 @@ pub struct ServerCommitBundle {
     pub welcome: Vec<u8>,
     #[prost(bytes = "vec", tag = "3")]
     pub private_message: Vec<u8>,
+    /// Ratchet tree for the members joining through `welcome`
+    #[prost(bytes = "vec", tag = "4")]
+    pub ratchet_tree: Vec<u8>,
+}
+
+/// Acknowledgement of a `message/mls-rcs-client` the Conversation Focus accepted
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct AcceptedMlsRcsMessage {
+    /// Message-ID of the CPIM message that carried it
+    #[prost(string, tag = "1")]
+    pub message_id: String,
+    /// Epoch the accepted message was sent in
+    #[prost(message, optional, tag = "2")]
+    pub previous_epoch_identifier: Option<EpochIdentifier>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct EpochIdentifier {
+    #[prost(uint32, tag = "1")]
+    pub era_id: u32,
+    #[prost(uint64, tag = "2")]
+    pub epoch_id: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub epoch_authenticator: Vec<u8>,
 }
 
 /// State kept by the Conversation Focus, used for self-healing
@@ -130,10 +156,34 @@ pub struct MlsGroupInfo {
     pub pending_proposals: Vec<u8>,
 }
 
+/// Control messages the Conversation Focus accepted in one epoch
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct EpochControlMessages {
+    #[prost(string, tag = "1")]
+    pub rcs_message_id: String,
+    #[prost(message, optional, tag = "2")]
+    pub server_mls_rcs_message: Option<ServerMlsRcsMessage>,
+}
+
+/// Response to an MLS-Enhanced-Group-Info-Pull INFO request (RCC.16 section 7.10.5)
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct MlsEnhancedGroupInfo {
+    #[prost(message, optional, tag = "2")]
+    pub latest_epoch_identifier: Option<EpochIdentifier>,
+    #[prost(message, optional, tag = "3")]
+    pub mls_group_info: Option<MlsGroupInfo>,
+    /// Control messages committed since the epoch given in the request
+    #[prost(message, repeated, tag = "4")]
+    pub committed_control_messages: Vec<EpochControlMessages>,
+    /// Epoch reached after applying `committed_control_messages`
+    #[prost(message, optional, tag = "5")]
+    pub paginated_epoch_identifier: Option<EpochIdentifier>,
+}
+
 /// Body of `message/mls-rcs-server`
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ServerMlsRcsMessage {
-    #[prost(oneof = "server_mls_rcs_message::Payload", tags = "1, 2, 3")]
+    #[prost(oneof = "server_mls_rcs_message::Payload", tags = "1, 2, 3, 4")]
     pub payload: Option<server_mls_rcs_message::Payload>,
 }
 
@@ -147,6 +197,8 @@ pub mod server_mls_rcs_message {
         ServerCommitBundle(super::ServerCommitBundle),
         #[prost(message, tag = "3")]
         MlsGroupInfo(super::MlsGroupInfo),
+        #[prost(message, tag = "4")]
+        AcceptedMlsRcsMessage(super::AcceptedMlsRcsMessage),
     }
 }
 
@@ -168,4 +220,29 @@ pub mod client_mls_rcs_message {
         #[prost(message, tag = "3")]
         CommitBundle(super::CommitBundle),
     }
+}
+
+/// Why a client moved a conversation to unencrypted (RCC.16 section 7.11.2.2)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum EndMlsReason {
+    Unset = 0,
+    ServerFailureEncryptionNotAvailable = 1,
+    ClientFailureEncryptionNotAvailable = 2,
+    GroupMemberFailsCapabilitiesCheck = 3,
+    UntrustedRootOnOtherGroupMember = 4,
+    ContinuityTokenMismatch = 5,
+    ContinuityTokenNotReceived = 6,
+    PersistentRefreshFailure = 7,
+    CannotFetchKeypackages = 8,
+    InternalClientError = 9,
+    OutgoingCommitFailed = 10,
+    ServerFailureEraAdvancementQuotaReached = 11,
+}
+
+/// extension_data of the end_mls GroupContext extension
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct EndMlsMetadata {
+    #[prost(enumeration = "EndMlsReason", tag = "1")]
+    pub downgrade_reason: i32,
 }

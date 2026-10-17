@@ -16,13 +16,15 @@
 //!
 //! The Original Message is encrypted with HPKE to the leaf key of the client that
 //! failed to decrypt it, and that ciphertext is sent to the whole group as an
-//! ordinary encrypted message.
+//! ordinary encrypted message. An HMAC of the Original Message goes along, by
+//! which the members that did decrypt it can tell whether they were sent the
+//! same message (Annex C.4.3).
 
-use openmls::prelude::{Credential, HpkeCiphertext};
+use openmls::prelude::{Ciphersuite, Credential, HpkeCiphertext};
 use openmls::treesync::EncryptionKey;
 use openmls_traits::storage::{traits, Entity, StorageProvider, CURRENT_VERSION};
 use openmls_traits::types::HpkePrivateKey;
-use openmls_traits::{crypto::OpenMlsCrypto, OpenMlsProvider};
+use openmls_traits::{crypto::OpenMlsCrypto, random::OpenMlsRand, OpenMlsProvider};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -31,8 +33,8 @@ use super::super::conversation::MlsConversation;
 use super::super::{fail, ErrorKind, Result};
 use super::file;
 use super::wire::{
-    self, AuthenticatedData, HpkeInnerEncapsulatedKeyAndCiphertext, ResentMessage, SecretPayload,
-    SecretPayloadType,
+    self, AuthenticatedData, HpkeInnerEncapsulatedKeyAndCiphertext, ResentMessage,
+    SecretPayloadType, VerifiableDerivedContent, VerifiableResentMessage,
 };
 
 const DISCRIMINANT: &[u8; 26] = b"MLSv1 RCSv1 1:1 Encryption";
@@ -89,6 +91,16 @@ struct LeafPrivateKey {
 impl Entity<CURRENT_VERSION> for LeafKeyPair {}
 impl traits::HpkeKeyPair<CURRENT_VERSION> for LeafKeyPair {}
 
+/// HMAC of the group's Cipher Suite, which is HKDF-Extract with the key as salt
+fn hmac(client: &MlsClient, ciphersuite: Ciphersuite, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    client
+        .provider()
+        .crypto()
+        .hkdf_extract(ciphersuite.hash_algorithm(), key, data)
+        .map(|tag| tag.as_slice().to_vec())
+        .map_err(fail("HMAC", ErrorKind::Crypto))
+}
+
 impl MlsConversation {
     /// Re-sends an Original Message to the client that reported failing to decrypt
     /// it (RCC.16 section 10.3)
@@ -96,7 +108,7 @@ impl MlsConversation {
     /// `original_cpim` is the CPIM message as originally encrypted, which only the
     /// client of `recipient` can read. `message_id` is the IMDN Message-ID of the
     /// new CPIM message, which carries `original_message_id` in its
-    /// Original-Message-Id header. RCC.16 has a key update follow.
+    /// Original-Message-ID header. RCC.16 has a key update follow.
     pub fn encrypt_resent(
         &mut self,
         client: &MlsClient,
@@ -105,9 +117,6 @@ impl MlsConversation {
         message_id: &[u8],
         original_message_id: &[u8],
     ) -> Result<Vec<u8>> {
-        if self.is_encryption_ended() {
-            return Err(ErrorKind::InvalidState);
-        }
         let era = self.era().ok_or(ErrorKind::InvalidState)?;
 
         let receiver = self
@@ -143,41 +152,79 @@ impl MlsConversation {
             )
             .map_err(fail("HPKE encryption", ErrorKind::Crypto))?;
 
+        // hmac_key || hmac_tag, the key as long as the tag
+        let ciphersuite = self.group.ciphersuite();
+        let hmac_key = client
+            .provider()
+            .rand()
+            .random_vec(ciphersuite.hash_length())
+            .map_err(fail("HMAC key generation", ErrorKind::Crypto))?;
+        let hmac_tag = hmac(client, ciphersuite, &hmac_key, original_cpim)?;
+
         let inner = wire::encode(&HpkeInnerEncapsulatedKeyAndCiphertext {
             receiver_leaf_index: binding.receiver_leaf_index,
             encapsulated_key: sealed.kem_output,
             ciphertext: sealed.ciphertext,
-            // how this HMAC is computed is not specified
-            original_message_hmac: Vec::new().into(),
+            original_message_hmac: [hmac_key, hmac_tag].concat().into(),
         })?;
 
-        let payload = wire::encode(&SecretPayload::new(
-            SecretPayloadType::Hpke1To1Message,
-            inner,
-        ))?;
-        let authenticated_data = wire::encode(&AuthenticatedData::new(
+        let authenticated_data = AuthenticatedData::new(
             message_id,
             original_message_id,
             era,
-        ))?;
+            VerifiableDerivedContent::ResentMessage(VerifiableResentMessage::new(
+                original_message_id,
+            )),
+        );
+        self.encrypt_secret_payload(
+            client,
+            SecretPayloadType::Hpke1To1Message,
+            inner,
+            &authenticated_data,
+        )
+    }
 
-        self.encrypt_with_aad(client, &payload, authenticated_data)
+    /// Whether the Original Message of a Re-Sent Message decrypted by another
+    /// member is the `original_contents` this client decrypted earlier (RCC.16
+    /// Annex C.4.2); a mismatch points at members being shown different messages
+    ///
+    /// `original_message_hmac` is the one of the DecryptedMessage.
+    pub fn resent_matches(
+        &self,
+        client: &MlsClient,
+        original_message_hmac: &[u8],
+        original_contents: &[u8],
+    ) -> Result<bool> {
+        let ciphersuite = self.group.ciphersuite();
+        let tag_length = ciphersuite.hash_length();
+        if original_message_hmac.len() <= tag_length {
+            return Err(ErrorKind::BadFormat);
+        }
+
+        let (hmac_key, hmac_tag) =
+            original_message_hmac.split_at(original_message_hmac.len() - tag_length);
+        Ok(hmac(client, ciphersuite, hmac_key, original_contents)? == hmac_tag)
     }
 
     /// Opens the inner layer of a Re-Sent Message sent in `epoch` by the client
-    /// with `sender_leaf_index`; None when it is addressed to another client
+    /// with `sender_leaf_index`; None when it is addressed to another client.
+    /// Also returns the original_message_hmac.
+    ///
+    /// A Re-Sent Message that does not match its HMAC is Rejected, and RCC.16 has
+    /// it dropped without IMDN.
     pub(super) fn open_resent(
         &self,
         client: &MlsClient,
         inner: &[u8],
         epoch: u64,
         sender_leaf_index: u32,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<(Option<Vec<u8>>, Vec<u8>)> {
         let inner: HpkeInnerEncapsulatedKeyAndCiphertext = wire::decode(inner)?;
+        let original_message_hmac: Vec<u8> = inner.original_message_hmac.into();
 
         let own_leaf_index = self.group.own_leaf_index().u32();
         if inner.receiver_leaf_index != own_leaf_index {
-            return Ok(None);
+            return Ok((None, original_message_hmac));
         }
 
         let binding = Binding {
@@ -217,6 +264,11 @@ impl MlsConversation {
             .map_err(fail("HPKE decryption", ErrorKind::Rejected))?;
 
         let resent: ResentMessage = wire::decode(&resent)?;
-        Ok(Some(resent.original_message.into()))
+        let original_message: Vec<u8> = resent.original_message.into();
+        if !self.resent_matches(client, &original_message_hmac, &original_message)? {
+            return Err(ErrorKind::Rejected);
+        }
+
+        Ok((Some(original_message), original_message_hmac))
     }
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! How MLS is applied within RCS, following GSMA PRD RCC.16 (v3.0) and the
+//! How MLS is applied within RCS, following GSMA PRD RCC.16 (v4.0) and the
 //! E2EE parts of GSMA PRD RCC.07 (v15.0)
 //!
 //! The interface between a client and its Home KDS is vendor specific
@@ -35,7 +35,7 @@ pub use certificate::{
     x509_credential, CertificateError, ClientCertificate, RcsCredentialValidator,
 };
 pub use messaging::DecryptedMessage;
-pub use wire::{ClientFailureReason, SecretPayloadType};
+pub use wire::{ClientFailureReason, SecretPayloadType, VerifiableDerivedContent};
 
 use crate::internet::parameter::Parameter;
 use crate::internet::syntax;
@@ -64,16 +64,23 @@ pub const CPIM_NAMESPACE_PREFIX: &[u8] = b"mls";
 
 pub const CPIM_HEADER_EPOCH_AUTHENTICATOR: &[u8] = b"Epoch-Authenticator";
 pub const CPIM_HEADER_DERIVED_CONTENT_SIGNATURE: &[u8] = b"MLS-Derived-Content-Signature";
-pub const CPIM_HEADER_ORIGINAL_MESSAGE_ID: &[u8] = b"Original-Message-Id";
-pub const CPIM_HEADER_ERA_ID: &[u8] = b"Era-Id";
+pub const CPIM_HEADER_ORIGINAL_MESSAGE_ID: &[u8] = b"Original-Message-ID";
+pub const CPIM_HEADER_ERA_ID: &[u8] = b"Era-ID";
 
 /// SIP header carrying the Conversation Focus token (RCC.16 section 6.1.3)
 pub const SIP_HEADER_MLS_OPAQUE_TOKEN: &[u8] = b"MLS-Opaque-Token";
 /// SIP headers in the 200 OK of the Conversation Focus (RCC.16 section 8.2.1)
 pub const SIP_HEADER_MLS_EPOCH: &[u8] = b"MLS-Epoch";
 pub const SIP_HEADER_MLS_ERA: &[u8] = b"MLS-Era";
-/// Info-Package for retrieving the GroupInfo with SIP INFO (RCC.16 section 6.3.1)
+/// Info-Packages for retrieving the GroupInfo with SIP INFO (RCC.16 sections 6.3.1, 6.3.2)
 pub const INFO_PACKAGE_MLS_GROUP_INFO_PULL: &[u8] = b"MLS-Group-Info-Pull";
+pub const INFO_PACKAGE_MLS_ENHANCED_GROUP_INFO_PULL: &[u8] = b"MLS-Enhanced-Group-Info-Pull";
+/// Content-Type of the EpochIdentifier in an MLS-Enhanced-Group-Info-Pull
+/// request (RCC.16 section 7.10.2)
+pub const CONTENT_TYPE_MLS_RCS: &[u8] = b"message/mls-rcs";
+/// Text of the SIP Warning header (warn-code 399) by which a server announces
+/// that no Negative-Delivery IMDN follows its error response (RCC.16 section 7.2.6)
+pub const SIP_WARNING_NON_MLS_ERROR: &[u8] = b"451 Non-MLS error";
 /// SIP URI parameter carrying an encrypted user alias (RCC.16 section 9.1.5)
 pub const SIP_URI_PARAMETER_ENCRYPTED_ALIAS: &[u8] = b"encrypted-alias";
 
@@ -90,25 +97,34 @@ pub const ACS_PARAMETER_HOME_KDS: &str = "home_kds";
 /// Configuration parameter holding the ACS Signed Encryption Identity Proof
 pub const ACS_CONFIG_SIGNED_ENCRYPTION_IDENTITY_PROOF: &str = "signedEncryptionIdentityProof";
 
-/// GroupContext extensions (RCC.16 section 7.11)
+/// GroupContext and GroupInfo extensions (RCC.16 section 7.11)
 pub const EXTENSION_ERA: u16 = 0xF001;
 pub const EXTENSION_END_MLS: u16 = 0xF002;
 pub const EXTENSION_ICON_KEY: u16 = 0xF003;
 pub const EXTENSION_ICON_COMMITMENT: u16 = 0xF004;
 pub const EXTENSION_SUBJECT_KEY: u16 = 0xF005;
 pub const EXTENSION_SUBJECT_COMMITMENT: u16 = 0xF006;
-pub const EXTENSIONS: [u16; 6] = [
+pub const EXTENSION_GROUP_METADATA_KEYS_REQUESTED: u16 = 0xF007;
+pub const EXTENSION_CONTINUITY_TOKEN: u16 = 0xF010;
+pub const EXTENSION_CONTINUITY_TOKEN_COMMITMENT: u16 = 0xF011;
+pub const EXTENSIONS: [u16; 9] = [
     EXTENSION_ERA,
     EXTENSION_END_MLS,
     EXTENSION_ICON_KEY,
     EXTENSION_ICON_COMMITMENT,
     EXTENSION_SUBJECT_KEY,
     EXTENSION_SUBJECT_COMMITMENT,
+    EXTENSION_GROUP_METADATA_KEYS_REQUESTED,
+    EXTENSION_CONTINUITY_TOKEN,
+    EXTENSION_CONTINUITY_TOKEN_COMMITMENT,
 ];
-/// extension_data of the end_mls GroupContext extension
-pub const END_MLS_EXTENSION_DATA: &[u8] = b"end_mls";
+/// extension_data of the group_metadata_keys_requested GroupContext extension
+pub const GROUP_METADATA_KEYS_REQUESTED: &[u8] = b"group_metadata_keys_requested";
+/// Extension and proposal types reserved for future use, which clients accept
+/// and carry forward (RCC.16 section 7.11.11)
+pub const RESERVED_FOR_FUTURE_USE: std::ops::RangeInclusive<u16> = 0xF012..=0xF030;
 
-/// Proposal types (RCC.16 section 7.11)
+/// Proposal types (RCC.16 section 7.11); 0xF001 is void since v4.0
 pub const PROPOSAL_END_MLS: u16 = 0xF001;
 pub const PROPOSAL_RCS_SIGNATURE: u16 = 0xF002;
 pub const PROPOSAL_SELF_REMOVE: u16 = 0xF003;
@@ -120,10 +136,11 @@ pub const PROPOSALS: [u16; 4] = [
     PROPOSAL_SERVER_REMOVE,
 ];
 
-/// Minimum time the secrets of past epochs are kept (RCC.16 section 6.1.1)
-pub const PAST_EPOCH_RETENTION: std::time::Duration = std::time::Duration::from_secs(3 * 86400);
+/// How long the secrets of past epochs are kept before being deleted (RCC.16
+/// section 6.1.1)
+pub const PAST_EPOCH_RETENTION: std::time::Duration = std::time::Duration::from_secs(30 * 86400);
 
-const UNENCRYPTED_CPIM_HEADERS: [&[u8]; 12] = [
+const UNENCRYPTED_CPIM_HEADERS: [&[u8]; 13] = [
     b"To",
     b"From",
     b"DateTime",
@@ -135,6 +152,8 @@ const UNENCRYPTED_CPIM_HEADERS: [&[u8]; 12] = [
     b"<urn:ietf:params:imdn>.IMDN-Route",
     b"<http://www.gsma.com/rcs>.advised-action",
     b"<http://www.gsma.com/rcs>.source",
+    // only for Group Chats
+    b"<http://www.gsma.com/rcs>.User-Profile-Config-Data",
     b"<http://www.gsma.com/rcs/mls>.Epoch-Authenticator",
 ];
 
@@ -203,7 +222,8 @@ impl MlsCapability {
 }
 
 /// Why the Conversation Focus rejected a Commit, Proposal or Message, as found in
-/// the `<mls-server-failure-reason>` of a Negative-Delivery IMDN (RCC.16 section 6.2.5)
+/// the `<mls-server-failure-reason>` of a Negative-Delivery IMDN (RCC.16 sections
+/// 6.2.5, 7.7.2.3)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServerFailureReason {
     IncorrectEra,
@@ -217,9 +237,15 @@ pub enum ServerFailureReason {
     TransientError,
     EncryptionNotAvailable,
     InvalidCommit,
+    InvalidInput,
+    MlsGroupHasEndMls,
+    MlsGroupNotFound,
+    EraAdvancementQuotaReached,
+    EpochAdvancementQuotaReached,
+    MissingMlsControlMessage,
 }
 
-const SERVER_FAILURE_REASONS: [(ServerFailureReason, &str); 11] = [
+const SERVER_FAILURE_REASONS: [(ServerFailureReason, &str); 17] = [
     (ServerFailureReason::IncorrectEra, "incorrect-era"),
     (ServerFailureReason::IncorrectEpoch, "incorrect-epoch"),
     (
@@ -243,6 +269,24 @@ const SERVER_FAILURE_REASONS: [(ServerFailureReason, &str); 11] = [
         "encryption-not-available",
     ),
     (ServerFailureReason::InvalidCommit, "invalid-commit"),
+    (ServerFailureReason::InvalidInput, "invalid-input"),
+    (
+        ServerFailureReason::MlsGroupHasEndMls,
+        "mls-group-has-end-mls",
+    ),
+    (ServerFailureReason::MlsGroupNotFound, "mls-group-not-found"),
+    (
+        ServerFailureReason::EraAdvancementQuotaReached,
+        "era-advancement-quota-reached",
+    ),
+    (
+        ServerFailureReason::EpochAdvancementQuotaReached,
+        "epoch-advancement-quota-reached",
+    ),
+    (
+        ServerFailureReason::MissingMlsControlMessage,
+        "missing-mls-control-message",
+    ),
 ];
 
 impl ServerFailureReason {

@@ -164,8 +164,10 @@ pub fn decrypt_file(
         plaintext[n - 1],
     ]) as u64;
 
+    // senders following RCC.16 v4.0 leave file_length_hint out
+    let length_hint = encryption_info.file_length_hint as u64;
     if message_length >= 1 << 31
-        || message_length != encryption_info.file_length_hint as u64
+        || (length_hint != 0 && message_length != length_hint)
         || n as u64 != TRAILER_LENGTH as u64 + message_length + padding_length
         || padding_length != padme(message_length) - message_length
     {

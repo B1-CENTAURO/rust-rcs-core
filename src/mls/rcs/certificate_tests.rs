@@ -329,7 +329,9 @@ fn groups_of_rcs_clients() {
         .add_members(&alice, &[&key_package])
         .unwrap();
     alice_conversation.merge_pending_commit(&alice).unwrap();
-    let mut bob_conversation = bob.join_conversation(&output.welcome.unwrap()).unwrap();
+    let mut bob_conversation = bob
+        .join_conversation(&output.welcome.unwrap(), &output.ratchet_tree.unwrap())
+        .unwrap();
 
     let message = alice_conversation
         .encrypt_cpim(&alice, b"hi", b"msg-1", b"")
