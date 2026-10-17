@@ -28,7 +28,6 @@ use std::time::SystemTime;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, FixedOffset};
 
-use data_encoding::HEXUPPER;
 use futures::io::{AsyncBufRead, AsyncReadExt};
 
 use quick_xml::events::Event;
@@ -599,8 +598,6 @@ impl BootstrappedContext {
         let naf_id = gba_get_naf_id(fqdn, cipher_id);
 
         let ks_naf = gba_me_ks_naf(&self.ks, &self.rand, self.impi.as_bytes(), &naf_id)?;
-        let ks_naf_hex = HEXUPPER.encode(&ks_naf);
-        platform_log(LOG_TAG, format!("ks_naf_hex: {}", &ks_naf_hex));
 
         let encoded = general_purpose::STANDARD.encode(&ks_naf);
         let encoded = Vec::from(encoded);

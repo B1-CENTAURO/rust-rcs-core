@@ -15,7 +15,6 @@
 extern crate base64;
 
 use base64::{engine::general_purpose, Engine as _};
-use data_encoding::HEXUPPER;
 use libc::{c_int, c_void, size_t};
 
 use crate::ffi::icc::IccChannel;
@@ -170,16 +169,14 @@ fn aka_decode_response(data: Vec<u8>) -> Result<AkaResponse, ErrorKind> {
             if data.len() >= 2 + res_length {
                 let mut res = Vec::with_capacity(res_length);
                 res.extend_from_slice(&data[2..2 + res_length]);
-                platform_log(LOG_TAG, format!("res:{}", &HEXUPPER.encode(&res)));
                 if data.len() > 2 + res_length {
                     let ck_length = data[2 + res_length] as usize;
-                    platform_log(LOG_TAG, format!("ck_length:{}", res_length));
+                    platform_log(LOG_TAG, format!("ck_length:{}", ck_length));
                     if data.len() >= 2 + res_length + 1 + ck_length {
                         let mut ck = Vec::with_capacity(ck_length);
                         ck.extend_from_slice(
                             &data[2 + res_length + 1..2 + res_length + 1 + ck_length],
                         );
-                        platform_log(LOG_TAG, format!("ck:{}", &HEXUPPER.encode(&ck)));
                         if data.len() > 2 + res_length + 1 + ck_length {
                             let ik_length = data[2 + res_length + 1 + ck_length] as usize;
                             platform_log(LOG_TAG, format!("ik_length:{}", ik_length));
@@ -189,7 +186,6 @@ fn aka_decode_response(data: Vec<u8>) -> Result<AkaResponse, ErrorKind> {
                                     &data[2 + res_length + 1 + ck_length + 1
                                         ..2 + res_length + 1 + ck_length + 1 + ik_length],
                                 );
-                                platform_log(LOG_TAG, format!("ik:{}", &HEXUPPER.encode(&ik)));
                                 return Ok(AkaResponse::Successful(res, Some((ck, ik))));
                             }
                         }
@@ -204,7 +200,6 @@ fn aka_decode_response(data: Vec<u8>) -> Result<AkaResponse, ErrorKind> {
             if data.len() >= 2 + auts_length {
                 let mut auts = Vec::with_capacity(auts_length);
                 auts.extend_from_slice(&data[2..2 + auts_length]);
-                platform_log(LOG_TAG, format!("auts:{}", &HEXUPPER.encode(&auts)));
                 return Ok(AkaResponse::SyncFailure(auts));
             }
         }
