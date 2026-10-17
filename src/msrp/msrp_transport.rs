@@ -298,10 +298,15 @@ pub fn msrp_transport_start<T, MC, TRC>(
 {
     let (mut rh, mut wh) = tokio::io::split(t);
 
+    let w_id = t_id.clone();
+
     rt.spawn(async move {
         let mut parser = MsrpParser::new();
         let mut data: [u8; 4096] = [0; 4096];
         'read: while let Ok(size) = rh.read(&mut data).await {
+            if size == 0 {
+                break; // the peer closed the connection
+            }
             parser.feed(&data[..size]);
             loop {
                 match parser.produce() {
@@ -324,7 +329,7 @@ pub fn msrp_transport_start<T, MC, TRC>(
                                         Err(e) => {}
                                     }
                                 }
-                                continue 'read;
+                                continue; // a read can carry more than one message
                             }
 
                             platform_log(
@@ -351,19 +356,12 @@ pub fn msrp_transport_start<T, MC, TRC>(
     });
 
     rt.spawn(async move {
-        'thread: loop {
-            let mut written = 0;
-            if let Some(Some(data)) = rx.recv().await {
-                while let Ok(size) = wh.write(&data[written..]).await {
-                    if size > 0 {
-                        written = written + size;
-                        if written == data.len() {
-                            continue 'thread;
-                        }
-                        continue;
-                    }
-                }
-            } else {
+        while let Some(Some(data)) = rx.recv().await {
+            if let Err(e) = wh.write_all(&data).await {
+                platform_log(
+                    LOG_TAG,
+                    format!("msrp write error for transport {}: {}", w_id, e),
+                );
                 break;
             }
         }
