@@ -24,6 +24,7 @@ use crate::internet::header_field::AsHeaderField;
 use crate::io::{DynamicChain, Serializable};
 use crate::sip::SipTransport;
 use crate::util::rand;
+use crate::util::runtime::HeldRuntime;
 // use crate::util::timer::Timer;
 
 use super::super::sip_headers::cseq::AsCSeq;
@@ -391,7 +392,7 @@ pub fn send_response(
                 match result {
                     is_transaction::SendResult::TimerH => {
                         let transaction = Arc::clone(&transaction);
-                        let rt_ = Arc::clone(&rt);
+                        let rt_ = HeldRuntime::new(rt);
                         rt.spawn(async move {
                             sleep(64 * T1).await;
                             transaction.on_timer_h(tx, &rt_);
@@ -402,7 +403,7 @@ pub fn send_response(
                     }
                     is_transaction::SendResult::TimerL => {
                         let transaction = Arc::clone(&transaction);
-                        let rt_ = Arc::clone(&rt);
+                        let rt_ = HeldRuntime::new(rt);
                         rt.spawn(async move {
                             sleep(64 * T1).await;
                             transaction.on_timer_l(tx, &rt_);

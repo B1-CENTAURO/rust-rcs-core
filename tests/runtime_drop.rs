@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The runtime given to MSRP can be dropped while MSRP is at work. tokio
-//! panics when a runtime is dropped inside one of its tasks, which a task of
-//! ours that held the last Arc<Runtime> would do as it ended. The panic is on
-//! a worker thread, so a panic hook watches for it; the one test keeps the hook
-//! to itself.
+//! The runtime given to MSRP and SIP can be dropped while they are at work.
+//! tokio panics when a runtime is dropped inside one of its tasks, which a
+//! task of ours that held the last Arc<Runtime> would do as it ended. The
+//! panic is on a worker thread, so a panic hook watches for it; the one test
+//! keeps the hook to itself.
 
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +30,10 @@ use tokio::sync::mpsc;
 
 use rust_rcs_core::msrp::msrp_channel::MsrpChannelManager;
 use rust_rcs_core::msrp::msrp_demuxer::MsrpDemuxer;
+use rust_rcs_core::sip::sip_core::SipCore;
+use rust_rcs_core::sip::sip_subscription::SubscriptionManager;
+use rust_rcs_core::sip::sip_transaction::SipTransactionManager;
+use rust_rcs_core::sip::sip_transport::TransportMessage;
 
 const LOCAL: &[u8] = b"msrp://127.0.0.1:2855/local;tcp";
 const REMOTE: &[u8] = b"msrp://127.0.0.1:2856/remote;tcp";
@@ -37,7 +41,7 @@ const REMOTE: &[u8] = b"msrp://127.0.0.1:2856/remote;tcp";
 static DROPPED_IN_A_TASK: AtomicBool = AtomicBool::new(false);
 
 #[test]
-fn the_runtime_can_be_dropped_while_msrp_is_at_work() {
+fn the_runtime_can_be_dropped_while_msrp_and_sip_are_at_work() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if info.to_string().contains("Cannot drop a runtime") {
@@ -76,6 +80,19 @@ fn the_runtime_can_be_dropped_while_msrp_is_at_work() {
     drop(rt);
     drop(manager);
     drop(tx);
+
+    // the loops of SIP's transaction manager and core, which end on Exit
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (tm, tm_events) = SipTransactionManager::new(&rt);
+    let tm = Arc::new(tm);
+    let sm = Arc::new(SubscriptionManager::new(500));
+    let core = SipCore::new(&sm, &tm, tm_events, Vec::new(), Vec::new(), &rt);
+    let ctrl = tm.get_ctrl_itf();
+    drop(rt);
+    drop(core);
+    drop(sm);
+    drop(tm);
+    ctrl.blocking_send(TransportMessage::Exit).unwrap();
 
     thread::sleep(Duration::from_secs(1));
     assert!(

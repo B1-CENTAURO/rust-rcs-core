@@ -30,6 +30,7 @@ use tokio::time::sleep;
 use crate::ffi::log::platform_log;
 use crate::internet::Header;
 use crate::util::rand;
+use crate::util::runtime::HeldRuntime;
 
 use self::heartbeat_transaction::HeartbeatTransaction;
 
@@ -85,9 +86,9 @@ impl SipTransactionManager {
         let mut heartbeat_transactions: Vec<Arc<HeartbeatTransaction>> = Vec::new();
         let (tx, mut rx) = mpsc::channel(8);
         let (ev_tx, ev_rx) = mpsc::channel(8);
-        let rt_ = Arc::clone(rt);
+        let rt_ = HeldRuntime::new(rt);
         rt.spawn(async move {
-            let rt = Arc::clone(&rt_);
+            let rt: &Arc<Runtime> = &rt_;
             'thread: loop {
                 match rx.recv().await { // to-do: use select! to separate TransportMessage or a Kind of Control Message
                     Some(TransportMessage::Incoming(transport, message)) => match &message {
@@ -112,7 +113,7 @@ impl SipTransactionManager {
                                                     if timer_h {
                                                         let t = Arc::clone(&transaction);
                                                         let tx = tx.clone();
-                                                        let rt_ = Arc::clone(&rt);
+                                                        let rt_ = HeldRuntime::new(rt);
                                                         rt.spawn(async move {
                                                             sleep(64 * T1).await;
                                                             t.on_timer_h(tx, &rt_);
@@ -135,7 +136,7 @@ impl SipTransactionManager {
                             if req_line.method == INVITE {
                                 let transports = Arc::clone(&transports_);
                                 let (tx, rx) = mpsc::channel(8);
-                                let rt_ = Arc::clone(&rt);
+                                let rt_ = HeldRuntime::new(rt);
                                 let transaction = ISTransaction::new(
                                     message,
                                     &transport,
@@ -178,7 +179,7 @@ impl SipTransactionManager {
                                 let is_cancel = req_line.method == CANCEL;
                                 let transports = Arc::clone(&transports_);
                                 let (tx, rx) = mpsc::channel(8);
-                                let rt_ = Arc::clone(&rt);
+                                let rt_ = HeldRuntime::new(rt);
                                 let transaction = NISTransaction::new(
                                     message,
                                     &transport,
@@ -364,8 +365,8 @@ impl SipTransactionManager {
     pub fn send_heartbeat(&self, transport: &Arc<SipTransport>, rt: &Arc<Runtime>) {
         let transport_2 = Arc::clone(transport);
         let tx = self.ctrl_itf.clone();
-        let rt_1 = Arc::clone(rt);
-        let rt_2 = Arc::clone(rt);
+        let rt_1 = HeldRuntime::new(rt);
+        let rt_2 = HeldRuntime::new(rt);
         let transports_1 = Arc::clone(&self.transports);
         let transports_2 = Arc::clone(&self.transports);
         let transaction = HeartbeatTransaction::new(
@@ -479,7 +480,7 @@ impl SipTransactionManager {
 
         if let SipMessage::Request(req_line, _, _) = &mut req_message {
             if req_line.method == INVITE {
-                let rt_ = Arc::clone(rt);
+                let rt_ = HeldRuntime::new(rt);
                 let transaction = ICTransaction::new(
                     req_message,
                     &transport,
@@ -521,7 +522,7 @@ impl SipTransactionManager {
                     }
                 });
             } else {
-                let rt_ = Arc::clone(rt);
+                let rt_ = HeldRuntime::new(rt);
                 let transaction = NICTransaction::new(
                     req_message,
                     &transport,

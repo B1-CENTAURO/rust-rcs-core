@@ -32,7 +32,10 @@ use uuid::Uuid;
 use crate::{
     ffi::log::platform_log,
     internet::{header::search, AsHeaderField},
-    util::raw_string::{StrEq, ToInt},
+    util::{
+        raw_string::{StrEq, ToInt},
+        runtime::HeldRuntime,
+    },
 };
 
 use self::{
@@ -108,7 +111,7 @@ pub fn schedule_refresh(
     let tm = Arc::clone(tm);
     let transport = Arc::clone(&subscription.transport);
     // let timer_ = Arc::clone(timer);
-    let rt_ = Arc::clone(&rt);
+    let rt_ = HeldRuntime::new(rt);
     rt.spawn(async move {
         sleep_until(scheduled_refresh_point).await;
         if *expiration.lock().unwrap() == scheduled_expiration {
@@ -158,7 +161,7 @@ pub fn send_refresh(
                     subscribe_request,
                     sm: Arc::clone(sm),
                     tm: Arc::clone(tm),
-                    rt: Arc::clone(rt),
+                    rt: HeldRuntime::new(rt),
                 },
                 rt,
             );
@@ -169,7 +172,7 @@ pub fn send_refresh(
 pub struct InitialSubscribeContext {
     subscribe_request: Arc<SubscribeRequest>,
     core: Arc<SipCore>,
-    rt: Arc<Runtime>,
+    rt: HeldRuntime,
 }
 
 impl InitialSubscribeContext {
@@ -181,7 +184,7 @@ impl InitialSubscribeContext {
         InitialSubscribeContext {
             subscribe_request,
             core,
-            rt,
+            rt: HeldRuntime::from(rt),
         }
     }
 }
@@ -331,7 +334,7 @@ struct SubscriptionRefreshContext {
     sm: Arc<SubscriptionManager>,
     tm: Arc<SipTransactionManager>,
     // timer: Arc<Timer>,
-    rt: Arc<Runtime>,
+    rt: HeldRuntime,
 }
 
 impl ClientTransactionCallbacks for SubscriptionRefreshContext {
