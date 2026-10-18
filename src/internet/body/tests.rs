@@ -157,3 +157,14 @@ fn multipart_parts_are_read_by_their_content_type() {
         _ => panic!("not a MIME part"),
     }
 }
+
+#[test]
+fn header_names_are_matched_whatever_their_case() {
+    let message =
+        MessageBody::construct(b"content-type: message/cpim\r\ncontent-length: 21\r\n\r\nFrom: <sip:a@b>\r\n\r\nhi\r\n\r\n")
+            .unwrap();
+    match &*message.body {
+        Body::Message(cpim) => assert_eq!(raw(&cpim.body), b"hi"),
+        _ => panic!("message/cpim content not parsed"),
+    }
+}

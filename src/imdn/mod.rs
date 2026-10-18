@@ -91,17 +91,19 @@ pub fn message_contains_imdn(message: &MessageBody, notification_checked: bool) 
 
     if !notification_checked {
         if let Some(content_disposition_header) =
-            header::search(&message.headers, b"Content-Disposition", false)
+            header::search(&message.headers, b"Content-Disposition", true)
         {
-            if content_disposition_header.get_value() == b"notification" {
+            if content_disposition_header
+                .get_value()
+                .equals_bytes(b"notification", true)
+            {
                 notification_checked = true;
             }
         }
     }
 
     if notification_checked {
-        if let Some(content_type_header) = header::search(&message.headers, b"Content-Type", false)
-        {
+        if let Some(content_type_header) = header::search(&message.headers, b"Content-Type", true) {
             let content_type_header_field = content_type_header.get_value().as_header_field();
             if let Some(content_type) = content_type_header_field.as_content_type() {
                 if content_type.major_type.equals_bytes(b"message", true)

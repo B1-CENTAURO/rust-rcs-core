@@ -275,7 +275,7 @@ impl<'a> CPIMMessage {
         let mut notification_checked = false;
 
         if let Some(content_disposition) = Self::search_header(self, b"Content-Disposition") {
-            if content_disposition == b"notification" {
+            if content_disposition.equals_bytes(b"notification", true) {
                 notification_checked = true;
             }
         }

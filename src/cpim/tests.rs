@@ -158,3 +158,23 @@ Content-Type: application/vnd.gsma.botsuggestion.v1.0+json\r\n\r\n{}\r\n--next--
         ))
     );
 }
+
+#[test]
+fn an_imdn_is_recognised_whatever_the_case_of_its_headers() {
+    // RFC 5438 writes Content-type and Content-length
+    let data = cpim(
+        vec![
+            Header::new(b"Content-type", b"message/imdn+xml"),
+            Header::new(b"Content-Disposition", b"Notification"),
+            Header::new(b"Content-length", IMDN.len().to_string()),
+        ],
+        IMDN,
+    );
+    let message = parse(&data);
+
+    assert!(message.contains_imdn());
+    assert_eq!(
+        message.get_message_body(),
+        Some((Some(&b"message/imdn+xml"[..]), IMDN, false))
+    );
+}

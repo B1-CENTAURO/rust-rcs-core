@@ -71,11 +71,11 @@ impl MessageBody {
         let mut boundary: Option<Vec<u8>> = None;
 
         for header in &headers {
-            if header.get_name().equals_bytes(b"Content-Length", false) {
+            if header.get_name().equals_bytes(b"Content-Length", true) {
                 if let Ok(i) = header.get_value().to_int() {
                     content_length = Some(i);
                 }
-            } else if parse_content && header.get_name().equals_bytes(b"Content-Type", false) {
+            } else if parse_content && header.get_name().equals_bytes(b"Content-Type", true) {
                 let field = header.get_value().as_header_field();
                 if let Some(content_type) = field.as_content_type() {
                     if content_type.major_type.equals_bytes(b"message", true)
