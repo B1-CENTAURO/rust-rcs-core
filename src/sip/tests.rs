@@ -12,10 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::runtime::Runtime;
+
 use crate::internet::body::Body;
 
 use super::sip_message::SipMessage;
 use super::sip_parser::SipParser;
+use super::sip_transaction::SipTransactionManager;
+use super::sip_transport::{setup_sip_transport, SipTransport, SipTransportType};
 
 fn parse(head: &str, body: &[u8]) -> SipMessage {
     let data = [
@@ -178,4 +187,46 @@ fn a_folded_header_arriving_in_pieces_is_read_once() {
         );
         assert_eq!(header_value(&message, b"Max-Forwards"), b"70");
     }
+}
+
+#[test]
+fn a_heartbeat_pings_and_one_unanswered_closes_the_transport() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (tm, _tm_events) = SipTransactionManager::new(&rt);
+    let transport = Arc::new(SipTransport::new::<DuplexStream>(
+        String::from("192.0.2.10:5060"),
+        SipTransportType::TCP,
+    ));
+    let (ours, mut theirs) = tokio::io::duplex(4096);
+    let (exit_tx, exit_rx) = mpsc::channel();
+    let tx = setup_sip_transport(
+        &transport,
+        ours,
+        tm.get_ctrl_itf(),
+        Arc::clone(&rt),
+        move || {
+            let _ = exit_tx.send(());
+        },
+    );
+    tm.register_sip_transport(Arc::clone(&transport), tx);
+    let mut data = [0; 16];
+
+    // a ping (RFC 5626 section 4.4.1), answered: the transport stays
+    tm.send_heartbeat(&transport, &rt);
+    let size = rt.block_on(theirs.read(&mut data)).unwrap();
+    assert_eq!(&data[..size], b"\r\n\r\n");
+    rt.block_on(theirs.write_all(b"\r\n")).unwrap();
+    assert_eq!(
+        exit_rx.recv_timeout(Duration::from_secs(2)),
+        Err(RecvTimeoutError::Timeout)
+    );
+
+    // unanswered: the transport is closed, and its owner told
+    tm.send_heartbeat(&transport, &rt);
+    let size = rt.block_on(theirs.read(&mut data)).unwrap();
+    assert_eq!(&data[..size], b"\r\n\r\n");
+    exit_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the transport is closed");
+    assert_eq!(rt.block_on(theirs.read(&mut data)).unwrap(), 0);
 }

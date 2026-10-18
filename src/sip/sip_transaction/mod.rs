@@ -52,7 +52,10 @@ use server_transaction::ServerTransactionEvent;
 
 const T200_MILLIS: Duration = Duration::from_millis(200);
 
+#[cfg(not(test))]
 const T_HEARTBEAT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const T_HEARTBEAT: Duration = Duration::from_secs(1);
 
 pub const T1: Duration = Duration::from_millis(500);
 const _T2: Duration = Duration::from_millis(4000);
@@ -394,12 +397,16 @@ impl SipTransactionManager {
                 if success {
                     platform_log(LOG_TAG, "heartbeat success");
                 } else {
-                    platform_log(LOG_TAG, "heartbeat failure, removing transport");
+                    platform_log(LOG_TAG, "heartbeat failure, closing transport");
                     let mut guard = transports_2.lock().unwrap();
                     let mut idx = 0;
                     for (transport, _) in &mut *guard {
                         if Arc::ptr_eq(transport, &transport_2) {
-                            guard.swap_remove(idx);
+                            // closed, so that its owner hears that it is gone
+                            let (_, tx) = guard.swap_remove(idx);
+                            rt_2.spawn(async move {
+                                let _ = tx.send(None).await;
+                            });
                             platform_log(LOG_TAG, "transport dropped");
                             return;
                         }

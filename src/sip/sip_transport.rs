@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::ffi::log::platform_log;
 use crate::sip::sip_parser::SipParser;
@@ -109,10 +109,22 @@ where
 
     let transport = Arc::clone(&transport);
 
+    // the writer stopping, sent None or with no one left to send, closes the
+    // transport: the reader stops too, as a peer gone silent would not end it
+    let closed = Arc::new(Notify::new());
+    let closed_ = Arc::clone(&closed);
+
     rt.spawn(async move {
         let mut parser = SipParser::new();
         let mut data: [u8; 4096] = [0; 4096];
-        'read: while let Ok(size) = rh.read(&mut data).await {
+        'read: loop {
+            let size = tokio::select! {
+                read = rh.read(&mut data) => match read {
+                    Ok(size) => size,
+                    Err(_) => break,
+                },
+                _ = closed_.notified() => break,
+            };
             platform_log(LOG_TAG, format!("sip_transport read {} bytes", size));
             if size > 0 {
                 let mut i = 0;
@@ -203,6 +215,8 @@ where
                 platform_log(LOG_TAG, format!("write handle shutdown error {}", e));
             }
         }
+
+        closed.notify_one();
     });
 
     tx
