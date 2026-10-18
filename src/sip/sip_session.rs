@@ -309,7 +309,9 @@ fn schedule(
     rt: &Arc<Runtime>,
     callback: &Arc<Box<dyn SipSessionEventCallback + Send + Sync>>,
 ) {
-    let duration_refresh = duration - Duration::from_secs(120); // to-do: lower limit
+    // halfway through the interval (RFC 4028 section 10), which is never
+    // shorter than 90 s
+    let duration_refresh = duration / 2;
     let timer_counter_ = Arc::clone(&timer_counter);
     let dialog_ = Arc::clone(dialog);
     let callback_ = Arc::clone(callback);

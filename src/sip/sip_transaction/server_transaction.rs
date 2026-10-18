@@ -19,7 +19,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 
-use crate::internet::header::{self, Header};
+use crate::internet::header::{self, Header, HeaderSearch};
 use crate::internet::header_field::AsHeaderField;
 use crate::io::{DynamicChain, Serializable};
 use crate::sip::SipTransport;
@@ -35,6 +35,9 @@ use super::super::sip_message::SipMessage;
 use super::super::sip_message::ACK;
 use super::super::sip_message::CANCEL;
 use super::super::sip_message::INVITE;
+use super::super::sip_message::NOTIFY;
+use super::super::sip_message::REFER;
+use super::super::sip_message::SUBSCRIBE;
 
 use super::is_transaction;
 use super::is_transaction::ISTransaction;
@@ -274,7 +277,7 @@ pub fn make_response(
     status_code: u16,
     reason_phrase: &[u8],
 ) -> Option<SipMessage> {
-    if let SipMessage::Request(_, Some(headers), _) = request_message {
+    if let SipMessage::Request(req_line, Some(headers), _) = request_message {
         let via_header = header::search(headers, b"Via", true);
         let call_id_header = header::search(headers, b"Call-ID", true);
         let cseq_header = header::search(headers, b"CSeq", true);
@@ -320,12 +323,17 @@ pub fn make_response(
                             }
                         }
                     },
-                    _ => {}
+                    // the tag of the earlier responses (RFC 3261 section 8.2.6.2)
+                    Some(ref tag) => to_tag = Some(tag.clone()),
                 }
 
                 let mut message = SipMessage::new_response(status_code, reason_phrase);
 
-                message.add_header(Header::new(b"Via", via_header.get_value().to_vec()));
+                // every Via, in order, so that the response finds its way back
+                // through the proxies (RFC 3261 section 8.2.6.2)
+                for via_header in HeaderSearch::new(headers, b"Via", true) {
+                    message.add_header(Header::new(b"Via", via_header.get_value().to_vec()));
+                }
 
                 message.add_header(Header::new(b"Call-ID", call_id_header.get_value().to_vec()));
 
@@ -360,12 +368,32 @@ pub fn make_response(
 
                 message.add_header(Header::new(b"To", to_data));
 
+                // a response making a dialog takes the Record-Route of the
+                // request, in order (RFC 3261 section 12.1.1)
+                if status_code > 100
+                    && status_code < 300
+                    && to.tag.is_none()
+                    && creates_dialog(&req_line.method)
+                {
+                    for record_route_header in HeaderSearch::new(headers, b"Record-Route", true) {
+                        message.add_header(Header::new(
+                            b"Record-Route",
+                            record_route_header.get_value().to_vec(),
+                        ));
+                    }
+                }
+
                 return Some(message);
             }
         }
     }
 
     None
+}
+
+/// Whether a request of `method` out of a dialog makes one
+fn creates_dialog(method: &[u8]) -> bool {
+    method == INVITE || method == SUBSCRIBE || method == REFER || method == NOTIFY
 }
 
 pub enum ServerTransactionEvent {

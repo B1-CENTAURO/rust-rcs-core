@@ -24,6 +24,7 @@ use crate::internet::header::{self, HeaderSearch};
 use crate::internet::header_field::AsHeaderField;
 use crate::internet::header_field::HeaderField;
 use crate::internet::name_addr::AsNameAddr;
+use crate::internet::syntax;
 use crate::internet::uri::AsURI;
 
 use crate::io::{DynamicChain, Serializable};
@@ -164,7 +165,10 @@ impl SipDialog {
                 let req_from = req_from_header_field.as_from_to();
                 let resp_to_header_field = resp_to_header.get_value().as_header_field();
                 let resp_to = resp_to_header_field.as_from_to();
-                let contact_addresses = contact_header.get_value().as_name_addresses();
+                // the address before the header parameters, the feature tags
+                // of RCS among them, which may hold quoted strings
+                let contact_header_field = contact_header.get_value().as_header_field();
+                let contact_addresses = contact_header_field.value.as_name_addresses();
 
                 if let (Some(req_cseq), Some(req_from_tag), Some(resp_to_tag)) =
                     (req_cseq, req_from.tag, resp_to.tag)
@@ -204,25 +208,16 @@ impl SipDialog {
                                     )
                                 };
 
-                                let mut route_set = Vec::new();
-
-                                if as_uac {
-                                    let mut iter = resp_headers.iter();
-                                    while let Some(position) =
-                                        iter.position(|h| h.get_name() == b"Record-Route")
-                                    {
-                                        let record_route_header = &resp_headers[position];
-                                        route_set.push(record_route_header.get_value().to_vec());
-                                    }
+                                // the Record-Route of the response, last first, as
+                                // UAC, of the request as UAS (RFC 3261 sections
+                                // 12.1.1 and 12.1.2)
+                                let route_set = if as_uac {
+                                    let mut route_set = route_entries(resp_headers);
+                                    route_set.reverse();
+                                    route_set
                                 } else {
-                                    let mut iter = req_headers.iter();
-                                    while let Some(position) =
-                                        iter.position(|h| h.get_name() == b"Record-Route")
-                                    {
-                                        let record_route_header = &req_headers[position];
-                                        route_set.push(record_route_header.get_value().to_vec());
-                                    }
-                                }
+                                    route_entries(req_headers)
+                                };
 
                                 // our end is the request's From as UAC, its To as UAS
                                 // (RFC 3261 section 12.1)
@@ -512,8 +507,10 @@ impl SipDialog {
                                 if let Some(contact_header) =
                                     header::search(headers, b"Contact", true)
                                 {
+                                    let contact_header_field =
+                                        contact_header.get_value().as_header_field();
                                     let contact_addresses =
-                                        contact_header.get_value().as_name_addresses();
+                                        contact_header_field.value.as_name_addresses();
                                     let contact_address = contact_addresses.first();
                                     if let Some(contact_address) = contact_address {
                                         if let Some(uri_part) = &contact_address.uri_part {
@@ -721,60 +718,44 @@ impl SipDialog {
 
         let mut final_route_set = (*guard).clone();
 
-        let mut contains_lr = false;
-        let mut new_remote_target = Vec::new();
-
+        // a first route without lr is a strict router, which takes the
+        // request with its URI as the Request-URI, the remote target last in
+        // the Route (RFC 3261 section 12.2.1.1); with lr the request goes to
+        // the remote target, the route set as it is
         if let Some(route) = final_route_set.first() {
-            if let Some(addr) = route.as_name_addresses().first() {
-                if let Some(uri_part) = &addr.uri_part {
-                    // let (_, uri_parameters) = uri_part;
+            let route_field = route.as_header_field();
+            let addresses = route_field.value.as_name_addresses();
+            let uri_part = match addresses.first() {
+                Some(addr) => match &addr.uri_part {
+                    Some(uri_part) => uri_part,
+                    None => return Err("Abnormal Route-Set"),
+                },
+                None => return Err("Abnormal Route-Set"),
+            };
 
-                    for p in uri_part.get_parameter_iterator() {
-                        if p.name.eq_ignore_ascii_case(b"lr") {
-                            contains_lr = true;
+            let loose = uri_part
+                .get_parameter_iterator()
+                .any(|p| p.name.eq_ignore_ascii_case(b"lr"));
 
-                            let data_size = uri_part.estimated_size();
-                            new_remote_target.reserve(data_size);
-                            {
-                                let mut readers = Vec::new();
-                                uri_part.get_readers(&mut readers);
-                                match DynamicChain::new(readers).read_to_end(&mut new_remote_target)
-                                {
-                                    Ok(_) => {}
-                                    Err(_) => {} // to-do: early failure
-                                }
-                            }
-
-                            break;
-                        }
+            if !loose {
+                let mut first_uri = Vec::with_capacity(uri_part.estimated_size());
+                {
+                    let mut readers = Vec::new();
+                    uri_part.get_readers(&mut readers);
+                    match DynamicChain::new(readers).read_to_end(&mut first_uri) {
+                        Ok(_) => {}
+                        Err(_) => {} // to-do: early failure
                     }
-
-                    // let p = parameter::search(&uri_parameters, b"lr");
-                    // if let Some(_) = p {
-                    //     if let Some(uri_part_string) = addr.uri_part_to_string() {
-                    //         final_route_set = final_route_set.split_off(1);
-                    //         let mut r = b"<".to_vec();
-                    //         r.extend(remote_target);
-                    //         r.extend(b">");
-                    //         final_route_set.push(r);
-
-                    //         remote_target = uri_part_string.to_vec();
-                    //     }
-                    // }
                 }
-            } else {
-                return Err("Abnormal Route-Set");
+
+                final_route_set.remove(0);
+                let mut r = b"<".to_vec();
+                r.extend(remote_target);
+                r.extend(b">");
+                final_route_set.push(r);
+
+                remote_target = first_uri;
             }
-        }
-
-        if contains_lr {
-            final_route_set = final_route_set.split_off(1);
-            let mut r = b"<".to_vec();
-            r.extend(remote_target);
-            r.extend(b">");
-            final_route_set.push(r);
-
-            remote_target = new_remote_target;
         }
 
         if let Some(_) = remote_target.as_standard_uri() {
@@ -869,17 +850,43 @@ impl SipDialog {
     pub fn cmcc_patch_route_set_on_subscriber_2xx_response(&self, resp_message: &SipMessage) {
         let mut new_route_set = Vec::new();
         if let Some(headers) = resp_message.headers() {
-            for record_route_header in HeaderSearch::new(headers, b"Record-Route", true) {
-                let route = record_route_header
-                    .get_value()
-                    .as_header_field()
-                    .value
-                    .to_vec();
-                new_route_set.push(route);
-            }
+            new_route_set = route_entries(headers);
+            new_route_set.reverse();
         }
         *self.route_set.lock().unwrap() = new_route_set;
     }
+}
+
+/// The entries of the Record-Route headers among `headers`, in order, each
+/// header perhaps listing several (RFC 3261 section 20.30)
+fn route_entries(headers: &[Header]) -> Vec<Vec<u8>> {
+    let mut entries = Vec::new();
+    for record_route_header in HeaderSearch::new(headers, b"Record-Route", true) {
+        let value = record_route_header.get_value();
+        let mut start = 0;
+        let mut quoted = false;
+        let mut angled = false;
+        let mut i = 0;
+        while i < value.len() {
+            match value[i] {
+                b'\\' if quoted => i += 1,
+                b'"' => quoted = !quoted,
+                b'<' if !quoted => angled = true,
+                b'>' if !quoted => angled = false,
+                b',' if !quoted && !angled => {
+                    entries.push(syntax::trim(&value[start..i]).to_vec());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let last = syntax::trim(&value[start.min(value.len())..]);
+        if !last.is_empty() {
+            entries.push(last.to_vec());
+        }
+    }
+    entries
 }
 
 pub trait GetDialogHeaders {
