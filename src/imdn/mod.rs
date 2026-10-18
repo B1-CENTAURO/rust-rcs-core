@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod notification;
+
 use crate::cpim::cpim_message::{CPIMHeaders, CPIMMessage};
 
 use crate::internet::body::message_body::MessageBody;
