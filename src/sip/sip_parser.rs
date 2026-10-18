@@ -151,8 +151,10 @@ impl SipParser {
                                         }
                                     }
 
-                                    if let Some(c) = iter.next() {
-                                        if *c == b'\t' {
+                                    // a line starting with a space or tab folds the header
+                                    // onto it (RFC 3261 section 7.3.1)
+                                    match iter.next() {
+                                        Some(c) if *c == b' ' || *c == b'\t' => {
                                             if first_fold.is_none() {
                                                 first_fold = Some(position);
                                             }
@@ -164,6 +166,17 @@ impl SipParser {
                                                 panic!("line value missing for no obvious reason")
                                             }
                                             continue 'inner;
+                                        }
+
+                                        Some(_) => {}
+
+                                        // the next line, which may fold the header, has yet to
+                                        // come
+                                        None => {
+                                            if let Some(line) = line {
+                                                line.clear();
+                                            }
+                                            return Ok(None);
                                         }
                                     }
 
@@ -207,6 +220,10 @@ impl SipParser {
                             }
                         }
 
+                        // the header is read again from its start once more has come
+                        if let Some(line) = line {
+                            line.clear();
+                        }
                         return Ok(None);
                     }
                 }

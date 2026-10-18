@@ -118,3 +118,64 @@ Content-Length: {}\r\n\r\n",
         _ => panic!("message/cpim body not parsed"),
     }
 }
+
+fn header_value(message: &SipMessage, name: &[u8]) -> Vec<u8> {
+    crate::internet::header::search(message.headers().unwrap(), name, true)
+        .unwrap()
+        .get_value()
+        .to_vec()
+}
+
+const FOLDED: &[u8] = b"MESSAGE sip:bob@example.com SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.1;branch=z9hG4bK776asdhds\r\n\
+From: <sip:alice@example.com>;tag=1928301774\r\n\
+To: <sip:bob@example.com>\r\n\
+Call-ID: a84b4c76e66710\r\n\
+CSeq: 1 MESSAGE\r\n\
+Subject: I know you're there,\r\n  pick up the phone\r\n\tand talk to me!\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\
+\r\n";
+
+#[test]
+fn a_header_folded_with_a_space_or_a_tab_is_unfolded() {
+    let mut parser = SipParser::new();
+    parser.feed(FOLDED);
+    let message = parser.produce().unwrap().expect("a complete message");
+
+    assert_eq!(
+        header_value(&message, b"Subject"),
+        b"I know you're there,  pick up the phone and talk to me!"
+    );
+    assert_eq!(header_value(&message, b"Max-Forwards"), b"70");
+}
+
+#[test]
+fn a_folded_header_arriving_in_pieces_is_read_once() {
+    // the message split in two at each point, and a byte at a time, as a
+    // connection may give it
+    let mut feeds: Vec<Vec<&[u8]>> = (1..FOLDED.len())
+        .map(|i| vec![&FOLDED[..i], &FOLDED[i..]])
+        .collect();
+    feeds.push(FOLDED.chunks(1).collect());
+
+    for pieces in feeds {
+        let mut parser = SipParser::new();
+        let mut message = None;
+        for piece in &pieces {
+            parser.feed(piece);
+            if let Some(m) = parser.produce().unwrap() {
+                message = Some(m);
+            }
+        }
+        let message = message.expect("a complete message");
+
+        assert_eq!(
+            header_value(&message, b"Subject"),
+            b"I know you're there,  pick up the phone and talk to me!",
+            "split at {}",
+            pieces[0].len()
+        );
+        assert_eq!(header_value(&message, b"Max-Forwards"), b"70");
+    }
+}

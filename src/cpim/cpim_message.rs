@@ -31,7 +31,7 @@ use crate::util::raw_string::StrEq;
 
 use super::cpim_header_value::{escape_controls, CPIMHeaderValue};
 use super::cpim_info::CPIMInfo;
-use super::cpim_namespace::CPIMNamespace;
+use super::cpim_namespace::{CPIMNamespace, CORE_NAMESPACE};
 
 const LOG_TAG: &str = "cpim";
 
@@ -67,7 +67,7 @@ impl<'a> CPIMMessage {
             let mut headers: Vec<Header> = Vec::new();
 
             for h in &message_body.headers {
-                if h.get_name() == b"NS" {
+                if ns.inflate(h.get_name()) == b"NS" {
                     if let Some((prefix, uri)) = CPIMNamespace::parse_declaration(h.get_value()) {
                         ns.register(prefix, uri);
                         continue;
@@ -243,7 +243,8 @@ impl<'a> CPIMMessage {
     fn written_headers(&self) -> Vec<u8> {
         let mut data = Vec::new();
 
-        // the namespace each prefix is declared for so far
+        // the namespace each prefix is declared for so far, the default
+        // namespace with an empty prefix
         let mut declared: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
         for (name, value) in self.inflated_headers() {
@@ -255,7 +256,24 @@ impl<'a> CPIMMessage {
                 continue;
             }
 
-            let name = self.ns.deflate(&name);
+            let mut name = self.ns.deflate(&name);
+
+            // a name in no namespace with a prefix, the core one included, is
+            // written in the default namespace, declared for it as needed
+            let mut default = None;
+            if let Some((uri, local_name)) = CPIMNamespace::split_inflated(&name) {
+                default = Some(uri.to_vec());
+                name = local_name.to_vec();
+            } else if !name.contains(&b'.') {
+                default = Some(CORE_NAMESPACE.to_vec());
+            }
+            if let Some(default) = default {
+                let current = declared.get(&b""[..]).map_or(CORE_NAMESPACE, |v| &v[..]);
+                if current != default {
+                    write_header(&mut data, b"NS", &[b"<", &default[..], b">"].concat());
+                    declared.insert(Vec::new(), default);
+                }
+            }
 
             // a Require uses the prefixes of the names it lists
             let mut used = vec![&name[..]];

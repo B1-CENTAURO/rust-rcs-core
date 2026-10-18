@@ -18,6 +18,10 @@ use std::collections::BTreeMap;
 use crate::internet::header::Header;
 use crate::internet::syntax;
 
+/// The namespace of the core headers, From, To, NS and the others of RFC 3862
+/// section 4
+pub const CORE_NAMESPACE: &[u8] = b"urn:ietf:params:cpim-headers:";
+
 pub struct CPIMNamespace {
     registered_namespaces: BTreeMap<Vec<u8>, Vec<u8>>,
 }
@@ -35,23 +39,26 @@ impl<'r> CPIMNamespace {
         self.registered_namespaces.insert(n, v);
     }
 
-    /// `name` with its namespace prefix, if registered, written out as the
-    /// namespace URI: `imdn.Message-ID` as `<urn:ietf:params:imdn>.Message-ID`
+    /// `name` with its namespace written out as the namespace URI:
+    /// `imdn.Message-ID` as `<urn:ietf:params:imdn>.Message-ID`. A name with
+    /// no prefix is in the default namespace, registered with an empty prefix,
+    /// if any (RFC 3862 section 3.4). A name in the core namespace is written
+    /// without one, as is NS, taken to declare namespaces whatever the default.
     pub fn inflate(&self, name: &[u8]) -> Vec<u8> {
-        let mut iter = name.iter();
-        if let Some(position) = iter.position(|c| *c == b'.') {
-            for (k, v) in &self.registered_namespaces {
-                if &name[..position] == k {
-                    let mut inflated = b"<".to_vec();
-                    inflated.extend(v);
-                    inflated.extend(b">.");
-                    inflated.extend(iter);
-                    return inflated;
-                }
-            }
+        if name == b"NS" {
+            return name.to_vec();
         }
 
-        name.to_vec()
+        let (prefix, local_name) = match name.iter().position(|c| *c == b'.') {
+            Some(position) => (&name[..position], &name[position + 1..]),
+            None => (&name[..0], name),
+        };
+
+        match self.registered_namespaces.get(prefix) {
+            Some(uri) if &uri[..] != CORE_NAMESPACE => [b"<", &uri[..], b">.", local_name].concat(),
+            Some(_) => local_name.to_vec(),
+            None => name.to_vec(),
+        }
     }
 
     pub fn as_inflator(&'r self) -> Box<dyn Fn(&Header) -> (Vec<u8>, &[u8]) + 'r> {
@@ -71,16 +78,22 @@ impl<'r> CPIMNamespace {
 
     /// The prefix and name within the namespace of `name` as inflate() writes it
     fn deflation<'a>(&'a self, name: &'a [u8]) -> Option<(&'a [u8], &'a [u8])> {
+        let (uri, local_name) = Self::split_inflated(name)?;
+        self.registered_namespaces
+            .iter()
+            .find(|(k, v)| !k.is_empty() && *v == uri)
+            .map(|(k, _)| (&k[..], local_name))
+    }
+
+    /// The namespace URI and the name within the namespace of `name` as
+    /// inflate() writes it
+    pub(crate) fn split_inflated(name: &[u8]) -> Option<(&[u8], &[u8])> {
         let end = name
             .strip_prefix(b"<")?
             .windows(2)
             .position(|w| w == b">.")?
             + 1;
-        let uri = &name[1..end];
-        self.registered_namespaces
-            .iter()
-            .find(|(k, v)| !k.is_empty() && *v == uri)
-            .map(|(k, _)| (&k[..], &name[end + 2..]))
+        Some((&name[1..end], &name[end + 2..]))
     }
 
     /// The namespace URI registered for `prefix`
