@@ -424,6 +424,86 @@ Content-Length: 1\r\n\
     }
 }
 
+#[test]
+fn a_first_notify_ending_the_subscription_is_answered() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (tm, tm_events) = SipTransactionManager::new(&rt);
+    let tm = Arc::new(tm);
+    let sm = Arc::new(SubscriptionManager::new(500));
+    let core = Arc::new(SipCore::new(
+        &sm,
+        &tm,
+        tm_events,
+        vec![b"NOTIFY"],
+        Vec::new(),
+        &rt,
+    ));
+    let transport = Arc::new(SipTransport::new::<DuplexStream>(
+        String::from("192.0.2.10:5060"),
+        SipTransportType::TCP,
+    ));
+    let (ours, theirs) = tokio::io::duplex(65536);
+    let tx = setup_sip_transport(&transport, ours, tm.get_ctrl_itf(), Arc::clone(&rt), || {});
+    tm.register_sip_transport(Arc::clone(&transport), tx);
+    let mut peer = Peer {
+        stream: theirs,
+        parser: SipParser::new(),
+    };
+
+    let (terminated_tx, terminated_rx) = mpsc::channel();
+    let subscriber = Arc::new(Subscriber::new(
+        "test",
+        move |subscriber_event| {
+            if let SubscriberEvent::Terminated(_, can_resubscribe, retry_after) = subscriber_event {
+                let _ = terminated_tx.send((can_resubscribe, retry_after));
+            }
+        },
+        move |_, expiration| {
+            let mut message = SipMessage::new_request(SUBSCRIBE, b"sip:alice@example.com");
+            message.add_header(Header::new(b"Call-ID", b"subscription-1"));
+            message.add_header(Header::new(b"CSeq", b"1 SUBSCRIBE"));
+            message.add_header(Header::new(b"From", b"<sip:alice@example.com>;tag=sub1"));
+            message.add_header(Header::new(b"To", b"<sip:alice@example.com>"));
+            message.add_header(Header::new(b"Expires", expiration.to_string()));
+            message.add_header(Header::new(b"Event", b"reg"));
+            Ok(message)
+        },
+    ));
+    let request = subscriber.build_request(None, 600).unwrap();
+    let subscribe_request = Arc::new(SubscribeRequest::new(&request, subscriber).unwrap());
+    sm.register_request(Arc::clone(&subscribe_request), &rt);
+    tm.send_request(
+        request,
+        &transport,
+        InitialSubscribeContext::new(subscribe_request, Arc::clone(&core), Arc::clone(&rt)),
+        &rt,
+    );
+
+    let subscribe = peer.next(&rt);
+    peer.send(&rt, &ok(&subscribe, "notifier1", "Expires: 600\r\n"));
+
+    peer.send(
+        &rt,
+        "NOTIFY sip:alice@192.0.2.10:5060;transport=tcp SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bKnotify1\r\n\
+From: <sip:alice@example.com>;tag=notifier1\r\n\
+To: <sip:alice@example.com>;tag=sub1\r\n\
+Call-ID: subscription-1\r\n\
+CSeq: 1 NOTIFY\r\n\
+Contact: <sip:notifier@192.0.2.1:5060;transport=tcp>\r\n\
+Event: reg\r\n\
+Subscription-State: terminated;reason=timeout\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\
+\r\n",
+    );
+    assert_eq!(status_code(&peer.next(&rt)), 200);
+    assert_eq!(
+        terminated_rx.recv_timeout(Duration::from_secs(5)),
+        Ok((true, 0))
+    );
+}
+
 fn read_message(data: &[u8]) -> SipMessage {
     let mut parser = SipParser::new();
     parser.feed(data);

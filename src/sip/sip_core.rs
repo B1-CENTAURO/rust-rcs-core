@@ -450,6 +450,19 @@ fn process_out_of_dialog_notify_request(
                     subscribe_request.on_event();
                     if subscription_state.state.equals_bytes(b"terminated", false) {
                         platform_log(LOG_TAG, "process terminated subscription state");
+                        if let Some(resp_message) = server_transaction::make_response(
+                            message,
+                            transaction.to_tag(),
+                            200,
+                            b"OK",
+                        ) {
+                            server_transaction::send_response(
+                                Arc::clone(&transaction),
+                                resp_message,
+                                tx,
+                                rt,
+                            );
+                        }
                         subscribe_request.on_terminating_event(subscription_state, message);
                     } else {
                         if let Some(mut resp_message) = server_transaction::make_response(
