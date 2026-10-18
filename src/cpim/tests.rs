@@ -106,18 +106,23 @@ fn the_cpim_part_of_a_multipart_body_is_read() {
     // an INVITE body with the first message: the client takes the CPIM from the
     // message/cpim part
     let cpim = cpim(vec![Header::new(b"Content-Type", b"text/plain")], b"hi");
-    let data = [
-        &b"--next\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n"[..],
-        format!(
-            "\r\n--next\r\nContent-Type: message/cpim\r\nContent-Length: {}\r\n\r\n",
-            cpim.len()
-        )
-        .as_bytes(),
-        &cpim,
-        b"\r\n--next--\r\n",
-    ]
-    .concat();
+    for content_length in [format!("Content-Length: {}\r\n", cpim.len()), String::new()] {
+        let data = [
+            &b"--next\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n"[..],
+            format!(
+                "\r\n--next\r\nContent-Type: message/cpim\r\n{}\r\n",
+                content_length
+            )
+            .as_bytes(),
+            &cpim,
+            b"\r\n--next--\r\n",
+        ]
+        .concat();
+        the_cpim_part_is_read(&data);
+    }
+}
 
+fn the_cpim_part_is_read(data: &[u8]) {
     let body = Body::construct_multipart(&data, b"next").unwrap();
     let part = match &body {
         Body::Multipart(multipart) => match &*multipart.parts[1] {
@@ -176,5 +181,22 @@ fn an_imdn_is_recognised_whatever_the_case_of_its_headers() {
     assert_eq!(
         message.get_message_body(),
         Some((Some(&b"message/imdn+xml"[..]), IMDN, false))
+    );
+}
+
+#[test]
+fn folded_mime_headers_are_read() {
+    let data = cpim(
+        vec![Header::new(
+            b"Content-Type",
+            b"text/plain;\r\n charset=UTF-8",
+        )],
+        b"hi",
+    );
+    let message = parse(&data);
+
+    assert_eq!(
+        message.get_message_body(),
+        Some((Some(&b"text/plain; charset=UTF-8"[..]), &b"hi"[..], false))
     );
 }

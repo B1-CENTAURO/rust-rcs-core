@@ -168,3 +168,63 @@ fn header_names_are_matched_whatever_their_case() {
         _ => panic!("message/cpim content not parsed"),
     }
 }
+
+#[test]
+fn content_is_read_by_its_type_without_content_length() {
+    let message = MessageBody::construct(
+        b"Content-Type: message/cpim\r\n\r\nFrom: <sip:a@b>\r\n\r\nContent-Type: text/plain\r\n\r\nhi",
+    )
+    .unwrap();
+    match &*message.body {
+        Body::Message(cpim) => {
+            assert_eq!(value(cpim, b"From"), b"<sip:a@b>");
+            assert_eq!(raw(&cpim.body), b"Content-Type: text/plain\r\n\r\nhi");
+        }
+        _ => panic!("message/cpim content not parsed"),
+    }
+
+    let message = MessageBody::construct(
+        b"Content-Type: multipart/mixed;boundary=next\r\n\r\n\
+--next\r\nContent-Type: text/plain\r\n\r\nhi\r\n--next--",
+    )
+    .unwrap();
+    match &*message.body {
+        Body::Multipart(multipart) => assert_eq!(multipart.parts.len(), 1),
+        _ => panic!("multipart content not parsed"),
+    }
+}
+
+#[test]
+fn content_not_reading_as_its_type_is_kept_as_it_is() {
+    for data in [
+        &b"Content-Type: message/cpim\r\n\r\nnot a header\r\n\r\nhi"[..],
+        // no boundary, which would find parts between each "--"
+        b"Content-Type: multipart/mixed\r\n\r\n--\r\nContent-Type: text/plain\r\n\r\nhi\r\n----",
+        b"Content-Type: multipart/mixed;boundary=other\r\n\r\n--next\r\n\r\nhi\r\n--next--",
+    ] {
+        let message = MessageBody::construct(data).unwrap();
+        let content = &data[data.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4..];
+        assert_eq!(
+            raw(&message.body),
+            content,
+            "{:?}",
+            String::from_utf8_lossy(data)
+        );
+    }
+}
+
+#[test]
+fn folded_headers_are_unfolded() {
+    let message = MessageBody::construct(
+        b"Content-Type: text/plain;\r\n charset=UTF-8\r\nX-Folded: a\r\n\tb\r\n  c\r\nX-Next: d\r\n\r\nhi",
+    )
+    .unwrap();
+
+    assert_eq!(
+        value(&message, b"Content-Type"),
+        b"text/plain; charset=UTF-8"
+    );
+    assert_eq!(value(&message, b"X-Folded"), b"a\tb  c");
+    assert_eq!(value(&message, b"X-Next"), b"d");
+    assert_eq!(raw(&message.body), b"hi");
+}

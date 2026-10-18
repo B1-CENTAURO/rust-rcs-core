@@ -51,16 +51,25 @@ impl MessageBody {
                     i = i + 2;
                     break;
                 }
-                let mut iter = data[i..i + idx].iter();
+                // a line starting with whitespace folds the header onto it
+                let mut end = i + idx;
+                while data[end + 2..].starts_with(b" ") || data[end + 2..].starts_with(b"\t") {
+                    if let Some(idx) = data[end + 2..].index_of(b"\r\n") {
+                        end = end + 2 + idx;
+                    } else {
+                        break;
+                    }
+                }
+                let mut iter = data[i..end].iter();
                 if let Some(position) = iter.position(|c| *c == b':') {
                     headers.push(Header::new(
                         data[i..i + position].to_vec(),
-                        syntax::trim(iter.as_slice()).to_vec(),
+                        syntax::trim(&unfold(iter.as_slice())).to_vec(),
                     ));
                 } else {
                     return Err("malformed header");
                 }
-                i = i + idx + 2;
+                i = end + 2;
             } else {
                 break;
             }
@@ -82,7 +91,9 @@ impl MessageBody {
                         && is_headers_and_body(content_type.sub_type)
                     {
                         construct_flag = Some(1);
-                    } else if content_type.major_type.equals_bytes(b"multipart", true) {
+                    } else if content_type.major_type.equals_bytes(b"multipart", true)
+                        && !content_type.boundary.is_empty()
+                    {
                         construct_flag = Some(2);
                         boundary = Some(content_type.boundary.to_vec());
                     } else {
@@ -92,72 +103,26 @@ impl MessageBody {
             }
         }
 
-        match content_length {
-            Some(content_length) => {
-                // what carries the message frames the content, so a
-                // Content-Length running past its end is not taken
-                let content = if content_length <= data.len() - i {
-                    &data[i..i + content_length]
-                } else {
-                    &data[i..]
-                };
-
-                match construct_flag {
-                    Some(flag) => match flag {
-                        0 => {
-                            return Ok(MessageBody {
-                                headers,
-                                body: Arc::new(Body::construct_raw(content)),
-                            });
-                        }
-                        1 => match Body::construct_message(content) {
-                            Ok(body) => {
-                                return Ok(MessageBody {
-                                    headers,
-                                    body: Arc::new(body),
-                                });
-                            }
-                            Err(e) => {
-                                return Err(e);
-                            }
-                        },
-                        2 => {
-                            if let Some(boundary) = boundary {
-                                match Body::construct_multipart(content, &boundary) {
-                                    Ok(body) => {
-                                        return Ok(MessageBody {
-                                            headers,
-                                            body: Arc::new(body),
-                                        });
-                                    }
-                                    Err(e) => {
-                                        return Err(e);
-                                    }
-                                }
-                            } else {
-                                return Err("missing multipart boundary");
-                            }
-                        }
-                        _ => {
-                            panic!("impossible condition")
-                        }
-                    },
-                    None => {
-                        return Ok(MessageBody {
-                            headers,
-                            body: Arc::new(Body::construct_raw(content)),
-                        });
-                    }
-                }
-            }
-
-            None => {
-                return Ok(MessageBody {
-                    headers,
-                    body: Arc::new(Body::construct_raw(&data[i..])),
-                });
+        // what carries the message frames the content, so a Content-Length
+        // running past its end is not taken
+        let mut content = &data[i..];
+        if let Some(content_length) = content_length {
+            if content_length <= content.len() {
+                content = &content[..content_length];
             }
         }
+
+        // content that does not read as its type is kept as it is
+        let body = match (construct_flag, boundary) {
+            (Some(1), _) => Body::construct_message(content).ok(),
+            (Some(2), Some(boundary)) => Body::construct_multipart(content, &boundary).ok(),
+            _ => None,
+        };
+
+        Ok(MessageBody {
+            headers,
+            body: Arc::new(body.unwrap_or_else(|| Body::construct_raw(content))),
+        })
     }
 
     pub fn get_readers<'a>(
@@ -171,6 +136,21 @@ impl MessageBody {
 
         Ok(())
     }
+}
+
+/// `value` with the line breaks folding it taken out
+fn unfold(value: &[u8]) -> Vec<u8> {
+    let mut unfolded = Vec::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        if value[i..].starts_with(b"\r\n") {
+            i = i + 2;
+        } else {
+            unfolded.push(value[i]);
+            i = i + 1;
+        }
+    }
+    unfolded
 }
 
 /// Whether content of type message/`sub_type` is itself headers and a body,
