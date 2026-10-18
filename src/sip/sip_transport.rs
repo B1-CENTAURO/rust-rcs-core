@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::runtime::Runtime;
@@ -62,6 +62,8 @@ pub enum SipTransportType {
 pub struct SipTransport {
     pub transport_address: String,
     pub transport_type: SipTransportType,
+
+    service_route: Mutex<Vec<Vec<u8>>>,
 }
 
 impl SipTransport {
@@ -69,7 +71,19 @@ impl SipTransport {
         SipTransport {
             transport_address,
             transport_type,
+            service_route: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Sets the Service-Route header values of the last registration on the
+    /// transport, which out-of-dialog requests other than REGISTER sent on it
+    /// take as their Route (TS 24.229 section 5.1.2A.1.1)
+    pub fn set_service_route(&self, service_route: Vec<Vec<u8>>) {
+        *self.service_route.lock().unwrap() = service_route;
+    }
+
+    pub fn get_service_route(&self) -> Vec<Vec<u8>> {
+        self.service_route.lock().unwrap().clone()
     }
 
     pub fn get_via(&self) -> String {

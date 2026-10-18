@@ -22,12 +22,13 @@ use tokio::runtime::Runtime;
 use crate::internet::body::Body;
 
 use super::sip_dialog::{GetDialogHeaderInfo, GetDialogHeaders, GetDialogIdentifier};
-use super::sip_message::BYE;
 use super::sip_message::{SipMessage, SUBSCRIBE};
+use super::sip_message::{BYE, OPTIONS, REGISTER};
 use super::sip_parser::SipParser;
 use super::sip_subscription::subscribe_request::SubscribeRequest;
 use super::sip_subscription::subscriber::{Subscriber, SubscriberEvent};
 use super::sip_subscription::{InitialSubscribeContext, SubscriptionManager};
+use super::sip_transaction::client_transaction::ClientTransactionCallbacks;
 use super::sip_transaction::SipTransactionManager;
 use super::sip_transport::{setup_sip_transport, SipTransport, SipTransportType};
 use super::{SipCore, SipDialog};
@@ -496,4 +497,80 @@ Content-Length: 0\r\n\r\n",
         value(b"To")
     );
     assert!(value(b"To").contains("tag=alice1"), "{}", value(b"To"));
+}
+
+struct NoCallbacks;
+
+impl ClientTransactionCallbacks for NoCallbacks {
+    fn on_provisional_response(&self, _message: SipMessage) {}
+    fn on_final_response(&self, _message: SipMessage) {}
+    fn on_transport_error(&self) {}
+}
+
+#[test]
+fn the_service_route_is_preloaded_on_requests_out_of_dialog() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (tm, _tm_events) = SipTransactionManager::new(&rt);
+    let transport = Arc::new(SipTransport::new::<DuplexStream>(
+        String::from("192.0.2.10:5060"),
+        SipTransportType::TCP,
+    ));
+    let (ours, theirs) = tokio::io::duplex(65536);
+    let tx = setup_sip_transport(&transport, ours, tm.get_ctrl_itf(), Arc::clone(&rt), || {});
+    tm.register_sip_transport(Arc::clone(&transport), tx);
+    let mut peer = Peer {
+        stream: theirs,
+        parser: SipParser::new(),
+    };
+
+    transport.set_service_route(vec![
+        b"<sip:orig@scscf1.example.com;lr>".to_vec(),
+        b"<sip:scscf2.example.com;lr>".to_vec(),
+    ]);
+
+    for (method, to, route, expected) in [
+        (
+            OPTIONS,
+            "<sip:bob@example.com>",
+            None,
+            vec![
+                "<sip:orig@scscf1.example.com;lr>",
+                "<sip:scscf2.example.com;lr>",
+            ],
+        ),
+        (REGISTER, "<sip:alice@example.com>", None, vec![]),
+        (OPTIONS, "<sip:bob@example.com>;tag=bob1", None, vec![]),
+        (
+            OPTIONS,
+            "<sip:bob@example.com>",
+            Some("<sip:elsewhere.example.com;lr>"),
+            vec!["<sip:elsewhere.example.com;lr>"],
+        ),
+    ] {
+        let mut message = SipMessage::new_request(method, b"sip:bob@example.com");
+        message.add_header(Header::new(b"Call-ID", b"route-1"));
+        message.add_header(Header::new(
+            b"CSeq",
+            format!("1 {}", String::from_utf8_lossy(method)),
+        ));
+        message.add_header(Header::new(b"From", b"<sip:alice@example.com>;tag=alice1"));
+        message.add_header(Header::new(b"To", to));
+        if let Some(route) = route {
+            message.add_header(Header::new(b"Route", route));
+        }
+        tm.send_request(message, &transport, NoCallbacks, &rt);
+
+        let sent = peer.next(&rt);
+        let routes: Vec<String> =
+            crate::internet::header::HeaderSearch::new(sent.headers().unwrap(), b"Route", true)
+                .map(|h| String::from_utf8_lossy(h.get_value()).into_owned())
+                .collect();
+        assert_eq!(
+            routes,
+            expected,
+            "{} to {}",
+            String::from_utf8_lossy(method),
+            to
+        );
+    }
 }

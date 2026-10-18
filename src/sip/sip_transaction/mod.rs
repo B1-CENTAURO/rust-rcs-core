@@ -28,7 +28,10 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 use crate::ffi::log::platform_log;
+use crate::internet::header;
+use crate::internet::header_field::AsHeaderField;
 use crate::internet::Header;
+use crate::sip::sip_headers::from_to::AsFromTo;
 use crate::util::rand;
 use crate::util::runtime::HeldRuntime;
 
@@ -481,6 +484,18 @@ impl SipTransactionManager {
             req_message.add_header(Header::new(b"Content-Length", b"0"));
         }
 
+        // the Service-Route preloaded on a request starting a dialog or
+        // standing alone, unless routed already
+        if !is_register_request && !is_in_dialog(&req_message) {
+            if let Some(headers) = req_message.headers() {
+                if header::search(headers, b"Route", true).is_none() {
+                    for route in transport.get_service_route() {
+                        req_message.add_header(Header::new(b"Route", route));
+                    }
+                }
+            }
+        }
+
         // to-do: might need to update Contact header
 
         let transports = Arc::clone(&self.transports);
@@ -598,4 +613,14 @@ impl SipTransactionManager {
             }
         });
     }
+}
+
+/// Whether `message` is sent in a dialog, its To having a tag
+fn is_in_dialog(message: &SipMessage) -> bool {
+    if let Some(headers) = message.headers() {
+        if let Some(to) = header::search(headers, b"To", true) {
+            return to.get_value().as_header_field().as_from_to().tag.is_some();
+        }
+    }
+    false
 }
