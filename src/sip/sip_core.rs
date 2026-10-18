@@ -139,8 +139,17 @@ impl SipCore {
                             if let Some(lh_dialog_identifier) =
                                 (call_id, from, to, false).get_dialog_identifier()
                             {
-                                if !SERVER_SUPPORT_RFC_6665 {
-                                    if req_line.method == NOTIFY {
+                                if !SERVER_SUPPORT_RFC_6665 && req_line.method == NOTIFY {
+                                    // the first NOTIFY of a subscription makes it, and
+                                    // takes the dialog its SUBSCRIBE's 2xx made; later
+                                    // ones are for the subscription the dialog has
+                                    let subscribed =
+                                        ongoing_dialogs.lock().unwrap().iter().any(|dialog| {
+                                            dialog.dialog_identifier() == lh_dialog_identifier
+                                                && dialog.has_users()
+                                        });
+
+                                    if !subscribed {
                                         process_out_of_dialog_server_transaction(
                                             sm,
                                             tm,
