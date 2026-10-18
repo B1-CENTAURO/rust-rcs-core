@@ -165,7 +165,10 @@ impl SipDialog {
                 let req_from = req_from_header_field.as_from_to();
                 let resp_to_header_field = resp_to_header.get_value().as_header_field();
                 let resp_to = resp_to_header_field.as_from_to();
-                let contact_addresses = contact_header.get_value().as_name_addresses();
+                // the address before the header parameters, the feature tags
+                // of RCS among them, which may hold quoted strings
+                let contact_header_field = contact_header.get_value().as_header_field();
+                let contact_addresses = contact_header_field.value.as_name_addresses();
 
                 if let (Some(req_cseq), Some(req_from_tag), Some(resp_to_tag)) =
                     (req_cseq, req_from.tag, resp_to.tag)
@@ -504,8 +507,10 @@ impl SipDialog {
                                 if let Some(contact_header) =
                                     header::search(headers, b"Contact", true)
                                 {
+                                    let contact_header_field =
+                                        contact_header.get_value().as_header_field();
                                     let contact_addresses =
-                                        contact_header.get_value().as_name_addresses();
+                                        contact_header_field.value.as_name_addresses();
                                     let contact_address = contact_addresses.first();
                                     if let Some(contact_address) = contact_address {
                                         if let Some(uri_part) = &contact_address.uri_part {
@@ -718,7 +723,8 @@ impl SipDialog {
         // the Route (RFC 3261 section 12.2.1.1); with lr the request goes to
         // the remote target, the route set as it is
         if let Some(route) = final_route_set.first() {
-            let addresses = route.as_name_addresses();
+            let route_field = route.as_header_field();
+            let addresses = route_field.value.as_name_addresses();
             let uri_part = match addresses.first() {
                 Some(addr) => match &addr.uri_part {
                     Some(uri_part) => uri_part,

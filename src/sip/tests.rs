@@ -907,3 +907,57 @@ fn a_response_in_a_dialog_takes_no_record_route() {
     assert!(header_values(&ok, b"Record-Route").is_empty());
     assert_eq!(to_tag(&ok), Some(String::from("alice1")));
 }
+
+#[test]
+fn a_dialog_is_made_with_a_contact_carrying_feature_tags() {
+    use super::sip_transaction::server_transaction::make_response;
+
+    let feature_tags = ";+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\";+sip.instance=\"<urn:uuid:1>\"";
+
+    // as UAS, the Contact of the request
+    let invite = parse(
+        &INVITE_THROUGH_PROXIES.replace(
+            "Contact: <sip:bob@198.51.100.7:5060;transport=tcp>",
+            &format!(
+                "Contact: <sip:bob@198.51.100.7:5060;transport=tcp>{}",
+                feature_tags
+            ),
+        ),
+        b"",
+    );
+    let ok = make_response(&invite, &Arc::new(std::sync::Mutex::new(None)), 200, b"OK").unwrap();
+    let dialog = SipDialog::try_new_as_uas(&invite, &ok, |_| {}).unwrap();
+    let bye = dialog.make_request(BYE, None).unwrap();
+    assert_eq!(request_uri(&bye), "sip:bob@198.51.100.7:5060;transport=tcp");
+
+    // as UAC, the Contact of the response
+    let request_headers = parse(
+        "INVITE sip:bob@example.com SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKalice\r\n\
+From: <sip:alice@example.com>;tag=alice1\r\n\
+To: <sip:bob@example.com>\r\n\
+Call-ID: tags\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:alice@192.0.2.10:5060;transport=tcp>\r\n",
+        b"",
+    )
+    .headers()
+    .unwrap()
+    .to_vec();
+    let ok = parse(
+        &format!(
+            "SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKalice\r\n\
+From: <sip:alice@example.com>;tag=alice1\r\n\
+To: <sip:bob@example.com>;tag=bob1\r\n\
+Call-ID: tags\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:bob@198.51.100.7:5060;transport=tcp>{}\r\n",
+            feature_tags
+        ),
+        b"",
+    );
+    let dialog = SipDialog::try_new_as_uac(&request_headers, &ok, |_| {}).unwrap();
+    let bye = dialog.make_request(BYE, None).unwrap();
+    assert_eq!(request_uri(&bye), "sip:bob@198.51.100.7:5060;transport=tcp");
+}
