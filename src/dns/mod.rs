@@ -16,6 +16,7 @@ extern crate hickory_client;
 extern crate tokio;
 extern crate tokio_stream;
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
@@ -30,11 +31,10 @@ use tokio::time::{Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 use hickory_client::client::{AsyncClient, ClientHandle as _};
-use hickory_client::rr::{DNSClass, Name, RData, RecordType};
+use hickory_client::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_client::udp::UdpClientStream;
 
 use crate::ffi::log::platform_log;
-use crate::util::raw_string::StrEq;
 
 const LOG_TAG: &str = "dns";
 
@@ -81,297 +81,210 @@ impl DnsClient {
 
             'next: loop {
                 match rx.recv().await {
-                    Some(dr) => {
-                        match dr {
-                            DnsRequest::Default(config, host, tx) => {
+                    Some(dr) => match dr {
+                        DnsRequest::Default(config, host, tx) => {
+                            platform_log(LOG_TAG, "getting dns request");
 
-                                platform_log(LOG_TAG, "getting dns request");
+                            let now = Instant::now();
+                            let mut cached = Vec::new();
 
-                                let now = Instant::now();
-                                let mut cached = Vec::new();
+                            {
+                                let guard = cache_a_aaaa.lock().unwrap();
 
-                                {
-                                    let guard = cache_a_aaaa.lock().unwrap();
-
-                                    if let Some(cached_addresses) = guard.get(&host) {
-                                        for (expire, ip) in cached_addresses {
-                                            if expire > &now {
-                                                cached.push(*ip);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if cached.is_empty() {
-                                    let cache = Arc::clone(&cache_a_aaaa);
-
-                                    platform_log(LOG_TAG, "start dns");
-
-                                    tokio::spawn(async move {
-                                        for server_addr in config.server_addrs {
-                                            let stream = UdpClientStream::<UdpSocket>::new(server_addr);
-
-                                            let mut successful = false;
-
-                                            if let Ok((mut client, bg)) = AsyncClient::connect(stream).await
-                                            {
-                                                platform_log(LOG_TAG, "dns server connected");
-
-                                                tokio::spawn(async move {
-                                                    bg.await.unwrap();
-                                                });
-
-                                                if let Ok(name) = Name::from_str(&host) {
-                                                    platform_log(LOG_TAG, "start AAAA query");
-
-                                                    match time::timeout_at(
-                                                        Instant::now() + Duration::from_secs(15),
-                                                        client.query(name, DNSClass::IN, RecordType::AAAA),
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(r) => {
-                                                            if let Ok(resp) = r {
-                                                                for r in resp.answers() {
-                                                                    if let Some(&RData::AAAA(addr)) =
-                                                                        r.data()
-                                                                    {
-                                                                        successful = true;
-
-                                                                        let addr = IpAddr::V6(addr.0);
-                                                                        let ttl = r.ttl();
-
-                                                                        if ttl > 0 {
-                                                                            update_a_aaaa_cache(
-                                                                                &cache, addr, ttl, &host,
-                                                                            );
-                                                                        }
-
-                                                                        match tx.send(addr).await {
-                                                                            Ok(()) => {}
-
-                                                                            Err(_) => {
-                                                                                return;
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-
-                                                        Err(_) => {
-                                                            platform_log(LOG_TAG, "dns timeout");
-                                                        }
-                                                    }
-                                                }
-
-                                                if let Ok(name) = Name::from_str(&host) {
-                                                    platform_log(LOG_TAG, "start A query");
-
-                                                    match time::timeout_at(
-                                                        Instant::now() + Duration::from_secs(15),
-                                                        client.query(name, DNSClass::IN, RecordType::A),
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(r) => {
-                                                            if let Ok(resp) = r {
-                                                                for r in resp.answers() {
-                                                                    if let Some(&RData::A(addr)) = r.data()
-                                                                    {
-                                                                        successful = true;
-
-                                                                        let addr = IpAddr::V4(addr.0);
-                                                                        let ttl = r.ttl();
-
-                                                                        if ttl > 0 {
-                                                                            update_a_aaaa_cache(
-                                                                                &cache, addr, ttl, &host,
-                                                                            );
-                                                                        }
-
-                                                                        match tx.send(addr).await {
-                                                                            Ok(()) => {}
-
-                                                                            Err(_) => {
-                                                                                return;
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-
-                                                        Err(_) => {
-                                                            platform_log(LOG_TAG, "dns timeout");
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            if successful {
-                                                return;
-                                            }
-                                        }
-                                    });
-                                } else {
-                                    for addr in cached {
-                                        match tx.send(addr).await {
-                                            Ok(()) => {}
-
-                                            Err(_) => {
-                                                continue 'next;
-                                            }
+                                if let Some(cached_addresses) = guard.get(&host) {
+                                    for (expire, ip) in cached_addresses {
+                                        if expire > &now {
+                                            cached.push(*ip);
                                         }
                                     }
                                 }
                             }
 
-                            DnsRequest::SipNaptr(config, q_name, q_service_type, tx) => {
+                            if cached.is_empty() {
+                                let cache = Arc::clone(&cache_a_aaaa);
 
-                                platform_log(LOG_TAG, "getting dns request");
+                                platform_log(LOG_TAG, "start dns");
 
-                                let now = Instant::now();
-                                let mut cached = Vec::new();
+                                tokio::spawn(async move {
+                                    for server_addr in config.server_addrs {
+                                        let stream = UdpClientStream::<UdpSocket>::new(server_addr);
 
-                                {
-                                    let guard = cache_naptr_srv.lock().unwrap();
+                                        let mut successful = false;
 
-                                    if let Some(cached_addresses) = guard.get(&q_name) {
-                                        for (expire, service_type, target, port) in cached_addresses {
-                                            if expire > &now && q_service_type.eq(service_type) {
-                                                cached.push((String::from(target), *port));
-                                            }
-                                        }
-                                    }
-                                }
+                                        if let Ok((mut client, bg)) =
+                                            AsyncClient::connect(stream).await
+                                        {
+                                            platform_log(LOG_TAG, "dns server connected");
 
-                                if cached.is_empty() {
+                                            tokio::spawn(async move {
+                                                bg.await.unwrap();
+                                            });
 
-                                    let cache = Arc::clone(&cache_naptr_srv);
+                                            if let Ok(name) = Name::from_str(&host) {
+                                                platform_log(LOG_TAG, "start AAAA query");
 
-                                    tokio::spawn(async move {
-                                        for server_addr in config.server_addrs {
-                                            let stream = UdpClientStream::<UdpSocket>::new(server_addr);
+                                                match time::timeout_at(
+                                                    Instant::now() + Duration::from_secs(15),
+                                                    client.query(
+                                                        name,
+                                                        DNSClass::IN,
+                                                        RecordType::AAAA,
+                                                    ),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(r) => {
+                                                        if let Ok(resp) = r {
+                                                            for r in resp.answers() {
+                                                                if let Some(&RData::AAAA(addr)) =
+                                                                    r.data()
+                                                                {
+                                                                    successful = true;
 
-                                            let mut successful = false;
+                                                                    let addr = IpAddr::V6(addr.0);
+                                                                    let ttl = r.ttl();
 
-                                            if let Ok((mut client, bg)) = AsyncClient::connect(stream).await
-                                            {
-                                                platform_log(LOG_TAG, "dns server connected");
+                                                                    if ttl > 0 {
+                                                                        update_a_aaaa_cache(
+                                                                            &cache, addr, ttl,
+                                                                            &host,
+                                                                        );
+                                                                    }
 
-                                                tokio::spawn(async move {
-                                                    bg.await.unwrap();
-                                                });
+                                                                    match tx.send(addr).await {
+                                                                        Ok(()) => {}
 
-                                                if let Ok(name) = Name::from_str(&q_name) {
-                                                    platform_log(LOG_TAG, "start NAPTR query");
-
-                                                    match time::timeout_at(
-                                                        Instant::now() + Duration::from_secs(15),
-                                                        client.query(name, DNSClass::IN, RecordType::NAPTR),
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(r) => {
-                                                            if let Ok(resp) = r {
-                                                                for r in resp.answers() {
-                                                                    if let Some(rd) =
-                                                                        r.data()
-                                                                    {
-                                                                        if let RData::NAPTR(ptr) = rd {
-
-                                                                            if ptr.services().equals_string(&q_service_type, false) {
-
-                                                                                let replacement = ptr.replacement().clone();
-
-                                                                                platform_log(LOG_TAG, format!("naptr replacement: {:?}", &replacement));
-
-                                                                                platform_log(LOG_TAG, "start SRV query");
-
-                                                                                match time::timeout_at(
-                                                                                    Instant::now() + Duration::from_secs(15),
-                                                                                    client.query(replacement, DNSClass::IN, RecordType::SRV),
-                                                                                )
-                                                                                .await {
-                                                                                    Ok(r) => {
-
-                                                                                        if let Ok(resp) = r {
-                                                                                            for r in resp.answers() {
-                                                                                                if let Some(rd) =
-                                                                                                    r.data()
-                                                                                                {
-                                                                                                    if let RData::SRV(srv) = rd {
-                                                                                                        successful = true;
-
-                                                                                                        let target = srv.target();
-                                                                                                        platform_log(LOG_TAG, format!("srv target: {:?}", target));
-                                                                                                        let target = target.to_string();
-                                                                                                        let target = if target.ends_with('.') {
-                                                                                                            String::from(&target[0..target.len() - 1])
-                                                                                                        } else {
-                                                                                                            target
-                                                                                                        };
-                                                                                                        let port = srv.port();
-
-                                                                                                        let ttl = r.ttl();
-
-                                                                                                        if ttl > 0 {
-                                                                                                            update_naptr_srv_cache(
-                                                                                                                &cache, &target, port, ttl, &q_name, &q_service_type,
-                                                                                                            );
-                                                                                                        }
-
-                                                                                                        match tx.send((target, port)).await {
-                                                                                                            Ok(()) => {}
-
-                                                                                                            Err(_) => {
-                                                                                                                return;
-                                                                                                            }
-                                                                                                        }
-                                                                                                    }
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                    }
-
-                                                                                    Err(_) => {
-                                                                                        platform_log(LOG_TAG, "dns timeout");
-                                                                                    }
-                                                                                }
-                                                                            }
+                                                                        Err(_) => {
+                                                                            return;
                                                                         }
                                                                     }
                                                                 }
                                                             }
                                                         }
+                                                    }
 
-                                                        Err(_) => {
-                                                            platform_log(LOG_TAG, "dns timeout");
-                                                        }
+                                                    Err(_) => {
+                                                        platform_log(LOG_TAG, "dns timeout");
                                                     }
                                                 }
                                             }
 
-                                            if successful {
-                                                return;
+                                            if let Ok(name) = Name::from_str(&host) {
+                                                platform_log(LOG_TAG, "start A query");
+
+                                                match time::timeout_at(
+                                                    Instant::now() + Duration::from_secs(15),
+                                                    client.query(name, DNSClass::IN, RecordType::A),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(r) => {
+                                                        if let Ok(resp) = r {
+                                                            for r in resp.answers() {
+                                                                if let Some(&RData::A(addr)) =
+                                                                    r.data()
+                                                                {
+                                                                    successful = true;
+
+                                                                    let addr = IpAddr::V4(addr.0);
+                                                                    let ttl = r.ttl();
+
+                                                                    if ttl > 0 {
+                                                                        update_a_aaaa_cache(
+                                                                            &cache, addr, ttl,
+                                                                            &host,
+                                                                        );
+                                                                    }
+
+                                                                    match tx.send(addr).await {
+                                                                        Ok(()) => {}
+
+                                                                        Err(_) => {
+                                                                            return;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+
+                                                    Err(_) => {
+                                                        platform_log(LOG_TAG, "dns timeout");
+                                                    }
+                                                }
                                             }
                                         }
-                                    });
 
-                                } else {
-                                    for res in cached {
-                                        match tx.send(res).await {
-                                            Ok(()) => {}
+                                        if successful {
+                                            return;
+                                        }
+                                    }
+                                });
+                            } else {
+                                for addr in cached {
+                                    match tx.send(addr).await {
+                                        Ok(()) => {}
 
-                                            Err(_) => {
-                                                continue 'next;
-                                            }
+                                        Err(_) => {
+                                            continue 'next;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        DnsRequest::SipNaptr(config, q_name, q_service_type, tx) => {
+                            platform_log(LOG_TAG, "getting dns request");
+
+                            let now = Instant::now();
+                            let mut cached = Vec::new();
+
+                            {
+                                let guard = cache_naptr_srv.lock().unwrap();
+
+                                if let Some(cached_addresses) = guard.get(&q_name) {
+                                    for (expire, service_type, target, port) in cached_addresses {
+                                        if expire > &now && q_service_type.eq(service_type) {
+                                            cached.push((String::from(target), *port));
                                         }
                                     }
                                 }
                             }
 
+                            if cached.is_empty() {
+                                let cache = Arc::clone(&cache_naptr_srv);
+
+                                tokio::spawn(async move {
+                                    for (target, port, ttl) in
+                                        resolve_sip_service(&config, &q_name, &q_service_type).await
+                                    {
+                                        if ttl > 0 {
+                                            update_naptr_srv_cache(
+                                                &cache,
+                                                &target,
+                                                port,
+                                                ttl,
+                                                &q_name,
+                                                &q_service_type,
+                                            );
+                                        }
+
+                                        if tx.send((target, port)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                });
+                            } else {
+                                for res in cached {
+                                    match tx.send(res).await {
+                                        Ok(()) => {}
+
+                                        Err(_) => {
+                                            continue 'next;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     },
                     None => break,
@@ -401,6 +314,12 @@ impl DnsClient {
         host: String,
     ) -> Result<ReceiverStream<IpAddr>> {
         let (tx, rx) = mpsc::channel::<IpAddr>(1);
+
+        // an address needs no looking up
+        if let Ok(ip) = host.trim_start_matches('[').trim_end_matches(']').parse() {
+            let _ = tx.send(ip).await;
+            return Ok(ReceiverStream::new(rx));
+        }
 
         match self
             .tx
@@ -472,6 +391,167 @@ impl DnsClient {
                 }
             }
         }
+    }
+}
+
+/// The targets to try for the SIP service `service` of `domain`, such as
+/// SIPS+D2T, in the order of RFC 3263 section 4: through its NAPTR records,
+/// through its SRV records if it has no NAPTR record for the service, and
+/// itself on the service's default port if it has neither. Each comes with
+/// the time to cache it for, none for the last.
+async fn resolve_sip_service(
+    config: &DnsConfig,
+    domain: &str,
+    service: &str,
+) -> Vec<(String, u16, u32)> {
+    let default = vec![(String::from(domain), default_sip_port(service), 0)];
+
+    if domain
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .is_ok()
+    {
+        return default;
+    }
+
+    let name = match Name::from_str(domain) {
+        Ok(name) => name,
+        Err(_) => return Vec::new(),
+    };
+
+    for server_addr in &config.server_addrs {
+        let stream = UdpClientStream::<UdpSocket>::new(*server_addr);
+        let mut client = match AsyncClient::connect(stream).await {
+            Ok((client, bg)) => {
+                tokio::spawn(async move {
+                    let _ = bg.await;
+                });
+                client
+            }
+            Err(_) => continue,
+        };
+
+        platform_log(LOG_TAG, "start NAPTR query");
+        let naptr_answers = match query(&mut client, name.clone(), RecordType::NAPTR).await {
+            Some(answers) => answers,
+            None => continue, // on to the next server
+        };
+
+        let mut targets = Vec::new();
+        for replacement in naptr_order(&naptr_answers, service) {
+            platform_log(LOG_TAG, format!("naptr replacement: {:?}", &replacement));
+            if let Some(answers) = query(&mut client, replacement, RecordType::SRV).await {
+                targets.extend(srv_order(&answers));
+            }
+        }
+
+        if targets.is_empty() {
+            if let Some(srv_name) = sip_srv_name(service, domain) {
+                if let Ok(srv_name) = Name::from_str(&srv_name) {
+                    platform_log(LOG_TAG, "start SRV query");
+                    if let Some(answers) = query(&mut client, srv_name, RecordType::SRV).await {
+                        targets.extend(srv_order(&answers));
+                    }
+                }
+            }
+        }
+
+        if targets.is_empty() {
+            return default;
+        }
+
+        return targets;
+    }
+
+    Vec::new()
+}
+
+/// The answers to a query, none if the server did not answer
+async fn query(
+    client: &mut AsyncClient,
+    name: Name,
+    record_type: RecordType,
+) -> Option<Vec<Record>> {
+    match time::timeout(
+        Duration::from_secs(15),
+        client.query(name, DNSClass::IN, record_type),
+    )
+    .await
+    {
+        Ok(Ok(response)) => Some(response.answers().to_vec()),
+        Ok(Err(e)) => {
+            platform_log(LOG_TAG, format!("dns error {:?}", e));
+            None
+        }
+        Err(_) => {
+            platform_log(LOG_TAG, "dns timeout");
+            None
+        }
+    }
+}
+
+/// The replacements of the NAPTR records leading to `service` through SRV
+/// records, lowest order and then preference first
+fn naptr_order(answers: &[Record], service: &str) -> Vec<Name> {
+    let mut naptrs: Vec<_> = answers
+        .iter()
+        .filter_map(|r| match r.data() {
+            Some(RData::NAPTR(naptr)) => Some(naptr),
+            _ => None,
+        })
+        .filter(|naptr| {
+            naptr.services().eq_ignore_ascii_case(service.as_bytes())
+                && naptr.flags().eq_ignore_ascii_case(b"s")
+        })
+        .collect();
+    naptrs.sort_by_key(|naptr| (naptr.order(), naptr.preference()));
+    naptrs
+        .into_iter()
+        .map(|naptr| naptr.replacement().clone())
+        .collect()
+}
+
+/// The targets of SRV records, with their ports and TTLs: lowest priority
+/// first and, in place of the weighted random choice of RFC 2782, the
+/// heaviest first within a priority
+fn srv_order(answers: &[Record]) -> Vec<(String, u16, u32)> {
+    let mut srvs: Vec<_> = answers
+        .iter()
+        .filter_map(|r| match r.data() {
+            Some(RData::SRV(srv)) => Some((srv, r.ttl())),
+            _ => None,
+        })
+        .collect();
+    srvs.sort_by_key(|(srv, _)| (srv.priority(), Reverse(srv.weight())));
+    srvs.into_iter()
+        .filter(|(srv, _)| !srv.target().is_root()) // "." means none
+        .map(|(srv, ttl)| {
+            let target = srv.target().to_string();
+            let target = target.strip_suffix('.').unwrap_or(&target).to_string();
+            (target, srv.port(), ttl)
+        })
+        .collect()
+}
+
+/// The SRV name of `service` for `domain`, `_sips._tcp.example.com` for
+/// SIPS+D2T
+fn sip_srv_name(service: &str, domain: &str) -> Option<String> {
+    let prefix = match &service.to_ascii_uppercase()[..] {
+        "SIP+D2T" => "_sip._tcp",
+        "SIPS+D2T" => "_sips._tcp",
+        "SIP+D2U" => "_sip._udp",
+        _ => return None,
+    };
+    Some(format!("{}.{}", prefix, domain))
+}
+
+/// 5061 for SIP over TLS, 5060 otherwise (RFC 3261 section 19.1.2)
+pub fn default_sip_port(service: &str) -> u16 {
+    if service.to_ascii_uppercase().starts_with("SIPS") {
+        5061
+    } else {
+        5060
     }
 }
 
@@ -559,3 +639,6 @@ impl Clone for ErrorKind {
 }
 
 pub type Result<T> = std::result::Result<T, ErrorKind>;
+
+#[cfg(test)]
+mod tests;
