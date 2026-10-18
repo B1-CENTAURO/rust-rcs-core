@@ -12,10 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod cpim_header_value;
 pub mod cpim_info;
 pub mod cpim_message;
 pub mod cpim_namespace;
 
+#[cfg(test)]
+mod tests;
+
+pub use cpim_header_value::escape;
+pub use cpim_header_value::unescape;
+pub use cpim_header_value::CPIMHeaderValue;
 pub use cpim_info::CPIMInfo;
 pub use cpim_message::CPIMHeaders;
 pub use cpim_message::CPIMMessage;

@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use crate::internet::header::Header;
+use crate::internet::syntax;
 
 pub struct CPIMNamespace {
     registered_namespaces: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -34,51 +35,86 @@ impl<'r> CPIMNamespace {
         self.registered_namespaces.insert(n, v);
     }
 
-    pub fn as_inflator(&'r self) -> Box<dyn Fn(&Header) -> (Vec<u8>, &[u8]) + 'r> {
-        Box::new(|header| {
-            let mut iter = header.get_name().iter();
-            if let Some(position) = iter.position(|c| *c == b'.') {
-                for (k, v) in &self.registered_namespaces {
-                    if &header.get_name()[..position] == k {
-                        let mut inflated = b"<".to_vec();
-                        inflated.extend(v);
-                        inflated.extend(b">.");
-                        inflated.extend(iter);
-                        return (inflated, header.get_value());
-                    }
+    /// `name` with its namespace prefix, if registered, written out as the
+    /// namespace URI: `imdn.Message-ID` as `<urn:ietf:params:imdn>.Message-ID`
+    pub fn inflate(&self, name: &[u8]) -> Vec<u8> {
+        let mut iter = name.iter();
+        if let Some(position) = iter.position(|c| *c == b'.') {
+            for (k, v) in &self.registered_namespaces {
+                if &name[..position] == k {
+                    let mut inflated = b"<".to_vec();
+                    inflated.extend(v);
+                    inflated.extend(b">.");
+                    inflated.extend(iter);
+                    return inflated;
                 }
             }
+        }
 
-            (header.get_name().to_vec(), header.get_value())
-        })
+        name.to_vec()
     }
 
-    pub fn as_deflator(&'r self) -> Box<dyn Fn(&Header) -> (Option<Header>, Cow<Header>) + 'r> {
-        Box::new(|header| {
-            for (k, v) in &self.registered_namespaces {
-                if header.get_name().starts_with(k) {
-                    if k.len() < header.get_name().len() {
-                        if header.get_name()[k.len()] == b'.' {
-                            let mut ns = k.clone();
-                            ns.extend(b"<");
-                            ns.extend_from_slice(header.get_name());
-                            ns.extend(b">");
-                            let h1 = Header::new(b"NS", ns);
-                            let mut deflated = v.clone();
-                            if k.len() == 0 {
-                                deflated.extend(b".");
-                                deflated.extend_from_slice(header.get_name());
-                            } else {
-                                deflated.extend_from_slice(&header.get_name()[..k.len()]);
-                            }
-                            let h2 = Header::new(deflated, header.get_value().to_vec());
-                            return (Some(h1), Cow::Owned(h2));
-                        }
-                    }
-                }
-            }
+    pub fn as_inflator(&'r self) -> Box<dyn Fn(&Header) -> (Vec<u8>, &[u8]) + 'r> {
+        Box::new(|header| (self.inflate(header.get_name()), header.get_value()))
+    }
 
-            (None, Cow::Borrowed(header))
+    /// `name` as inflate() writes it with the namespace URI, if registered
+    /// with a prefix, written with the prefix: `<urn:ietf:params:imdn>.Message-ID`
+    /// as `imdn.Message-ID`
+    pub fn deflate(&self, name: &[u8]) -> Vec<u8> {
+        if let Some((prefix, local_name)) = self.deflation(name) {
+            [prefix, b".", local_name].concat()
+        } else {
+            name.to_vec()
+        }
+    }
+
+    /// The prefix and name within the namespace of `name` as inflate() writes it
+    fn deflation<'a>(&'a self, name: &'a [u8]) -> Option<(&'a [u8], &'a [u8])> {
+        let end = name
+            .strip_prefix(b"<")?
+            .windows(2)
+            .position(|w| w == b">.")?
+            + 1;
+        let uri = &name[1..end];
+        self.registered_namespaces
+            .iter()
+            .find(|(k, v)| !k.is_empty() && *v == uri)
+            .map(|(k, _)| (&k[..], &name[end + 2..]))
+    }
+
+    /// The namespace URI registered for `prefix`
+    pub fn uri(&self, prefix: &[u8]) -> Option<&[u8]> {
+        self.registered_namespaces.get(prefix).map(|v| &v[..])
+    }
+
+    /// The prefix and namespace URI an NS header's value declares, the prefix
+    /// empty for a default namespace
+    pub fn parse_declaration(value: &[u8]) -> Option<(&[u8], &[u8])> {
+        let start = value.iter().position(|c| *c == b'<')?;
+        let end = start + 1 + value[start + 1..].iter().position(|c| *c == b'>')?;
+        Some((
+            syntax::trim(&value[..start]),
+            syntax::trim(&value[start + 1..end]),
+        ))
+    }
+
+    /// A deflator, taking a header named as inflate() names it to the header
+    /// named as deflate() names it and the NS header declaring the prefix:
+    /// `imdn.Message-ID` and `NS: imdn <urn:ietf:params:imdn>`
+    pub fn as_deflator(&'r self) -> Box<dyn Fn(&Header) -> (Option<Header>, Cow<Header>) + 'r> {
+        Box::new(|header| match self.deflation(header.get_name()) {
+            Some((prefix, local_name)) => {
+                let uri = &self.registered_namespaces[prefix];
+                (
+                    Some(Header::new(b"NS", [prefix, b" <", uri, b">"].concat())),
+                    Cow::Owned(Header::new(
+                        [prefix, b".", local_name].concat(),
+                        header.get_value().to_vec(),
+                    )),
+                )
+            }
+            None => (None, Cow::Borrowed(header)),
         })
     }
 }

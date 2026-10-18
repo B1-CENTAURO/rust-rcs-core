@@ -16,6 +16,9 @@ pub mod message_body;
 pub mod multipart_body;
 pub mod streamed_body;
 
+#[cfg(test)]
+mod tests;
+
 use std::{
     fmt,
     fs::File,
