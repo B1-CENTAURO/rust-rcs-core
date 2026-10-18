@@ -18,7 +18,12 @@ use crate::ffi::log::platform_log;
 use crate::sip::sip_message::build_message_data;
 use crate::sip::SipTransport;
 
+use crate::internet::header::{self, Header, HeaderSearch};
+use crate::internet::header_field::AsHeaderField;
+use crate::sip::sip_headers::cseq::AsCSeq;
+
 use super::super::sip_message::SipMessage;
+use super::super::sip_message::ACK;
 
 use super::client_transaction::ClientTransactionCallbacks;
 
@@ -169,9 +174,14 @@ impl ICTransaction {
                 match guard.0 {
                     State::Calling | State::Proceeding => {
                         guard.0 = State::Completed;
+                        // the transaction itself acknowledges a final
+                        // response other than 2xx, and again for each
+                        // retransmission of it (RFC 3261 section 17.1.1.3)
+                        guard.1 = make_ack(&self.message, &resp_message);
+                        if let Some(ack_message) = &guard.1 {
+                            self.perform_send(ack_message);
+                        }
                         self.callbacks.on_final_response(resp_message);
-                        guard.1 = None;
-                        // (self.transport_function)(&self.transport, data);
                         return Ok((true, false));
                     }
                     State::Completed => {
@@ -187,4 +197,35 @@ impl ICTransaction {
 
         Err("Wrong state")
     }
+}
+
+/// The ACK to `response`, a final response other than 2xx to `invite`: its
+/// Request-URI, Call-ID, From, top Via, Route and sequence number, with the To
+/// of the response (RFC 3261 section 17.1.1.3)
+fn make_ack(invite: &SipMessage, response: &SipMessage) -> Option<SipMessage> {
+    let (req_line, req_headers) = match invite {
+        SipMessage::Request(req_line, Some(req_headers), _) => (req_line, req_headers),
+        _ => return None,
+    };
+    let resp_headers = response.headers()?;
+
+    let via = header::search(req_headers, b"Via", true)?;
+    let call_id = header::search(req_headers, b"Call-ID", true)?;
+    let from = header::search(req_headers, b"From", true)?;
+    let to = header::search(resp_headers, b"To", true)?;
+    let cseq = header::search(req_headers, b"CSeq", true)?;
+    let seq = cseq.get_value().as_header_field().as_cseq()?.seq;
+
+    let mut ack = SipMessage::new_request(ACK, &req_line.uri);
+    ack.add_header(Header::new(b"Via", via.get_value().to_vec()));
+    ack.add_header(Header::new(b"Max-Forwards", b"70"));
+    ack.add_header(Header::new(b"From", from.get_value().to_vec()));
+    ack.add_header(Header::new(b"To", to.get_value().to_vec()));
+    ack.add_header(Header::new(b"Call-ID", call_id.get_value().to_vec()));
+    ack.add_header(Header::new(b"CSeq", format!("{} ACK", seq)));
+    for route in HeaderSearch::new(req_headers, b"Route", true) {
+        ack.add_header(Header::new(b"Route", route.get_value().to_vec()));
+    }
+    ack.add_header(Header::new(b"Content-Length", b"0"));
+    Some(ack)
 }

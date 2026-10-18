@@ -961,3 +961,47 @@ Contact: <sip:bob@198.51.100.7:5060;transport=tcp>{}\r\n",
     let bye = dialog.make_request(BYE, None).unwrap();
     assert_eq!(request_uri(&bye), "sip:bob@198.51.100.7:5060;transport=tcp");
 }
+
+#[test]
+fn a_refusal_of_an_invite_is_acknowledged_by_the_transaction() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (tm, _tm_events) = SipTransactionManager::new(&rt);
+    let tm = Arc::new(tm);
+    let transport = Arc::new(SipTransport::new::<DuplexStream>(
+        String::from("192.0.2.10:5060"),
+        SipTransportType::TCP,
+    ));
+    let (ours, theirs) = tokio::io::duplex(65536);
+    let tx = setup_sip_transport(&transport, ours, tm.get_ctrl_itf(), Arc::clone(&rt), || {});
+    tm.register_sip_transport(Arc::clone(&transport), tx);
+    let mut peer = Peer {
+        stream: theirs,
+        parser: SipParser::new(),
+    };
+
+    let mut invite = SipMessage::new_request(super::INVITE, b"sip:bob@example.com");
+    invite.add_header(Header::new(b"Call-ID", b"refused"));
+    invite.add_header(Header::new(b"CSeq", b"7 INVITE"));
+    invite.add_header(Header::new(b"From", b"<sip:alice@example.com>;tag=alice1"));
+    invite.add_header(Header::new(b"To", b"<sip:bob@example.com>"));
+    invite.add_header(Header::new(b"Route", b"<sip:pcscf.example.com;lr>"));
+    invite.add_header(Header::new(b"Contact", b"<sip:alice@192.0.2.10:5060>"));
+    tm.send_request(invite, &transport, NoCallbacks, &rt);
+
+    let invite = peer.next(&rt);
+    let busy = ok(&invite, "bob1", "").replace("SIP/2.0 200 OK", "SIP/2.0 486 Busy Here");
+    peer.send(&rt, &busy);
+
+    let ack = peer.next(&rt);
+    match &ack {
+        SipMessage::Request(line, _, _) => {
+            assert_eq!(line.method, b"ACK");
+            assert_eq!(line.uri, b"sip:bob@example.com");
+        }
+        _ => panic!("not a request"),
+    }
+    assert_eq!(header_value(&ack, b"Via"), header_value(&invite, b"Via"));
+    assert_eq!(header_value(&ack, b"CSeq"), b"7 ACK");
+    assert_eq!(header_value(&ack, b"To"), b"<sip:bob@example.com>;tag=bob1");
+    assert_eq!(header_value(&ack, b"Route"), b"<sip:pcscf.example.com;lr>");
+}
