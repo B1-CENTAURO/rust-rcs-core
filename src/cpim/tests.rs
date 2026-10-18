@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use crate::imdn::GetIMDNInfo;
 use crate::internet::body::message_body::MessageBody;
+use crate::internet::body::multipart_body::MultipartBody;
 use crate::internet::body::Body;
 use crate::internet::header::Header;
 use crate::io::DynamicChain;
@@ -500,5 +501,195 @@ fn the_deflator_gives_prefixed_names_and_their_declarations() {
         let (declaration, deflated) = deflator(&header);
         assert!(declaration.is_none());
         assert_eq!(deflated.get_name(), name);
+    }
+}
+
+#[test]
+fn an_rcs_chat_message_is_read() {
+    for (content_headers, content, base64) in [
+        (
+            "Content-Type: text/plain;charset=UTF-8\r\nContent-Length: 11\r\n",
+            &b"Hello, Bob!"[..],
+            false,
+        ),
+        (
+            "Content-Type: text/plain;charset=UTF-8\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Length: 16\r\n",
+            b"SGVsbG8sIEJvYiE=",
+            true,
+        ),
+    ] {
+        let data = [
+            &b"From: <sip:anonymous@anonymous.invalid>\r\n\
+To: <sip:anonymous@anonymous.invalid>\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: Kn31\r\n\
+DateTime: 2023-04-04T12:16:49.000+08:00\r\n\
+imdn.Disposition-Notification: positive-delivery, display\r\n\
+NS: cpm <http://www.openmobilealliance.org/cpm/>\r\n\
+cpm.Payload-Type: text\r\n\
+\r\n"[..],
+            content_headers.as_bytes(),
+            b"\r\n",
+            content,
+        ]
+        .concat();
+        let message = parse(&data);
+
+        let info = message.get_info().unwrap();
+        assert_eq!(info.imdn_message_id, b"Kn31");
+        assert_eq!(info.from, b"<sip:anonymous@anonymous.invalid>");
+        assert_eq!(info.to, b"<sip:anonymous@anonymous.invalid>");
+        assert_eq!(info.date, b"2023-04-04T12:16:49.000+08:00");
+        assert_eq!(
+            info.from_uri
+                .unwrap()
+                .string_representation_without_query_and_fragment(),
+            b"sip:anonymous@anonymous.invalid"
+        );
+        assert_eq!(info.payload_type, Some(&b"text"[..]));
+        assert_eq!(
+            info.disposition_notification,
+            Some(&b"positive-delivery, display"[..])
+        );
+
+        assert_eq!(
+            message.get_message_body(),
+            Some((Some(&b"text/plain;charset=UTF-8"[..]), content, base64))
+        );
+        assert!(!message.contains_imdn());
+
+        let imdn_info = message.get_imdn_info().unwrap();
+        assert_eq!(imdn_info.imdn_id, b"Kn31");
+        assert_eq!(
+            imdn_info.disposition_notification,
+            Some(&b"positive-delivery, display"[..])
+        );
+    }
+}
+
+#[test]
+fn a_display_notification_is_read() {
+    // RFC 5438 section 7.2.1.2, with the blank line between the CPIM headers
+    // and the MIME object that RFC 3862 has
+    let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<imdn xmlns=\"urn:ietf:params:xml:ns:imdn\">\r\n\
+<message-id>34jk324j</message-id>\r\n\
+<datetime>2008-04-04T12:16:49-05:00</datetime>\r\n\
+<display-notification>\r\n\
+<status>\r\n\
+<displayed/>\r\n\
+</status>\r\n\
+</display-notification>\r\n\
+</imdn>";
+    let data = [
+        format!(
+            "From: Bob <im:bob@example.com>\r\n\
+To: Alice <im:alice@example.com>\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: dfjkleriou432333\r\n\
+DateTime: 2008-04-04T12:16:49-05:00\r\n\
+\r\n\
+Content-type: message/imdn+xml\r\n\
+Content-Disposition: notification\r\n\
+Content-length: {}\r\n\
+\r\n",
+            xml.len()
+        )
+        .as_bytes(),
+        xml,
+    ]
+    .concat();
+    let message = parse(&data);
+
+    assert!(message.contains_imdn());
+    assert_eq!(
+        message.get_imdn_info().unwrap().imdn_id,
+        b"dfjkleriou432333"
+    );
+    assert_eq!(
+        message.get_message_body(),
+        Some((Some(&b"message/imdn+xml"[..]), &xml[..], false))
+    );
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, b"Bob <im:bob@example.com>");
+    assert_eq!(info.to, b"Alice <im:alice@example.com>");
+}
+
+#[test]
+fn the_rfc_3862_example_is_read() {
+    let message = parse(RFC_3862_EXAMPLE);
+
+    assert_eq!(
+        values(&message, b"From"),
+        [b"MR SANDERS <im:piglet@100akerwood.com>"]
+    );
+    assert_eq!(
+        values(&message, b"To"),
+        [b"Depressed Donkey <im:eeyore@100akerwood.com>"]
+    );
+    assert_eq!(
+        values(&message, b"DateTime"),
+        [b"2000-12-13T13:40:00-08:00"]
+    );
+    assert_eq!(
+        values(
+            &message,
+            b"<mid:MessageFeatures@id.foo.com>.WackyMessageOption"
+        ),
+        [b"Use-silly-font"]
+    );
+    assert_eq!(
+        message.get_message_body(),
+        Some((
+            Some(&b"text/xml; charset=utf-8"[..]),
+            &b"<body>\r\nHere is the text of my message.\r\n</body>\r\n"[..],
+            false
+        ))
+    );
+    match &message.body {
+        Body::Message(content) => assert_eq!(
+            crate::internet::header::search(&content.headers, b"Content-ID", true)
+                .unwrap()
+                .get_value(),
+            b"<1234567890@foo.com>"
+        ),
+        _ => panic!("no MIME object"),
+    }
+
+    // it is no RCS message, which get_info() reads
+    assert!(message.get_info().is_err());
+    assert!(!message.contains_imdn());
+}
+
+#[test]
+fn an_imdn_among_multipart_parts_is_recognised() {
+    let part = |content_type: &'static [u8], content: &[u8]| {
+        Arc::new(Body::Message(MessageBody {
+            headers: vec![
+                Header::new(b"Content-Type", content_type),
+                Header::new(b"Content-Disposition", b"notification"),
+            ],
+            body: Arc::new(Body::Raw(content.to_vec())),
+        }))
+    };
+
+    for (parts, imdn) in [
+        (vec![part(b"text/plain", b"hi")], false),
+        (
+            vec![part(b"text/plain", b"hi"), part(b"message/imdn+xml", IMDN)],
+            true,
+        ),
+    ] {
+        let message = CPIMMessage::new(
+            &[],
+            Vec::new(),
+            Body::Multipart(MultipartBody {
+                boundary: b"next".to_vec(),
+                parts,
+            }),
+        );
+        assert_eq!(message.contains_imdn(), imdn);
     }
 }
