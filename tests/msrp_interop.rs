@@ -417,12 +417,8 @@ fn check(peer: &mut Peer, endpoint: &Endpoint) {
     assert_eq!(endpoint.demuxer.session_failure(), None);
 }
 
-// kept for the whole test run: the library's tasks hold clones, and the last
-// one dropped from inside a task would panic
 fn rt() -> Arc<Runtime> {
-    let rt = Arc::new(Runtime::new().unwrap());
-    std::mem::forget(Arc::clone(&rt));
-    rt
+    Arc::new(Runtime::new().unwrap())
 }
 
 #[test]

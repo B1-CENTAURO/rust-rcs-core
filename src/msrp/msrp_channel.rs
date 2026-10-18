@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 // use std::thread;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::mpsc;
 
 use crate::internet::header::Header;
@@ -36,7 +36,7 @@ use super::msrp_chunk::ReportFailure;
 use super::msrp_chunk::ReportSuccess;
 use super::msrp_demuxer::MsrpDemuxer;
 use super::msrp_muxer::MsrpMuxer;
-use super::msrp_transport::msrp_transport_start;
+use super::msrp_transport::msrp_transport_start_on;
 // use super::msrp_transport::MsrpTransportFactory;
 // use super::msrp_transport::{MsrpTransport, MsrpTransportWrapper};
 
@@ -245,7 +245,8 @@ impl MsrpChannelManager {
         // weak, so that the loop ends once the manager and its connections are gone
         let event_tx_ = event_tx.downgrade();
 
-        let rt_ = Arc::clone(&rt);
+        // a handle, not the runtime, see msrp_transport_start_on()
+        let rt_ = rt.handle().clone();
         rt.spawn(async move {
             let transports = transports_;
 
@@ -427,7 +428,7 @@ impl MsrpChannelManager {
             &self.channels,
             &self.event_tx,
             true,
-            &self.rt,
+            self.rt.handle(),
         );
     }
 
@@ -457,7 +458,7 @@ fn start_transport<T>(
     channels: &Arc<Mutex<Vec<MsrpChannel>>>,
     event_tx: &mpsc::UnboundedSender<Event>,
     accepted: bool,
-    rt: &Arc<Runtime>,
+    rt: &Handle,
 ) -> Connection
 where
     T: AsyncRead + AsyncWrite + Send + 'static,
@@ -471,7 +472,7 @@ where
     let event_tx = event_tx.clone();
     let event_tx_r = event_tx.clone();
 
-    msrp_transport_start(
+    msrp_transport_start_on(
         t,
         t_id,
         data_tx.as_ref().clone(),

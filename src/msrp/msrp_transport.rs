@@ -20,7 +20,7 @@ use std::sync::Arc;
 // use std::thread;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::mpsc;
 
 use crate::ffi::log::platform_log;
@@ -287,10 +287,37 @@ pub fn msrp_transport_start<T, MC, TRC>(
     t: T,
     t_id: String,
     tx: mpsc::Sender<Option<Vec<u8>>>,
+    rx: mpsc::Receiver<Option<Vec<u8>>>,
+    message_callback: MC,
+    transport_release_callback: TRC,
+    rt: &Arc<Runtime>,
+) where
+    T: AsyncRead + AsyncWrite + Send + 'static,
+    MC: FnMut(MsrpChunk) -> Result<Vec<MsrpChunk>, &'static str> + Send + Sync + 'static,
+    TRC: FnOnce() + Send + Sync + 'static,
+{
+    msrp_transport_start_on(
+        t,
+        t_id,
+        tx,
+        rx,
+        message_callback,
+        transport_release_callback,
+        rt.handle(),
+    )
+}
+
+// as msrp_transport_start(), for a task to call with the runtime's handle: a
+// task that holds an Arc<Runtime> may drop the last one, and tokio panics when
+// a runtime is dropped from inside one of its tasks
+pub(crate) fn msrp_transport_start_on<T, MC, TRC>(
+    t: T,
+    t_id: String,
+    tx: mpsc::Sender<Option<Vec<u8>>>,
     mut rx: mpsc::Receiver<Option<Vec<u8>>>,
     mut message_callback: MC,
     transport_release_callback: TRC,
-    rt: &Arc<Runtime>,
+    rt: &Handle,
 ) where
     T: AsyncRead + AsyncWrite + Send + 'static,
     MC: FnMut(MsrpChunk) -> Result<Vec<MsrpChunk>, &'static str> + Send + Sync + 'static,
