@@ -654,3 +654,256 @@ fn the_service_route_is_preloaded_on_requests_out_of_dialog() {
         );
     }
 }
+
+const INVITE_THROUGH_PROXIES: &str = "INVITE sip:alice@192.0.2.10:5060;transport=tcp SIP/2.0\r\n\
+Via: SIP/2.0/TCP pcscf.example.com;branch=z9hG4bKpcscf\r\n\
+Via: SIP/2.0/TCP scscf.example.com;branch=z9hG4bKscscf\r\n\
+Via: SIP/2.0/TCP 198.51.100.7:5060;branch=z9hG4bKbob\r\n\
+Record-Route: <sip:pcscf.example.com;lr>\r\n\
+Record-Route: <sip:scscf1.example.com;lr>, <sip:scscf2.example.com;lr>\r\n\
+From: <sip:bob@example.com>;tag=bob1\r\n\
+To: <sip:alice@example.com>\r\n\
+Call-ID: through-proxies\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:bob@198.51.100.7:5060;transport=tcp>\r\n\
+Max-Forwards: 68\r\n";
+
+/// The values of the headers of `message` named `name`, in order
+fn header_values(message: &SipMessage, name: &[u8]) -> Vec<String> {
+    crate::internet::header::HeaderSearch::new(message.headers().unwrap(), name, true)
+        .map(|h| String::from_utf8_lossy(h.get_value()).into_owned())
+        .collect()
+}
+
+fn to_tag(message: &SipMessage) -> Option<String> {
+    let to = String::from_utf8_lossy(&header_value(message, b"To")).into_owned();
+    to.split_once(";tag=").map(|(_, tag)| String::from(tag))
+}
+
+#[test]
+fn a_response_keeps_every_via_and_the_to_tag_given_first() {
+    use super::sip_transaction::server_transaction::make_response;
+
+    let invite = parse(INVITE_THROUGH_PROXIES, b"");
+    let assigned_to_tag = Arc::new(std::sync::Mutex::new(None));
+    let trying = make_response(&invite, &assigned_to_tag, 100, b"Trying").unwrap();
+    let ringing = make_response(&invite, &assigned_to_tag, 180, b"Ringing").unwrap();
+    let ok = make_response(&invite, &assigned_to_tag, 200, b"OK").unwrap();
+
+    for response in [&trying, &ringing, &ok] {
+        assert_eq!(
+            header_values(response, b"Via"),
+            [
+                "SIP/2.0/TCP pcscf.example.com;branch=z9hG4bKpcscf",
+                "SIP/2.0/TCP scscf.example.com;branch=z9hG4bKscscf",
+                "SIP/2.0/TCP 198.51.100.7:5060;branch=z9hG4bKbob",
+            ]
+        );
+    }
+
+    // none on the 100, one on the 180, the same on the 200
+    assert_eq!(to_tag(&trying), None);
+    let tag = to_tag(&ringing).expect("a To tag on the 180");
+    assert_eq!(to_tag(&ok), Some(tag));
+
+    // the 1xx and 2xx making the dialog carry the Record-Route
+    assert!(header_values(&trying, b"Record-Route").is_empty());
+    for response in [&ringing, &ok] {
+        assert_eq!(
+            header_values(response, b"Record-Route"),
+            [
+                "<sip:pcscf.example.com;lr>",
+                "<sip:scscf1.example.com;lr>, <sip:scscf2.example.com;lr>",
+            ]
+        );
+    }
+
+    // a MESSAGE makes no dialog
+    let message = parse(
+        &INVITE_THROUGH_PROXIES
+            .replace("INVITE sip", "MESSAGE sip")
+            .replace("1 INVITE", "1 MESSAGE"),
+        b"",
+    );
+    let ok = make_response(&message, &Arc::new(std::sync::Mutex::new(None)), 200, b"OK").unwrap();
+    assert!(header_values(&ok, b"Record-Route").is_empty());
+    assert_eq!(header_values(&ok, b"Via").len(), 3);
+}
+
+fn request_uri(message: &SipMessage) -> String {
+    match message {
+        SipMessage::Request(line, _, _) => String::from_utf8_lossy(&line.uri).into_owned(),
+        _ => panic!("not a request"),
+    }
+}
+
+#[test]
+fn a_dialog_we_answer_routes_through_the_record_route_in_order() {
+    use super::sip_transaction::server_transaction::make_response;
+
+    let invite = parse(INVITE_THROUGH_PROXIES, b"");
+    let ok = make_response(&invite, &Arc::new(std::sync::Mutex::new(None)), 200, b"OK").unwrap();
+    let dialog = SipDialog::try_new_as_uas(&invite, &ok, |_| {}).unwrap();
+
+    let bye = dialog.make_request(BYE, None).unwrap();
+    assert_eq!(request_uri(&bye), "sip:bob@198.51.100.7:5060;transport=tcp");
+    assert_eq!(
+        header_values(&bye, b"Route"),
+        [
+            "<sip:pcscf.example.com;lr>",
+            "<sip:scscf1.example.com;lr>",
+            "<sip:scscf2.example.com;lr>",
+        ]
+    );
+}
+
+#[test]
+fn a_dialog_we_start_routes_through_the_record_route_reversed() {
+    let invite = parse(
+        "INVITE sip:bob@example.com SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKalice\r\n\
+From: <sip:alice@example.com>;tag=alice1\r\n\
+To: <sip:bob@example.com>\r\n\
+Call-ID: we-start\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:alice@192.0.2.10:5060;transport=tcp>\r\n\
+Max-Forwards: 70\r\n",
+        b"",
+    );
+    let request_headers = invite.headers().unwrap().to_vec();
+
+    for (record_route, request_uri_expected, route_expected) in [
+        // loose routers: to the remote target, the route set as it is
+        (
+            "Record-Route: <sip:scscf2.example.com;lr>, <sip:scscf1.example.com;lr>\r\n\
+Record-Route: <sip:pcscf.example.com;lr>\r\n",
+            "sip:bob@198.51.100.7:5060;transport=tcp",
+            vec![
+                "<sip:pcscf.example.com;lr>",
+                "<sip:scscf1.example.com;lr>",
+                "<sip:scscf2.example.com;lr>",
+            ],
+        ),
+        // a strict router first: to it, the remote target last in the Route
+        (
+            "Record-Route: <sip:scscf.example.com;lr>, <sip:strict.example.com>\r\n",
+            "sip:strict.example.com",
+            vec![
+                "<sip:scscf.example.com;lr>",
+                "<sip:bob@198.51.100.7:5060;transport=tcp>",
+            ],
+        ),
+    ] {
+        let ok = parse(
+            &format!(
+                "SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKalice\r\n\
+{}From: <sip:alice@example.com>;tag=alice1\r\n\
+To: <sip:bob@example.com>;tag=bob1\r\n\
+Call-ID: we-start\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:bob@198.51.100.7:5060;transport=tcp>\r\n",
+                record_route
+            ),
+            b"",
+        );
+        let dialog = SipDialog::try_new_as_uac(&request_headers, &ok, |_| {}).unwrap();
+
+        let bye = dialog.make_request(BYE, None).unwrap();
+        assert_eq!(request_uri(&bye), request_uri_expected, "{}", record_route);
+        assert_eq!(
+            header_values(&bye, b"Route"),
+            route_expected,
+            "{}",
+            record_route
+        );
+    }
+}
+
+#[test]
+fn a_response_writes_the_to_as_the_request_has_it() {
+    use super::sip_transaction::server_transaction::make_response;
+
+    let message = parse(
+        &INVITE_THROUGH_PROXIES
+            .replace("INVITE sip", "MESSAGE sip")
+            .replace("1 INVITE", "1 MESSAGE")
+            .replace(
+                "To: <sip:alice@example.com>",
+                "To: \"Alice\" <sip:alice@example.com;user=phone>",
+            ),
+        b"",
+    );
+    let ok = make_response(&message, &Arc::new(std::sync::Mutex::new(None)), 200, b"OK").unwrap();
+    let to = String::from_utf8_lossy(&header_value(&ok, b"To")).into_owned();
+    let tag = to_tag(&ok).unwrap();
+    assert_eq!(
+        to,
+        format!("\"Alice\" <sip:alice@example.com;user=phone>;tag={}", tag)
+    );
+}
+
+struct NoDialogCallbacks;
+
+impl super::SipDialogEventCallbacks for NoDialogCallbacks {
+    fn on_ack(&self, _transaction: &Arc<super::ServerTransaction>) {}
+    fn on_new_request(
+        &self,
+        _transaction: Arc<super::ServerTransaction>,
+        _tx: tokio::sync::mpsc::Sender<super::ServerTransactionEvent>,
+        _rt: &Arc<Runtime>,
+    ) -> Option<(u16, bool)> {
+        None
+    }
+    fn on_terminating_request(&self, _message: &SipMessage) {}
+    fn on_terminating_response(&self, _message: &SipMessage) {}
+}
+
+struct NoSessionEvents;
+
+impl super::sip_session::SipSessionEventCallback for NoSessionEvents {
+    fn on_event(&self, _ev: super::sip_session::SipSessionEvent) {}
+}
+
+#[test]
+fn a_session_may_last_the_shortest_time_allowed() {
+    use super::sip_transaction::server_transaction::make_response;
+
+    let rt = Arc::new(Runtime::new().unwrap());
+    let invite = parse(INVITE_THROUGH_PROXIES, b"");
+    let ok = make_response(&invite, &Arc::new(std::sync::Mutex::new(None)), 200, b"OK").unwrap();
+    let dialog = Arc::new(SipDialog::try_new_as_uas(&invite, &ok, |_| {}).unwrap());
+
+    let session = super::sip_session::SipSession::new(&Arc::new(()), NoSessionEvents);
+    session.setup_confirmed_dialog(&dialog, NoDialogCallbacks);
+
+    // the Min-SE of RFC 4028 section 5, refreshed halfway
+    for (timeout, is_refresher) in [(90, true), (90, false), (1800, true)] {
+        session.schedule_refresh(timeout, is_refresher, &rt);
+    }
+}
+
+#[test]
+fn a_response_in_a_dialog_takes_no_record_route() {
+    use super::sip_transaction::server_transaction::make_response;
+
+    // a re-INVITE: the route set was settled by the first
+    let reinvite = parse(
+        &INVITE_THROUGH_PROXIES
+            .replace(
+                "To: <sip:alice@example.com>",
+                "To: <sip:alice@example.com>;tag=alice1",
+            )
+            .replace("1 INVITE", "2 INVITE"),
+        b"",
+    );
+    let ok = make_response(
+        &reinvite,
+        &Arc::new(std::sync::Mutex::new(None)),
+        200,
+        b"OK",
+    )
+    .unwrap();
+    assert!(header_values(&ok, b"Record-Route").is_empty());
+    assert_eq!(to_tag(&ok), Some(String::from("alice1")));
+}

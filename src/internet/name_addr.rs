@@ -77,7 +77,7 @@ impl<'a> NameAddr<'a> {
             readers.push(Box::new(&display_name[..]));
             readers.push(Box::new(&b"\""[..]));
             if let Some(_) = self.uri_part {
-                readers.push(Box::new(&b", "[..]));
+                readers.push(Box::new(&b" "[..]));
             }
         }
 
@@ -118,6 +118,10 @@ impl<'a> NameAddrUri<'a> {
 
     pub fn get_readers(&'a self, readers: &mut Vec<Box<dyn Read + Send + 'a>>) {
         readers.push(Box::new(&self.uri[..]));
+        // the parameters were read without the semicolon before them
+        if !self.uri_parameters.is_empty() {
+            readers.push(Box::new(&b";"[..]));
+        }
         readers.push(Box::new(&self.uri_parameters[..]));
 
         // for p in self.get_parameter_iterator() {
@@ -221,7 +225,7 @@ impl<'a> Serializable for NameAddr<'a> {
             size += display_name.len();
             size += 1;
             if let Some(_) = self.uri_part {
-                size += 2;
+                size += 1;
             }
         }
         if let Some(uri_part) = &self.uri_part {
