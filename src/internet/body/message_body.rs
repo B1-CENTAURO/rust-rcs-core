@@ -22,6 +22,7 @@ use crate::util::raw_string::{StrEq, StrFind, ToInt};
 use super::super::header::Header;
 use super::super::header_field::AsHeaderField;
 use super::super::headers::content_type::AsContentType;
+use super::super::syntax;
 use super::{Body, BodySerializationError};
 
 #[derive(Debug)]
@@ -32,6 +33,16 @@ pub struct MessageBody {
 
 impl MessageBody {
     pub fn construct(data: &[u8]) -> Result<MessageBody, &'static str> {
+        Self::construct_with(data, true)
+    }
+
+    /// Reads `data` as construct() does, but leaves the content as it is
+    /// whatever its type
+    pub fn construct_with_raw_content(data: &[u8]) -> Result<MessageBody, &'static str> {
+        Self::construct_with(data, false)
+    }
+
+    fn construct_with(data: &[u8], parse_content: bool) -> Result<MessageBody, &'static str> {
         let mut headers = Vec::new();
         let mut i = 0;
         while i <= data.len() {
@@ -44,7 +55,7 @@ impl MessageBody {
                 if let Some(position) = iter.position(|c| *c == b':') {
                     headers.push(Header::new(
                         data[i..i + position].to_vec(),
-                        iter.cloned().collect::<Vec<u8>>(),
+                        syntax::trim(iter.as_slice()).to_vec(),
                     ));
                 } else {
                     return Err("malformed header");
@@ -64,10 +75,12 @@ impl MessageBody {
                 if let Ok(i) = header.get_value().to_int() {
                     content_length = Some(i);
                 }
-            } else if header.get_name().equals_bytes(b"Content-Type", false) {
+            } else if parse_content && header.get_name().equals_bytes(b"Content-Type", false) {
                 let field = header.get_value().as_header_field();
                 if let Some(content_type) = field.as_content_type() {
-                    if content_type.major_type.equals_bytes(b"message", true) {
+                    if content_type.major_type.equals_bytes(b"message", true)
+                        && is_headers_and_body(content_type.sub_type)
+                    {
                         construct_flag = Some(1);
                     } else if content_type.major_type.equals_bytes(b"multipart", true) {
                         construct_flag = Some(2);
@@ -81,19 +94,23 @@ impl MessageBody {
 
         match content_length {
             Some(content_length) => {
-                if i + content_length < data.len() {
-                    return Err("insufficient data length");
-                }
+                // what carries the message frames the content, so a
+                // Content-Length running past its end is not taken
+                let content = if content_length <= data.len() - i {
+                    &data[i..i + content_length]
+                } else {
+                    &data[i..]
+                };
 
                 match construct_flag {
                     Some(flag) => match flag {
                         0 => {
                             return Ok(MessageBody {
                                 headers,
-                                body: Arc::new(Body::construct_raw(&data[i..i + content_length])),
+                                body: Arc::new(Body::construct_raw(content)),
                             });
                         }
-                        1 => match Body::construct_message(&data[i..i + content_length]) {
+                        1 => match Body::construct_message(content) {
                             Ok(body) => {
                                 return Ok(MessageBody {
                                     headers,
@@ -106,10 +123,7 @@ impl MessageBody {
                         },
                         2 => {
                             if let Some(boundary) = boundary {
-                                match Body::construct_multipart(
-                                    &data[i..i + content_length],
-                                    &boundary,
-                                ) {
+                                match Body::construct_multipart(content, &boundary) {
                                     Ok(body) => {
                                         return Ok(MessageBody {
                                             headers,
@@ -131,7 +145,7 @@ impl MessageBody {
                     None => {
                         return Ok(MessageBody {
                             headers,
-                            body: Arc::new(Body::construct_raw(&data[i..i + content_length])),
+                            body: Arc::new(Body::construct_raw(content)),
                         });
                     }
                 }
@@ -157,6 +171,14 @@ impl MessageBody {
 
         Ok(())
     }
+}
+
+/// Whether content of type message/`sub_type` is itself headers and a body,
+/// to be parsed as a MessageBody; message/imdn+xml, for one, is XML
+fn is_headers_and_body(sub_type: &[u8]) -> bool {
+    sub_type.equals_bytes(b"cpim", true)
+        || sub_type.equals_bytes(b"rfc822", true)
+        || sub_type.equals_bytes(b"global", true)
 }
 
 impl Clone for MessageBody {

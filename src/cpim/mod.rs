@@ -16,6 +16,9 @@ pub mod cpim_info;
 pub mod cpim_message;
 pub mod cpim_namespace;
 
+#[cfg(test)]
+mod tests;
+
 pub use cpim_info::CPIMInfo;
 pub use cpim_message::CPIMHeaders;
 pub use cpim_message::CPIMMessage;

@@ -84,7 +84,8 @@ impl<'a> CPIMMessage {
 
             match &*message_body.body {
                 Body::Raw(data) => {
-                    let inner_body = MessageBody::construct(&data);
+                    // the content is handed on as it is, multipart or not
+                    let inner_body = MessageBody::construct_with_raw_content(&data);
                     if let Ok(inner_body) = inner_body {
                         return Ok(CPIMMessage {
                             ns,

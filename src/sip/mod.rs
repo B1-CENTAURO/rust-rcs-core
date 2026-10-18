@@ -22,6 +22,9 @@ pub mod sip_subscription;
 pub mod sip_transaction;
 pub mod sip_transport;
 
+#[cfg(test)]
+mod tests;
+
 pub use sip_core::SipCore;
 pub use sip_core::TransactionHandler;
 
