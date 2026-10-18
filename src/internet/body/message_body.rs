@@ -155,7 +155,7 @@ fn unfold(value: &[u8]) -> Vec<u8> {
 
 /// Whether content of type message/`sub_type` is itself headers and a body,
 /// to be parsed as a MessageBody; message/imdn+xml, for one, is XML
-fn is_headers_and_body(sub_type: &[u8]) -> bool {
+pub(crate) fn is_headers_and_body(sub_type: &[u8]) -> bool {
     sub_type.equals_bytes(b"cpim", true)
         || sub_type.equals_bytes(b"rfc822", true)
         || sub_type.equals_bytes(b"global", true)

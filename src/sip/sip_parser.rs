@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use crate::internet::body::message_body::is_headers_and_body;
 use crate::internet::body::Body;
 use crate::internet::header;
 use crate::internet::header::{Header, HeaderSearch};
@@ -219,11 +220,14 @@ impl SipParser {
                             for header in HeaderSearch::new(headers, b"Content-Type", true) {
                                 let field = header.get_value().as_header_field();
                                 if let Some(content_type) = field.as_content_type() {
-                                    if content_type.major_type.equals_bytes(b"message", true) {
+                                    if content_type.major_type.equals_bytes(b"message", true)
+                                        && is_headers_and_body(content_type.sub_type)
+                                    {
                                         construct_flag = Some(1);
                                     } else if content_type
                                         .major_type
                                         .equals_bytes(b"multipart", true)
+                                        && !content_type.boundary.is_empty()
                                     {
                                         construct_flag = Some(2);
                                         boundary = Some(content_type.boundary.to_vec());
@@ -245,77 +249,28 @@ impl SipParser {
                                 return ok;
                             }
 
-                            match construct_flag {
-                                Some(flag) => match flag {
-                                    0 => {
-                                        let body = Body::construct_raw(
-                                            &self.buffer[self.p..self.p + *content_length],
-                                        );
-                                        let ok = Ok(Some(SipMessage::new(
-                                            first_line.take().unwrap(),
-                                            message_headers.take(),
-                                            Some(Arc::new(body)),
-                                        )));
-                                        self.buffer =
-                                            self.buffer.split_off(self.p + *content_length);
-                                        self.p = 0;
-                                        self.state = ParsingState::Empty;
-                                        return ok;
-                                    }
-                                    1 => match Body::construct_message(
-                                        &self.buffer[self.p..self.p + *content_length],
-                                    ) {
-                                        Ok(body) => {
-                                            let ok = Ok(Some(SipMessage::new(
-                                                first_line.take().unwrap(),
-                                                message_headers.take(),
-                                                Some(Arc::new(body)),
-                                            )));
-                                            self.buffer =
-                                                self.buffer.split_off(self.p + *content_length);
-                                            self.p = 0;
-                                            self.state = ParsingState::Empty;
-                                            return ok;
-                                        }
-                                        Err(e) => {
-                                            return Err(e);
-                                        }
-                                    },
-                                    2 => {
-                                        if let Some(boundary) = boundary {
-                                            match Body::construct_multipart(
-                                                &self.buffer[self.p..self.p + *content_length],
-                                                &boundary,
-                                            ) {
-                                                Ok(body) => {
-                                                    let ok = Ok(Some(SipMessage::new(
-                                                        first_line.take().unwrap(),
-                                                        message_headers.take(),
-                                                        Some(Arc::new(body)),
-                                                    )));
-                                                    self.buffer = self
-                                                        .buffer
-                                                        .split_off(self.p + *content_length);
-                                                    self.p = 0;
-                                                    self.state = ParsingState::Empty;
-                                                    return ok;
-                                                }
-                                                Err(e) => {
-                                                    return Err(e);
-                                                }
-                                            }
-                                        } else {
-                                            return Err("missing multipart boundary");
-                                        }
-                                    }
-                                    _ => {
-                                        panic!("impossible condition")
-                                    }
-                                },
-                                None => {
-                                    panic!("require explicit content-type")
+                            let content = &self.buffer[self.p..self.p + *content_length];
+
+                            // a body that does not read as its type, or has none,
+                            // is kept as it is
+                            let body = match (construct_flag, boundary) {
+                                (Some(1), _) => Body::construct_message(content).ok(),
+                                (Some(2), Some(boundary)) => {
+                                    Body::construct_multipart(content, &boundary).ok()
                                 }
+                                _ => None,
                             }
+                            .unwrap_or_else(|| Body::construct_raw(content));
+
+                            let ok = Ok(Some(SipMessage::new(
+                                first_line.take().unwrap(),
+                                message_headers.take(),
+                                Some(Arc::new(body)),
+                            )));
+                            self.buffer = self.buffer.split_off(self.p + *content_length);
+                            self.p = 0;
+                            self.state = ParsingState::Empty;
+                            return ok;
                         }
 
                         return Err("seriously?");

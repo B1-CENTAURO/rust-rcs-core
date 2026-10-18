@@ -14,7 +14,74 @@
 
 use crate::internet::body::Body;
 
+use super::sip_message::SipMessage;
 use super::sip_parser::SipParser;
+
+fn parse(head: &str, body: &[u8]) -> SipMessage {
+    let data = [
+        format!("{}Content-Length: {}\r\n\r\n", head, body.len()).as_bytes(),
+        body,
+    ]
+    .concat();
+
+    let mut parser = SipParser::new();
+    parser.feed(&data);
+    parser.produce().unwrap().expect("a complete message")
+}
+
+fn raw_body(message: &SipMessage) -> Vec<u8> {
+    match message.get_body().as_deref() {
+        Some(Body::Raw(raw)) => raw.clone(),
+        _ => panic!("not a raw body"),
+    }
+}
+
+const NOTIFY: &str = "NOTIFY sip:alice@192.0.2.1 SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.2;branch=z9hG4bK776asdhds\r\n\
+From: <sip:conference@example.com>;tag=1928301774\r\n\
+To: <sip:alice@example.com>;tag=a6c85cf\r\n\
+Call-ID: a84b4c76e66710\r\n\
+CSeq: 2 NOTIFY\r\n\
+Event: refer\r\n\
+Subscription-State: active;expires=60\r\n";
+
+#[test]
+fn a_sipfrag_body_is_kept_as_it_is() {
+    // a NOTIFY reporting on a REFER, as when adding to a group chat, and a
+    // fragment starting with a request line, which has a colon in it
+    for sipfrag in [
+        &b"SIP/2.0 200 OK\r\n"[..],
+        b"INVITE sip:bob@example.com SIP/2.0\r\nContact: <sip:bob@192.0.2.3>\r\n",
+    ] {
+        let message = parse(
+            &format!("{}Content-Type: message/sipfrag;version=2.0\r\n", NOTIFY),
+            sipfrag,
+        );
+        assert_eq!(raw_body(&message), sipfrag);
+    }
+}
+
+#[test]
+fn a_body_not_reading_as_its_type_is_kept_as_it_is() {
+    for content_type in [
+        "Content-Type: multipart/mixed;boundary=other\r\n",
+        "Content-Type: multipart/mixed\r\n",
+        "Content-Type: message/cpim\r\n",
+        "Content-Type: nothing\r\n",
+        "",
+    ] {
+        let message = parse(
+            &format!("{}{}", NOTIFY, content_type),
+            b"no headers\r\n\r\n--next--",
+        );
+        assert_eq!(
+            raw_body(&message),
+            b"no headers\r\n\r\n--next--",
+            "{:?}",
+            content_type
+        );
+    }
+}
 
 #[test]
 fn a_content_length_past_the_end_of_a_message_body_is_not_taken() {
