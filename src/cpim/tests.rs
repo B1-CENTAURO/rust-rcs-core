@@ -20,8 +20,9 @@ use crate::imdn::GetIMDNInfo;
 use crate::internet::body::message_body::MessageBody;
 use crate::internet::body::Body;
 use crate::internet::header::Header;
+use crate::io::DynamicChain;
 
-use super::{unescape, CPIMHeaderValue, CPIMMessage};
+use super::{escape, unescape, CPIMHeaderValue, CPIMMessage, CPIMNamespace};
 
 const IMDN: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
 <imdn xmlns=\"urn:ietf:params:xml:ns:imdn\">\r\n\
@@ -360,4 +361,144 @@ fn values_are_read_from_a_message_built_with_new() {
         [b"x1"]
     );
     assert_eq!(message.get_values(b"Subject")[0].lang(), Some(&b"en"[..]));
+}
+
+fn written(message: &CPIMMessage) -> Vec<u8> {
+    let mut readers = Vec::new();
+    message.get_readers(&mut readers).unwrap();
+    let mut data = Vec::new();
+    DynamicChain::new(readers).read_to_end(&mut data).unwrap();
+    data
+}
+
+#[test]
+fn a_message_built_with_new_is_written_with_its_namespaces() {
+    let message = CPIMMessage::new(
+        &[
+            (b"imdn", b"urn:ietf:params:imdn"),
+            (b"cpm", b"http://www.openmobilealliance.org/cpm/"),
+            (b"unused", b"urn:example:unused"),
+        ],
+        vec![
+            Header::new(b"From", b"<sip:anonymous@anonymous.invalid>"),
+            Header::new(b"To", b"<sip:anonymous@anonymous.invalid>"),
+            Header::new(b"DateTime", b"2023-04-04T12:16:49.000+08:00"),
+            Header::new(b"imdn.Message-ID", b"Kn31"),
+            Header::new(
+                b"imdn.Disposition-Notification",
+                b"positive-delivery, display",
+            ),
+            Header::new(b"cpm.Payload-Type", b"text"),
+            Header::new(b"Subject", b";lang=en two\nlines"),
+        ],
+        Body::Message(MessageBody {
+            headers: vec![Header::new(b"Content-Type", b"text/plain")],
+            body: Arc::new(Body::Raw(b"hi".to_vec())),
+        }),
+    );
+
+    let data = written(&message);
+    assert_eq!(
+        String::from_utf8_lossy(&data),
+        "From: <sip:anonymous@anonymous.invalid>\r\n\
+To: <sip:anonymous@anonymous.invalid>\r\n\
+DateTime: 2023-04-04T12:16:49.000+08:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: Kn31\r\n\
+imdn.Disposition-Notification: positive-delivery, display\r\n\
+NS: cpm <http://www.openmobilealliance.org/cpm/>\r\n\
+cpm.Payload-Type: text\r\n\
+Subject:;lang=en two\\nlines\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hi"
+    );
+
+    let message = parse(&data);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.imdn_message_id, b"Kn31");
+    assert_eq!(info.payload_type, Some(&b"text"[..]));
+    let subject = &message.get_values(b"Subject")[0];
+    assert_eq!(subject.lang(), Some(&b"en"[..]));
+    assert_eq!(unescape(subject.value), &b"two\nlines"[..]);
+}
+
+#[test]
+fn a_message_read_is_written_as_it_came() {
+    let imdn = cpim(
+        vec![
+            Header::new(b"Content-Type", b"message/imdn+xml"),
+            Header::new(b"Content-Disposition", b"notification"),
+            Header::new(b"Content-Length", IMDN.len().to_string()),
+        ],
+        IMDN,
+    );
+
+    for data in [RFC_3862_EXAMPLE, &imdn] {
+        assert_eq!(
+            String::from_utf8_lossy(&written(&parse(data))),
+            String::from_utf8_lossy(data)
+        );
+    }
+}
+
+#[test]
+fn a_prefix_is_declared_again_only_when_bound_elsewhere() {
+    for (declaration, written_out) in [
+        (
+            "x <urn:example:x>",
+            "NS: x <urn:example:x>\r\nx.One: 1\r\n\r\nhi",
+        ),
+        (
+            "x <urn:example:other>",
+            "NS: x <urn:example:other>\r\nNS: x <urn:example:x>\r\nx.One: 1\r\n\r\nhi",
+        ),
+    ] {
+        let message = CPIMMessage::new(
+            &[(b"x", b"urn:example:x")],
+            vec![
+                Header::new(b"NS", declaration.to_string()),
+                Header::new(b"x.One", b"1"),
+            ],
+            Body::Raw(b"hi".to_vec()),
+        );
+        assert_eq!(String::from_utf8_lossy(&written(&message)), written_out);
+    }
+}
+
+#[test]
+fn text_is_escaped() {
+    assert_eq!(
+        escape(b"a\\b\t\"q\"\n\x01\x7f"),
+        &b"a\\\\b\\t\"q\"\\n\\u0001\\u007f"[..]
+    );
+    assert!(matches!(escape(b"plain"), Cow::Borrowed(b"plain")));
+
+    let text = "caf\u{e9} \\ \u{1}\r\n";
+    assert_eq!(unescape(&escape(text.as_bytes())), text.as_bytes());
+}
+
+#[test]
+fn the_deflator_gives_prefixed_names_and_their_declarations() {
+    let mut ns = CPIMNamespace::new();
+    ns.register(b"imdn", b"urn:ietf:params:imdn");
+    // a default namespace, which has no prefix to write names with
+    ns.register(b"", b"urn:example:x");
+    let deflator = ns.as_deflator();
+
+    let header = Header::new(b"<urn:ietf:params:imdn>.Message-ID", b"x1");
+    let (declaration, deflated) = deflator(&header);
+    let declaration = declaration.unwrap();
+    assert_eq!(declaration.get_name(), b"NS");
+    assert_eq!(declaration.get_value(), b"imdn <urn:ietf:params:imdn>");
+    assert_eq!(deflated.get_name(), b"imdn.Message-ID");
+    assert_eq!(deflated.get_value(), b"x1");
+
+    for name in [&b"From"[..], b"<urn:example:x>.Name", b"imdn.Message-ID"] {
+        let header = Header::new(name.to_vec(), b"v".to_vec());
+        let (declaration, deflated) = deflator(&header);
+        assert!(declaration.is_none());
+        assert_eq!(deflated.get_name(), name);
+    }
 }

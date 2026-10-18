@@ -20,6 +20,7 @@ pub mod cpim_namespace;
 #[cfg(test)]
 mod tests;
 
+pub use cpim_header_value::escape;
 pub use cpim_header_value::unescape;
 pub use cpim_header_value::CPIMHeaderValue;
 pub use cpim_info::CPIMInfo;

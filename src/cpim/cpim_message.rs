@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+use std::io::{Cursor, Read};
+
 use crate::ffi::log::platform_log;
 use crate::internet::body::message_body::MessageBody;
-use crate::internet::body::Body;
+use crate::internet::body::{Body, BodySerializationError};
 use crate::internet::header;
 use crate::internet::header::Header;
 use crate::internet::name_addr::AsNameAddr;
@@ -26,7 +29,7 @@ use crate::imdn;
 
 use crate::util::raw_string::StrEq;
 
-use super::cpim_header_value::CPIMHeaderValue;
+use super::cpim_header_value::{escape_controls, CPIMHeaderValue};
 use super::cpim_info::CPIMInfo;
 use super::cpim_namespace::CPIMNamespace;
 
@@ -65,16 +68,9 @@ impl<'a> CPIMMessage {
 
             for h in &message_body.headers {
                 if h.get_name() == b"NS" {
-                    let value = h.get_value();
-                    let mut iter = value.iter();
-                    if let Some(start) = iter.position(|c| *c == b'<') {
-                        if let Some(end) = iter.position(|c| *c == b'>') {
-                            ns.register(
-                                syntax::trim(&value[..start]),
-                                syntax::trim(&value[start + 1..start + 1 + end]),
-                            );
-                            continue;
-                        }
+                    if let Some((prefix, uri)) = CPIMNamespace::parse_declaration(h.get_value()) {
+                        ns.register(prefix, uri);
+                        continue;
                     }
                     return Err("bad namespace");
                 } else {
@@ -228,6 +224,67 @@ impl<'a> CPIMMessage {
             .collect()
     }
 
+    /// The message written out: its headers, each namespace prefix declared by
+    /// an NS header before its first use, a blank line and the MIME object of
+    /// its body. Values are written as they are, but for the control
+    /// characters no header can hold, which are escaped; escape() escapes text
+    /// fully. Each prefix used is to be among the namespaces of new(), or of
+    /// the message read.
+    pub fn get_readers<'b>(
+        &'b self,
+        readers: &mut Vec<Box<dyn Read + Send + 'b>>,
+    ) -> Result<(), BodySerializationError> {
+        readers.push(Box::new(Cursor::new(self.written_headers())));
+        readers.push(Box::new(&b"\r\n"[..]));
+        readers.push(Box::new(self.body.reader()?));
+        Ok(())
+    }
+
+    fn written_headers(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+
+        // the namespace each prefix is declared for so far
+        let mut declared: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        for (name, value) in self.inflated_headers() {
+            if name == b"NS" {
+                if let Some((prefix, uri)) = CPIMNamespace::parse_declaration(value) {
+                    declared.insert(prefix.to_vec(), uri.to_vec());
+                }
+                write_header(&mut data, &name, value);
+                continue;
+            }
+
+            let name = self.ns.deflate(&name);
+
+            // a Require uses the prefixes of the names it lists
+            let mut used = vec![&name[..]];
+            if name == b"Require" {
+                used = CPIMHeaderValue::parse(value)
+                    .value
+                    .split(|c| *c == b',')
+                    .map(syntax::trim)
+                    .collect();
+            }
+
+            for used in used {
+                if let Some(position) = used.iter().position(|c| *c == b'.') {
+                    let prefix = &used[..position];
+                    if let Some(uri) = self.ns.uri(prefix) {
+                        if declared.get(prefix).map(|v| &v[..]) != Some(uri) {
+                            write_header(&mut data, b"NS", &[prefix, b" <", uri, b">"].concat());
+                            declared.insert(prefix.to_vec(), uri.to_vec());
+                        }
+                    }
+                }
+            }
+
+            write_header(&mut data, &name, value);
+        }
+
+        data
+    }
+
     /// The names listed by Require headers (RFC 3862 section 3.5), written as
     /// get_values() takes them, that are not in `understood`. The sender
     /// requires each to be understood, so a message with any left is not to
@@ -333,4 +390,16 @@ impl<'a> CPIMMessage {
 
         false
     }
+}
+
+/// Writes a CPIM header, its parameters straight after the colon and its value
+/// after a space (RFC 3862 section 3.6)
+fn write_header(data: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    data.extend_from_slice(name);
+    data.push(b':');
+    if !value.starts_with(b";") {
+        data.push(b' ');
+    }
+    data.extend_from_slice(&escape_controls(value));
+    data.extend_from_slice(b"\r\n");
 }

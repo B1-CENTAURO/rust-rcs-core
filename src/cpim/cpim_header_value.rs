@@ -133,3 +133,35 @@ fn hex4(data: &[u8]) -> Option<u32> {
         None
     }
 }
+
+/// `text` with the escapes of RFC 3862 section 2.3 applied, for a header
+/// value such as a Subject. Within a quoted string, `"` is to be escaped too.
+pub fn escape(text: &[u8]) -> Cow<'_, [u8]> {
+    escape_with(text, true)
+}
+
+/// `value` with the control characters no header can hold escaped
+pub(crate) fn escape_controls(value: &[u8]) -> Cow<'_, [u8]> {
+    escape_with(value, false)
+}
+
+fn escape_with(value: &[u8], backslash: bool) -> Cow<'_, [u8]> {
+    let escaped = |c: u8| c < 0x20 || c == 0x7f || (backslash && c == b'\\');
+    if !value.iter().any(|c| escaped(*c)) {
+        return Cow::Borrowed(value);
+    }
+
+    let mut data = Vec::with_capacity(value.len() + 8);
+    for c in value {
+        match *c {
+            0x08 => data.extend_from_slice(b"\\b"),
+            b'\t' => data.extend_from_slice(b"\\t"),
+            b'\n' => data.extend_from_slice(b"\\n"),
+            b'\r' => data.extend_from_slice(b"\\r"),
+            b'\\' if backslash => data.extend_from_slice(b"\\\\"),
+            c if escaped(c) => data.extend_from_slice(format!("\\u{:04x}", c).as_bytes()),
+            c => data.push(c),
+        }
+    }
+    Cow::Owned(data)
+}
