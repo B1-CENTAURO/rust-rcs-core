@@ -17,3 +17,25 @@ pub mod android_socket;
 #[cfg(all(feature = "ohos", all(target_os = "linux", target_env = "ohos")))]
 pub mod ohos_socket;
 pub mod stream;
+
+/// `address` and `port` as a SIP host and port, an IPv6 address in brackets
+/// (RFC 3261 section 25.1)
+pub fn host_port(address: &str, port: u16) -> String {
+    if address.contains(':') && !address.starts_with('[') {
+        format!("[{}]:{}", address, port)
+    } else {
+        format!("{}:{}", address, port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_port;
+
+    #[test]
+    fn an_ipv6_address_is_bracketed() {
+        assert_eq!(host_port("192.0.2.10", 5060), "192.0.2.10:5060");
+        assert_eq!(host_port("2001:db8::10", 5060), "[2001:db8::10]:5060");
+        assert_eq!(host_port("[2001:db8::10]", 5060), "[2001:db8::10]:5060");
+    }
+}

@@ -224,8 +224,23 @@ impl SipDialog {
                                     }
                                 }
 
-                                // let (req_from_uri, _) = req_from_uri_part;
-                                // let (resp_to_uri, _) = resp_to_uri_part;
+                                // our end is the request's From as UAC, its To as UAS
+                                // (RFC 3261 section 12.1)
+                                let (local_uri, local_tag, remote_uri, remote_tag) = if as_uac {
+                                    (
+                                        req_from_uri_part.uri,
+                                        req_from_tag,
+                                        resp_to_uri_part.uri,
+                                        resp_to_tag,
+                                    )
+                                } else {
+                                    (
+                                        resp_to_uri_part.uri,
+                                        resp_to_tag,
+                                        req_from_uri_part.uri,
+                                        req_from_tag,
+                                    )
+                                };
 
                                 return Ok(SipDialog {
                                     state: Arc::new(Mutex::new(state)),
@@ -238,8 +253,8 @@ impl SipDialog {
                                         Arc::new(Mutex::new(None))
                                     },
 
-                                    local_uri: req_from_uri_part.uri.to_vec(),
-                                    local_tag: req_from_tag.to_vec(),
+                                    local_uri: local_uri.to_vec(),
+                                    local_tag: local_tag.to_vec(),
 
                                     remote_seq: if as_uac {
                                         Arc::new(Mutex::new(None))
@@ -247,8 +262,8 @@ impl SipDialog {
                                         Arc::new(Mutex::new(Some(req_cseq.seq)))
                                     },
 
-                                    remote_uri: resp_to_uri_part.uri.to_vec(),
-                                    remote_tag: resp_to_tag.to_vec(),
+                                    remote_uri: remote_uri.to_vec(),
+                                    remote_tag: remote_tag.to_vec(),
 
                                     remote_target: Arc::new(Mutex::new(remote_target)),
 
@@ -294,6 +309,15 @@ impl SipDialog {
             Self::try_new(req_headers, resp_message, false, on_last_user_removed)
         } else {
             Err("Missing header information")
+        }
+    }
+
+    /// Whether a usage of the dialog, such as a subscription, has registered
+    /// with it
+    pub fn has_users(&self) -> bool {
+        match &*self.state.lock().unwrap() {
+            State::Early(users, _) | State::Confirmed(users, _) => !users.is_empty(),
+            _ => false,
         }
     }
 

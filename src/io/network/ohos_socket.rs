@@ -81,7 +81,7 @@ impl OhosTcpStream {
             if let Some(l_addr) = get_socket_local_address(&sock_info) {
                 let l_port = get_socket_local_port(&sock_info);
                 if l_port > 0 {
-                    return Ok(format!("{}:{}", l_addr, l_port)); // to-do: support ipv6
+                    return Ok(super::host_port(&l_addr, l_port));
                 }
             }
         }

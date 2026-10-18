@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::ffi::log::platform_log;
 use crate::sip::sip_parser::SipParser;
@@ -62,6 +62,8 @@ pub enum SipTransportType {
 pub struct SipTransport {
     pub transport_address: String,
     pub transport_type: SipTransportType,
+
+    service_route: Mutex<Vec<Vec<u8>>>,
 }
 
 impl SipTransport {
@@ -69,7 +71,19 @@ impl SipTransport {
         SipTransport {
             transport_address,
             transport_type,
+            service_route: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Sets the Service-Route header values of the last registration on the
+    /// transport, which out-of-dialog requests other than REGISTER sent on it
+    /// take as their Route (TS 24.229 section 5.1.2A.1.1)
+    pub fn set_service_route(&self, service_route: Vec<Vec<u8>>) {
+        *self.service_route.lock().unwrap() = service_route;
+    }
+
+    pub fn get_service_route(&self) -> Vec<Vec<u8>> {
+        self.service_route.lock().unwrap().clone()
     }
 
     pub fn get_via(&self) -> String {
@@ -109,10 +123,22 @@ where
 
     let transport = Arc::clone(&transport);
 
+    // the writer stopping, sent None or with no one left to send, closes the
+    // transport: the reader stops too, as a peer gone silent would not end it
+    let closed = Arc::new(Notify::new());
+    let closed_ = Arc::clone(&closed);
+
     rt.spawn(async move {
         let mut parser = SipParser::new();
         let mut data: [u8; 4096] = [0; 4096];
-        'read: while let Ok(size) = rh.read(&mut data).await {
+        'read: loop {
+            let size = tokio::select! {
+                read = rh.read(&mut data) => match read {
+                    Ok(size) => size,
+                    Err(_) => break,
+                },
+                _ = closed_.notified() => break,
+            };
             platform_log(LOG_TAG, format!("sip_transport read {} bytes", size));
             if size > 0 {
                 let mut i = 0;
@@ -203,6 +229,8 @@ where
                 platform_log(LOG_TAG, format!("write handle shutdown error {}", e));
             }
         }
+
+        closed.notify_one();
     });
 
     tx

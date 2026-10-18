@@ -38,7 +38,9 @@ impl HeartbeatTransaction {
     }
 
     pub fn start(&self) {
-        (self.transport_function)(&self.transport, b"\r\n".to_vec());
+        // the ping is a double CRLF, which a single CRLF answers (RFC 5626
+        // section 4.4.1)
+        (self.transport_function)(&self.transport, b"\r\n\r\n".to_vec());
     }
 
     pub fn on_response(&self) {
