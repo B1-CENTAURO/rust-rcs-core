@@ -41,6 +41,7 @@ use crate::sip::sip_transaction::SipTransactionManager;
 use crate::sip::sip_transaction::SipTransactionManagerEventInterface;
 
 use crate::util::raw_string::StrEq;
+use crate::util::runtime::HeldRuntime;
 
 use super::sip_headers::subscription_state::AsSubscriptionState;
 use super::sip_subscription::subscriber::SubscriberEvent;
@@ -81,7 +82,7 @@ impl SipCore {
 
         let sm_ = Arc::clone(sm);
         let tm_ = Arc::clone(tm);
-        let rt_ = Arc::clone(&rt);
+        let rt_ = HeldRuntime::new(rt);
 
         rt.spawn(async move {
             let default_public_identity = default_public_identity_;
@@ -93,7 +94,7 @@ impl SipCore {
             'thread: loop {
                 let sm = Arc::clone(&sm_);
                 let tm = Arc::clone(&tm_);
-                let rt = Arc::clone(&rt_);
+                let rt: &Arc<Runtime> = &rt_;
                 if let Some((transaction, tx, rx)) = tm_event_itf.event_rx.recv().await {
                     let message = transaction.message();
                     if let SipMessage::Request(req_line, _, _) = message {
