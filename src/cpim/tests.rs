@@ -693,3 +693,103 @@ fn an_imdn_among_multipart_parts_is_recognised() {
         assert_eq!(message.contains_imdn(), imdn);
     }
 }
+
+#[test]
+fn a_default_namespace_holds_the_names_after_it() {
+    // as in RFC 3862 section 3.4, then back to the core headers
+    let data = b"From: <sip:alice@example.com>\r\n\
+NS: <http://id.acme.widgets/wily-headers/>\r\n\
+runner-trap: set\r\n\
+NS: <urn:example:other>\r\n\
+runner-trap: unset\r\n\
+NS: <urn:ietf:params:cpim-headers:>\r\n\
+To: <sip:bob@example.com>\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: x1\r\n\
+DateTime: 2023-04-04T12:16:49Z\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hi";
+    let message = parse(data);
+
+    assert_eq!(
+        values(
+            &message,
+            b"<http://id.acme.widgets/wily-headers/>.runner-trap"
+        ),
+        [b"set"]
+    );
+    assert_eq!(
+        values(&message, b"<urn:example:other>.runner-trap"),
+        [b"unset"]
+    );
+    assert!(message.get_values(b"runner-trap").is_empty());
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, b"<sip:alice@example.com>");
+    assert_eq!(info.to, b"<sip:bob@example.com>");
+
+    assert_eq!(
+        String::from_utf8_lossy(&written(&message)),
+        String::from_utf8_lossy(data)
+    );
+}
+
+#[test]
+fn a_core_header_after_a_default_namespace_is_in_that_namespace() {
+    // NS still declares namespaces, so that the default can be changed back
+    let message = parse(
+        b"NS: <urn:example:x>\r\n\
+From: <sip:alice@example.com>\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: x1\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hi",
+    );
+
+    assert!(message.get_values(b"From").is_empty());
+    assert_eq!(
+        values(&message, b"<urn:example:x>.From"),
+        [b"<sip:alice@example.com>"]
+    );
+    assert_eq!(
+        values(&message, b"<urn:ietf:params:imdn>.Message-ID"),
+        [b"x1"]
+    );
+}
+
+#[test]
+fn the_core_namespace_may_have_a_prefix() {
+    let message = parse(
+        b"NS: cpim <urn:ietf:params:cpim-headers:>\r\n\
+cpim.From: <sip:alice@example.com>\r\n\
+cpim.To: <sip:bob@example.com>\r\n\
+cpim.DateTime: 2023-04-04T12:16:49Z\r\n\
+cpim.NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: x1\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hi",
+    );
+
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, b"<sip:alice@example.com>");
+    assert_eq!(info.imdn_message_id, b"x1");
+
+    // written with the core headers in the default namespace they start in
+    assert_eq!(
+        String::from_utf8_lossy(&written(&message)),
+        "From: <sip:alice@example.com>\r\n\
+To: <sip:bob@example.com>\r\n\
+DateTime: 2023-04-04T12:16:49Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: x1\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hi"
+    );
+}
