@@ -26,6 +26,7 @@ use crate::imdn;
 
 use crate::util::raw_string::StrEq;
 
+use super::cpim_header_value::CPIMHeaderValue;
 use super::cpim_info::CPIMInfo;
 use super::cpim_namespace::CPIMNamespace;
 
@@ -140,18 +141,20 @@ impl<'a> CPIMMessage {
                 format!("decoded CPIM header value {:?}", std::str::from_utf8(v)),
             );
 
+            // the first of each, without its parameters
+            let v = CPIMHeaderValue::parse(v).value;
             if &n == b"From" {
-                from = Some(v);
+                from.get_or_insert(v);
             } else if &n == b"To" {
-                to = Some(v);
+                to.get_or_insert(v);
             } else if &n == b"DateTime" {
-                date = Some(v);
+                date.get_or_insert(v);
             } else if &n == b"<http://www.openmobilealliance.org/cpm/>.Payload-Type" {
-                payload_type = Some(v);
+                payload_type.get_or_insert(v);
             } else if &n == b"<urn:ietf:params:imdn>.Message-ID" {
-                imdn_message_id = Some(v);
+                imdn_message_id.get_or_insert(v);
             } else if &n == b"<urn:ietf:params:imdn>.Disposition-Notification" {
-                disposition_notification = Some(v);
+                disposition_notification.get_or_insert(v);
             }
         }
 
@@ -192,29 +195,59 @@ impl<'a> CPIMMessage {
         Err("missing required headers")
     }
 
+    /// The From, the first To, DateTime and the IMDN and CPM headers of an RCS
+    /// message
     pub fn get_info(&self) -> Result<CPIMInfo, &'static str> {
+        self.get_info_from_inflated_headers(self.inflated_headers())
+    }
+
+    /// The names and values of the headers, with namespace prefixes written
+    /// out as CPIMNamespace::inflate() writes them
+    fn inflated_headers(&self) -> Vec<(Vec<u8>, &[u8])> {
         match &self.headers {
-            CPIMHeaders::Deflated(headers) => {
-                let mut inflated_headers: Vec<(Vec<u8>, &[u8])> = Vec::with_capacity(headers.len());
+            CPIMHeaders::Deflated(headers) => headers
+                .iter()
+                .map(|header| (self.ns.inflate(header.get_name()), header.get_value()))
+                .collect(),
 
-                let inflator = self.ns.as_inflator();
-                for header in headers {
-                    inflated_headers.push(inflator(&header));
+            CPIMHeaders::Inflated(headers) => headers
+                .iter()
+                .map(|header| (header.get_name().to_vec(), header.get_value()))
+                .collect(),
+        }
+    }
+
+    /// The values of each header named `name`, in order, such as every To, cc
+    /// or Subject. A name in a namespace is written as
+    /// CPIMNamespace::inflate() writes it: `<urn:ietf:params:imdn>.Message-ID`.
+    pub fn get_values(&self, name: &[u8]) -> Vec<CPIMHeaderValue<'_>> {
+        self.inflated_headers()
+            .into_iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| CPIMHeaderValue::parse(v))
+            .collect()
+    }
+
+    /// The names listed by Require headers (RFC 3862 section 3.5), written as
+    /// get_values() takes them, that are not in `understood`. The sender
+    /// requires each to be understood, so a message with any left is not to
+    /// be taken as understood. NS and Require are understood here.
+    pub fn get_unmet_requirements(&self, understood: &[&[u8]]) -> Vec<Vec<u8>> {
+        let mut unmet: Vec<Vec<u8>> = Vec::new();
+        for required in self.get_values(b"Require") {
+            for name in required.value.split(|c| *c == b',') {
+                let name = self.ns.inflate(syntax::trim(name));
+                if !name.is_empty()
+                    && name != b"NS"
+                    && name != b"Require"
+                    && !understood.contains(&&name[..])
+                    && !unmet.contains(&name)
+                {
+                    unmet.push(name);
                 }
-
-                self.get_info_from_inflated_headers(inflated_headers)
-            }
-
-            CPIMHeaders::Inflated(headers) => {
-                let mut inflated_headers: Vec<(Vec<u8>, &[u8])> = Vec::with_capacity(headers.len());
-
-                for header in headers {
-                    inflated_headers.push((header.get_name().to_vec(), header.get_value()));
-                }
-
-                self.get_info_from_inflated_headers(inflated_headers)
             }
         }
+        unmet
     }
 
     pub fn get_message_body(&'a self) -> Option<(Option<&'a [u8]>, &'a [u8], bool)> {

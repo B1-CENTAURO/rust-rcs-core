@@ -34,23 +34,27 @@ impl<'r> CPIMNamespace {
         self.registered_namespaces.insert(n, v);
     }
 
-    pub fn as_inflator(&'r self) -> Box<dyn Fn(&Header) -> (Vec<u8>, &[u8]) + 'r> {
-        Box::new(|header| {
-            let mut iter = header.get_name().iter();
-            if let Some(position) = iter.position(|c| *c == b'.') {
-                for (k, v) in &self.registered_namespaces {
-                    if &header.get_name()[..position] == k {
-                        let mut inflated = b"<".to_vec();
-                        inflated.extend(v);
-                        inflated.extend(b">.");
-                        inflated.extend(iter);
-                        return (inflated, header.get_value());
-                    }
+    /// `name` with its namespace prefix, if registered, written out as the
+    /// namespace URI: `imdn.Message-ID` as `<urn:ietf:params:imdn>.Message-ID`
+    pub fn inflate(&self, name: &[u8]) -> Vec<u8> {
+        let mut iter = name.iter();
+        if let Some(position) = iter.position(|c| *c == b'.') {
+            for (k, v) in &self.registered_namespaces {
+                if &name[..position] == k {
+                    let mut inflated = b"<".to_vec();
+                    inflated.extend(v);
+                    inflated.extend(b">.");
+                    inflated.extend(iter);
+                    return inflated;
                 }
             }
+        }
 
-            (header.get_name().to_vec(), header.get_value())
-        })
+        name.to_vec()
+    }
+
+    pub fn as_inflator(&'r self) -> Box<dyn Fn(&Header) -> (Vec<u8>, &[u8]) + 'r> {
+        Box::new(|header| (self.inflate(header.get_name()), header.get_value()))
     }
 
     pub fn as_deflator(&'r self) -> Box<dyn Fn(&Header) -> (Option<Header>, Cow<Header>) + 'r> {

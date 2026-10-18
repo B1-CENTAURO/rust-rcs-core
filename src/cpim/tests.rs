@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ use crate::internet::body::message_body::MessageBody;
 use crate::internet::body::Body;
 use crate::internet::header::Header;
 
-use super::CPIMMessage;
+use super::{unescape, CPIMHeaderValue, CPIMMessage};
 
 const IMDN: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
 <imdn xmlns=\"urn:ietf:params:xml:ns:imdn\">\r\n\
@@ -28,6 +29,24 @@ const IMDN: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
 <datetime>2023-04-04T12:16:49.000+08:00</datetime>\r\n\
 <delivery-notification><status><delivered/></status></delivery-notification>\r\n\
 </imdn>";
+
+// RFC 3862 section 5.1, without the MIME headers before it
+const RFC_3862_EXAMPLE: &[u8] = b"From: MR SANDERS <im:piglet@100akerwood.com>\r\n\
+To: Depressed Donkey <im:eeyore@100akerwood.com>\r\n\
+DateTime: 2000-12-13T13:40:00-08:00\r\n\
+Subject: the weather will be fine today\r\n\
+Subject:;lang=fr beau temps prevu pour aujourd'hui\r\n\
+NS: MyFeatures <mid:MessageFeatures@id.foo.com>\r\n\
+Require: MyFeatures.VitalMessageOption\r\n\
+MyFeatures.VitalMessageOption: Confirmation-requested\r\n\
+MyFeatures.WackyMessageOption: Use-silly-font\r\n\
+\r\n\
+Content-type: text/xml; charset=utf-8\r\n\
+Content-ID: <1234567890@foo.com>\r\n\
+\r\n\
+<body>\r\n\
+Here is the text of my message.\r\n\
+</body>\r\n";
 
 /// A CPIM message carrying `content`, written as an RCS client writes one
 fn cpim(content_headers: Vec<Header>, content: &[u8]) -> Vec<u8> {
@@ -199,4 +218,146 @@ fn folded_mime_headers_are_read() {
         message.get_message_body(),
         Some((Some(&b"text/plain; charset=UTF-8"[..]), &b"hi"[..], false))
     );
+}
+
+fn values(message: &CPIMMessage, name: &[u8]) -> Vec<Vec<u8>> {
+    message
+        .get_values(name)
+        .iter()
+        .map(|value| value.value.to_vec())
+        .collect()
+}
+
+#[test]
+fn subjects_are_read_with_their_languages() {
+    let message = parse(RFC_3862_EXAMPLE);
+    let subjects = message.get_values(b"Subject");
+
+    assert_eq!(subjects.len(), 2);
+    assert_eq!(subjects[0].lang(), None);
+    assert_eq!(subjects[0].value, b"the weather will be fine today");
+    assert_eq!(subjects[1].lang(), Some(&b"fr"[..]));
+    assert_eq!(subjects[1].value, b"beau temps prevu pour aujourd'hui");
+}
+
+#[test]
+fn parameters_are_split_from_values() {
+    let value = CPIMHeaderValue::parse(b";lang=fr;x=\"a; \\\"b\";flag text; with ;semicolons");
+    assert_eq!(
+        value.parameters,
+        [
+            (&b"lang"[..], &b"fr"[..]),
+            (b"x", b"\"a; \\\"b\""),
+            (b"flag", b""),
+        ]
+    );
+    assert_eq!(value.value, b"text; with ;semicolons");
+
+    let value = CPIMHeaderValue::parse(b"<sip:alice@example.com>");
+    assert!(value.parameters.is_empty());
+    assert_eq!(value.value, b"<sip:alice@example.com>");
+}
+
+#[test]
+fn every_to_and_cc_is_read() {
+    let message = parse(
+        b"From: <sip:alice@example.com>\r\n\
+To:;x=1 <sip:bob@example.com>\r\n\
+To: Carol <sip:carol@example.com>\r\n\
+cc: <sip:dave@example.com>\r\n\
+cc: <sip:erin@example.com>\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: x1\r\n\
+DateTime: 2023-04-04T12:16:49Z\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hi",
+    );
+
+    assert_eq!(
+        values(&message, b"To"),
+        [
+            &b"<sip:bob@example.com>"[..],
+            b"Carol <sip:carol@example.com>"
+        ]
+    );
+    assert_eq!(
+        values(&message, b"cc"),
+        [&b"<sip:dave@example.com>"[..], b"<sip:erin@example.com>"]
+    );
+    assert_eq!(
+        values(&message, b"<urn:ietf:params:imdn>.Message-ID"),
+        [b"x1"]
+    );
+
+    // the first To, without its parameter
+    let info = message.get_info().unwrap();
+    assert_eq!(info.to, b"<sip:bob@example.com>");
+    assert!(info.to_uri.is_some());
+}
+
+#[test]
+fn requirements_not_understood_are_listed() {
+    let message = parse(RFC_3862_EXAMPLE);
+    let vital: &[u8] = b"<mid:MessageFeatures@id.foo.com>.VitalMessageOption";
+    assert_eq!(message.get_unmet_requirements(&[]), [vital]);
+    assert!(message.get_unmet_requirements(&[vital]).is_empty());
+
+    // several Require headers and lists, with NS and Require understood here
+    let message = parse(
+        b"From: <sip:alice@example.com>\r\n\
+NS: x <urn:example:x>\r\n\
+Require: x.One, x.Two,Subject\r\n\
+Require: x.One\r\n\
+Require: NS,Require\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hi",
+    );
+    assert_eq!(
+        message.get_unmet_requirements(&[b"Subject"]),
+        [&b"<urn:example:x>.One"[..], b"<urn:example:x>.Two"]
+    );
+}
+
+#[test]
+fn escapes_are_decoded() {
+    for (escaped, unescaped) in [
+        (&b"a\\\\b \\\"q\\\" \\'s\\'"[..], "a\\b \"q\" 's'"),
+        (b"\\b\\t\\n\\r", "\u{8}\t\n\r"),
+        (b"caf\\u00e9 \\u0007 \\u00E9", "caf\u{e9} \u{7} \u{e9}"),
+        (b"\\uD83D\\uDE00", "\u{1f600}"),
+        (b"\\ud83d alone", "\u{fffd} alone"),
+        (b"\\x \\u12 \\u+123", "x u12 u+123"),
+        (b"end\\", "end"),
+    ] {
+        assert_eq!(
+            unescape(escaped),
+            unescaped.as_bytes(),
+            "{:?}",
+            String::from_utf8_lossy(escaped)
+        );
+    }
+
+    assert!(matches!(unescape(b"plain"), Cow::Borrowed(b"plain")));
+}
+
+#[test]
+fn values_are_read_from_a_message_built_with_new() {
+    let message = CPIMMessage::new(
+        &[(b"imdn", b"urn:ietf:params:imdn")],
+        vec![
+            Header::new(b"imdn.Message-ID", b"x1"),
+            Header::new(b"Subject", b";lang=en hello"),
+        ],
+        Body::Raw(Vec::new()),
+    );
+
+    assert_eq!(
+        values(&message, b"<urn:ietf:params:imdn>.Message-ID"),
+        [b"x1"]
+    );
+    assert_eq!(message.get_values(b"Subject")[0].lang(), Some(&b"en"[..]));
 }
