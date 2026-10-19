@@ -66,6 +66,59 @@ const _T4: Duration = Duration::from_millis(5000);
 
 const LOG_TAG: &str = "librust_rcs_client";
 
+type Transports = Arc<Mutex<Vec<(Arc<SipTransport>, mpsc::Sender<Option<Vec<u8>>>)>>>;
+
+/// What a server transaction sends its responses with: the transport the
+/// request came over, if still registered
+fn respond_through(
+    transports: &Transports,
+    rt: &Arc<Runtime>,
+) -> impl Fn(&Arc<SipTransport>, Vec<u8>) -> bool + Send + Sync + 'static {
+    let transports = Arc::clone(transports);
+    let rt = HeldRuntime::new(rt);
+    move |transport_, data| {
+        let guard = transports.lock().unwrap();
+        for (transport, tx) in &*guard {
+            // to-do: usually we would be sending the response message back to
+            // where we received the request, but there might be some
+            // exceptions though
+            if Arc::ptr_eq(transport, transport_) {
+                let tx = tx.clone();
+                rt.spawn(async move {
+                    match tx.send(Some(data)).await {
+                        Ok(()) => {}
+                        Err(_) => platform_log(LOG_TAG, "data is not sent to transport"),
+                    }
+                });
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Answers `cancel` in a transaction of its own, with `status_code` and the To
+/// tag `to_tag` holds, else one of its own
+fn answer_cancel(
+    cancel: SipMessage,
+    transport: &Arc<SipTransport>,
+    to_tag: Option<&Arc<Mutex<Option<Vec<u8>>>>>,
+    status_code: u16,
+    reason_phrase: &[u8],
+    transports: &Transports,
+    rt: &Arc<Runtime>,
+) {
+    let transaction = NISTransaction::new(cancel, transport, respond_through(transports, rt));
+    let to_tag = to_tag.unwrap_or(&transaction.to_tag);
+    if let Some(resp_message) =
+        server_transaction::make_response(&transaction.message, to_tag, status_code, reason_phrase)
+    {
+        if let Ok(nis_transaction::SendResult::TimerJ) = transaction.send_response(resp_message) {
+            transaction.on_timer_j(); // to-do: udp
+        }
+    }
+}
+
 pub struct SipTransactionManagerEventInterface {
     pub event_rx: mpsc::Receiver<(
         Arc<ServerTransaction>,
@@ -96,10 +149,14 @@ impl SipTransactionManager {
         rt.spawn(async move {
             let rt: &Arc<Runtime> = &rt_;
             'thread: loop {
-                match rx.recv().await { // to-do: use select! to separate TransportMessage or a Kind of Control Message
+                match rx.recv().await {
+                    // to-do: use select! to separate TransportMessage or a Kind of Control Message
                     Some(TransportMessage::Incoming(transport, message)) => match &message {
                         SipMessage::Request(req_line, _, _) => {
                             platform_log(LOG_TAG, "incoming sip request");
+                            // the To tag the transaction the request matches
+                            // is answered with
+                            let mut matched = None;
                             let mut i = 0;
                             while i < server_transactions.len() {
                                 let (transaction, tx) = &server_transactions[i];
@@ -133,35 +190,38 @@ impl SipTransactionManager {
                                         }
                                         _ => {}
                                     }
-                                    continue 'thread;
+                                    matched = Some(Arc::clone(transaction.to_tag()));
+                                    break;
                                 } else {
                                     i = i + 1;
                                 }
                             }
 
+                            if let Some(to_tag) = matched {
+                                // a CANCEL matching a transaction is answered,
+                                // whether or not it could still end it, with
+                                // the To tag of the request's answers (RFC 3261
+                                // section 9.2)
+                                if req_line.method == CANCEL {
+                                    answer_cancel(
+                                        message,
+                                        &transport,
+                                        Some(&to_tag),
+                                        200,
+                                        b"OK",
+                                        &transports_,
+                                        rt,
+                                    );
+                                }
+                                continue 'thread;
+                            }
+
                             if req_line.method == INVITE {
-                                let transports = Arc::clone(&transports_);
                                 let (tx, rx) = mpsc::channel(8);
-                                let rt_ = HeldRuntime::new(rt);
                                 let transaction = ISTransaction::new(
                                     message,
                                     &transport,
-                                    move |transport_, data| {
-                                        let guard = transports.lock().unwrap();
-                                        for (transport, tx) in &*guard {
-                                            if Arc::ptr_eq(transport, &transport_) { // to-do: usually we would be sending the response message back to where we received the request, but there might be some exceptions though
-                                                let tx = tx.clone();
-                                                rt_.spawn(async move {
-                                                    match tx.send(Some(data)).await {
-                                                        Ok(()) => {},
-                                                        Err(_) => platform_log(LOG_TAG, "data is not sent to transport"),
-                                                    }
-                                                });
-                                                return true;
-                                            }
-                                        }
-                                        false
-                                    },
+                                    respond_through(&transports_, rt),
                                 );
                                 let transaction = ServerTransaction::IS(transaction);
                                 let transaction = Arc::new(transaction);
@@ -176,73 +236,47 @@ impl SipTransactionManager {
                                 let tx_ = tx.clone();
                                 server_transactions.push((t, tx_));
                                 match ev_tx.send((transaction, tx, rx)).await {
-                                    Ok(()) => {},
+                                    Ok(()) => {}
                                     Err(_) => {
-                                        platform_log(LOG_TAG, "incoming transaction not send to event processor");
-                                    },
+                                        platform_log(
+                                            LOG_TAG,
+                                            "incoming transaction not send to event processor",
+                                        );
+                                    }
                                 }
+                            } else if req_line.method == CANCEL {
+                                answer_cancel(
+                                    message,
+                                    &transport,
+                                    None,
+                                    481,
+                                    b"Transaction Does Not Exist",
+                                    &transports_,
+                                    rt,
+                                );
                             } else {
-                                let is_cancel = req_line.method == CANCEL;
-                                let transports = Arc::clone(&transports_);
                                 let (tx, rx) = mpsc::channel(8);
-                                let rt_ = HeldRuntime::new(rt);
                                 let transaction = NISTransaction::new(
                                     message,
                                     &transport,
-                                    move |transport_, data| {
-                                        let guard = transports.lock().unwrap();
-                                        for (transport, tx) in &*guard {
-                                            if Arc::ptr_eq(transport, &transport_) { // to-do: usually we would be sending the response message back to where we received the request, but there might be some exceptions though
-                                                let tx = tx.clone();
-                                                rt_.spawn(async move {
-                                                    match tx.send(Some(data)).await {
-                                                        Ok(()) => {},
-                                                        Err(_) => platform_log(LOG_TAG, "data is not sent to transport"),
-                                                    }
-                                                });
-                                                return true;
-                                            }
-                                        }
-                                        false
-                                    },
+                                    respond_through(&transports_, rt),
                                 );
                                 let transaction = ServerTransaction::NIS(transaction);
                                 let transaction = Arc::new(transaction);
                                 let t = Arc::clone(&transaction);
                                 let tx_ = tx.clone();
                                 server_transactions.push((t, tx_));
-                                if is_cancel {
-                                    if let ServerTransaction::NIS(transaction) = &*transaction {
-                                        let resp_message = server_transaction::make_response(
-                                            &transaction.message,
-                                            &transaction.to_tag,
-                                            481,
-                                            b"Transaction Does Not Exist",
+                                match ev_tx.send((transaction, tx, rx)).await {
+                                    Ok(()) => {}
+                                    Err(_) => {
+                                        platform_log(
+                                            LOG_TAG,
+                                            "incoming transaction not send to event processor",
                                         );
-                                        if let Some(resp_message) = resp_message {
-                                            if let Ok(result) =
-                                                transaction.send_response(resp_message)
-                                            {
-                                                match result {
-                                                    nis_transaction::SendResult::TimerJ => {
-                                                        transaction.on_timer_j();
-                                                        // to-do: udp
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    match ev_tx.send((transaction, tx, rx)).await {
-                                        Ok(()) => {},
-                                        Err(_) => {
-                                            platform_log(LOG_TAG, "incoming transaction not send to event processor");
-                                        },
                                     }
                                 }
                             }
-                        },
+                        }
 
                         SipMessage::Response(_, _, _) => {
                             platform_log(LOG_TAG, "incoming sip response");
@@ -252,7 +286,13 @@ impl SipTransactionManager {
                                     if let Ok((timer_d, timer_m, timer_k)) =
                                         transaction.on_response(message)
                                     {
-                                        platform_log(LOG_TAG, format!("response processed d/{} m/{} k/{}", timer_d, timer_m, timer_k));
+                                        platform_log(
+                                            LOG_TAG,
+                                            format!(
+                                                "response processed d/{} m/{} k/{}",
+                                                timer_d, timer_m, timer_k
+                                            ),
+                                        );
                                         if timer_d {
                                             transaction.on_timer_d(); // to-do: udp
                                         }
@@ -284,14 +324,17 @@ impl SipTransactionManager {
                                     let tx = tx.clone();
                                     rt_.spawn(async move {
                                         match tx.send(Some(pong)).await {
-                                            Ok(()) => {},
-                                            Err(_) => platform_log(LOG_TAG, "heartbeat response is not sent to transport"),
+                                            Ok(()) => {}
+                                            Err(_) => platform_log(
+                                                LOG_TAG,
+                                                "heartbeat response is not sent to transport",
+                                            ),
                                         }
                                     });
                                     break;
                                 }
                             }
-                        },
+                        }
 
                         SipMessage::Pong => {
                             let mut idx = 0;
@@ -303,18 +346,18 @@ impl SipTransactionManager {
                                 }
                                 idx += 1;
                             }
-                        },
+                        }
                     },
 
                     Some(TransportMessage::Outgoing(transaction)) => {
                         transaction.start();
                         client_transactions.push(transaction);
-                    },
+                    }
 
                     Some(TransportMessage::Heartbeat(transaction)) => {
                         transaction.start();
                         heartbeat_transactions.push(transaction);
-                    },
+                    }
 
                     Some(TransportMessage::Drop(transport)) => {
                         let mut i = 0;
@@ -325,8 +368,10 @@ impl SipTransactionManager {
                             if Arc::ptr_eq(transport_, &transport) {
                                 let (_, tx) = server_transactions.swap_remove(i);
                                 match tx.send(ServerTransactionEvent::TransportError).await {
-                                    Ok(()) => {},
-                                    Err(_) => platform_log(LOG_TAG, "transaction event not handled"),
+                                    Ok(()) => {}
+                                    Err(_) => {
+                                        platform_log(LOG_TAG, "transaction event not handled")
+                                    }
                                 }
                             } else {
                                 i = i + 1;
@@ -344,15 +389,15 @@ impl SipTransactionManager {
                                 i = i + 1;
                             }
                         }
-                    },
+                    }
 
                     Some(TransportMessage::Exit) => {
                         return ();
-                    },
+                    }
 
                     None => {
                         return ();
-                    },
+                    }
                 }
             }
         });

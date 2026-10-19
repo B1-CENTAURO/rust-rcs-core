@@ -1226,3 +1226,167 @@ fn a_refusal_of_an_invite_is_acknowledged_by_the_transaction() {
     assert_eq!(header_value(&ack, b"To"), b"<sip:bob@example.com>;tag=bob1");
     assert_eq!(header_value(&ack, b"Route"), b"<sip:pcscf.example.com;lr>");
 }
+
+/// A transaction manager over a transport whose far end is the peer, with
+/// what it is told of the transactions requests start
+fn transaction_manager(
+    rt: &Arc<Runtime>,
+) -> (
+    Arc<SipTransactionManager>,
+    super::sip_transaction::SipTransactionManagerEventInterface,
+    Peer,
+) {
+    let (tm, tm_events) = SipTransactionManager::new(rt);
+    let tm = Arc::new(tm);
+    let transport = Arc::new(SipTransport::new::<DuplexStream>(
+        String::from("192.0.2.10:5060"),
+        SipTransportType::TCP,
+    ));
+    let (ours, theirs) = tokio::io::duplex(65536);
+    let tx = setup_sip_transport(&transport, ours, tm.get_ctrl_itf(), Arc::clone(rt), || {});
+    tm.register_sip_transport(transport, tx);
+    (
+        tm,
+        tm_events,
+        Peer {
+            stream: theirs,
+            parser: SipParser::new(),
+        },
+    )
+}
+
+/// An INVITE from the peer, or its CANCEL if `method` is CANCEL
+fn incoming(method: &str, call_id: &str) -> String {
+    format!(
+        "{} sip:bob@192.0.2.10:5060 SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bK{}\r\n\
+From: <sip:alice@example.com>;tag=alice1\r\n\
+To: <sip:bob@example.com>\r\n\
+Call-ID: {}\r\n\
+CSeq: 1 {}\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\
+\r\n",
+        method, call_id, call_id, method
+    )
+}
+
+/// The status code and CSeq method of `response`
+fn answer_to(response: &SipMessage) -> (u16, String) {
+    let cseq = String::from_utf8(header_value(response, b"CSeq")).unwrap();
+    let method = cseq.split(' ').last().unwrap_or_default();
+    (status_code(response), String::from(method))
+}
+
+/// The INVITE the peer sent, as the transaction manager tells of it, given
+/// `status_code`
+fn answer_incoming_invite(
+    rt: &Arc<Runtime>,
+    tm_events: &mut super::sip_transaction::SipTransactionManagerEventInterface,
+    status_code: u16,
+    reason_phrase: &[u8],
+) -> (
+    Arc<super::sip_transaction::server_transaction::ServerTransaction>,
+    tokio::sync::mpsc::Receiver<super::sip_transaction::server_transaction::ServerTransactionEvent>,
+) {
+    use super::sip_transaction::server_transaction;
+
+    let (transaction, tx, rx) = rt
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), tm_events.event_rx.recv()).await
+        })
+        .expect("the INVITE told of")
+        .unwrap();
+    let response = server_transaction::make_response(
+        transaction.message(),
+        transaction.to_tag(),
+        status_code,
+        reason_phrase,
+    )
+    .unwrap();
+    server_transaction::send_response(Arc::clone(&transaction), response, tx, rt);
+    (transaction, rx)
+}
+
+#[test]
+fn a_cancel_ends_a_ringing_invite_and_is_answered_itself() {
+    use super::sip_transaction::server_transaction::ServerTransactionEvent;
+
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (_tm, mut tm_events, mut peer) = transaction_manager(&rt);
+
+    peer.send(&rt, &incoming("INVITE", "cancelled"));
+    let (_transaction, mut events) = answer_incoming_invite(&rt, &mut tm_events, 180, b"Ringing");
+    let ringing = peer.next(&rt);
+    assert_eq!(status_code(&ringing), 180);
+
+    // each with a Content-Length, else the peer could not read them, and the
+    // To tag the INVITE is answered with
+    peer.send(&rt, &incoming("CANCEL", "cancelled"));
+    let mut answers = vec![peer.next(&rt), peer.next(&rt)];
+    answers.sort_by_key(|answer| answer_to(answer).1);
+    assert_eq!(answer_to(&answers[0]), (200, String::from("CANCEL")));
+    assert_eq!(answer_to(&answers[1]), (487, String::from("INVITE")));
+    for answer in &answers {
+        assert_eq!(to_tag(answer), to_tag(&ringing));
+    }
+
+    let event =
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), events.recv()).await });
+    assert!(matches!(event, Ok(Some(ServerTransactionEvent::Cancelled))));
+}
+
+#[test]
+fn a_cancel_after_the_final_answer_is_answered_alone() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (_tm, mut tm_events, mut peer) = transaction_manager(&rt);
+
+    peer.send(&rt, &incoming("INVITE", "answered"));
+    let _invite = answer_incoming_invite(&rt, &mut tm_events, 486, b"Busy Here");
+    let busy = peer.next(&rt);
+    assert_eq!(answer_to(&busy), (486, String::from("INVITE")));
+
+    peer.send(&rt, &incoming("CANCEL", "answered"));
+    let ok = peer.next(&rt);
+    assert_eq!(answer_to(&ok), (200, String::from("CANCEL")));
+    assert_eq!(to_tag(&ok), to_tag(&busy));
+
+    // and nothing more, as the INVITE was answered already
+    peer.send(&rt, &incoming("CANCEL", "unknown"));
+    assert_eq!(
+        answer_to(&peer.next(&rt)),
+        (481, String::from("CANCEL")),
+        "the next thing the peer reads"
+    );
+}
+
+#[test]
+fn a_trying_sent_for_an_invite_left_unanswered_has_a_content_length() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (_tm, _tm_events, mut peer) = transaction_manager(&rt);
+
+    peer.send(&rt, &incoming("INVITE", "unanswered"));
+    let trying = peer.next(&rt);
+    assert_eq!(answer_to(&trying), (100, String::from("INVITE")));
+    assert_eq!(header_value(&trying, b"Content-Length"), b"0");
+}
+
+#[test]
+fn a_response_is_given_a_content_length_once() {
+    use super::sip_transaction::server_transaction::with_content_length;
+
+    let bare = with_content_length(SipMessage::new_response(200, b"OK"));
+    assert_eq!(header_values(&bare, b"Content-Length"), ["0"]);
+
+    let mut given = SipMessage::new_response(200, b"OK");
+    given.add_header(Header::new(b"Content-Length", b"0"));
+    let given = with_content_length(given);
+    assert_eq!(header_values(&given, b"Content-Length"), ["0"]);
+
+    // one with a body is left to give its own
+    let mut with_body = SipMessage::new_response(200, b"OK");
+    with_body.add_header(Header::new(b"Content-Type", b"application/sdp"));
+    with_body.set_body(Arc::new(Body::Raw(b"v=0\r\n".to_vec())));
+    let with_body = with_content_length(with_body);
+    assert!(header_values(&with_body, b"Content-Length").is_empty());
+}

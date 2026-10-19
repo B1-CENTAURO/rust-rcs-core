@@ -73,6 +73,7 @@ impl ISTransaction {
 
     /// Returns Ok(('should start timer_h', 'should start timer_l')) on success
     pub fn send_response(&self, resp_message: SipMessage) -> Result<SendResult, &'static str> {
+        let resp_message = server_transaction::with_content_length(resp_message);
         if let SipMessage::Response(resp_line, _, _) = &resp_message {
             if resp_line.status_code >= 100 && resp_line.status_code < 200 {
                 let mut guard = self.state.lock().unwrap();
@@ -227,7 +228,8 @@ impl ISTransaction {
                     &self.to_tag,
                     487,
                     b"Request Terminated",
-                );
+                )
+                .map(server_transaction::with_content_length);
                 if let Some(resp_message) = resp_message {
                     let data = build_message_data(&resp_message);
 
@@ -260,7 +262,8 @@ impl ISTransaction {
         match guard.0 {
             State::None => {
                 let resp_message =
-                    server_transaction::make_response(&self.message, &self.to_tag, 100, b"Trying");
+                    server_transaction::make_response(&self.message, &self.to_tag, 100, b"Trying")
+                        .map(server_transaction::with_content_length);
                 if let Some(resp_message) = resp_message {
                     let data = build_message_data(&resp_message);
 
