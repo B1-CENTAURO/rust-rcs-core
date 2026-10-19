@@ -223,7 +223,10 @@ impl ClientTransactionCallbacks for InitialSubscribeContext {
 
                     if let Ok(dialog) =
                         SipDialog::try_new_as_uac(request_headers, &message, move |d| {
-                            match d_tx.blocking_send(d) {
+                            // the one dialog the channel holds never
+                            // waits, even from within the runtime, where
+                            // blocking_send panics
+                            match d_tx.try_send(d) {
                                 Ok(()) => {}
                                 Err(e) => {}
                             }
@@ -407,10 +410,12 @@ impl ClientTransactionCallbacks for SubscriptionRefreshContext {
                         self.subscription
                             .dialog
                             .on_terminating_response(&message, &self.rt);
-                    } else {
-                        self.subscription
-                            .dialog
-                            .unregister_user(&self.subscription_dialog_user_key);
+                    } else if let Some(on_dispose) = self
+                        .subscription
+                        .dialog
+                        .unregister_user(&self.subscription_dialog_user_key)
+                    {
+                        on_dispose(Arc::clone(&self.subscription.dialog));
                     }
 
                     self.subscribe_request
@@ -427,9 +432,13 @@ impl ClientTransactionCallbacks for SubscriptionRefreshContext {
         self.subscribe_request
             .get_subscriber()
             .remove_subscription(self.subscription_key);
-        self.subscription
+        if let Some(on_dispose) = self
+            .subscription
             .dialog
-            .unregister_user(&self.subscription_dialog_user_key);
+            .unregister_user(&self.subscription_dialog_user_key)
+        {
+            on_dispose(Arc::clone(&self.subscription.dialog));
+        }
         self.subscribe_request
             .get_subscriber()
             .on_event(SubscriberEvent::SubscribeFailed(0));
@@ -525,7 +534,11 @@ impl SipDialogEventCallbacks for SubscriptionDialogListener {
                                         subscription_state.retry_after,
                                     ));
 
-                                // subscriber_remove_terminated_subscription
+                                // gone from the subscriber, the dialog
+                                // lets go of it on our answer
+                                self.subscription
+                                    .subscriber
+                                    .remove_subscription(self.subscription_key);
 
                                 return Some((200, true));
                             } else {
@@ -592,13 +605,19 @@ impl SipDialogEventCallbacks for SubscriptionDialogListener {
         None
     }
 
-    fn on_terminating_request(&self, message: &SipMessage) {
-        todo!()
+    /// The dialog ended under the subscription, which ends with it
+    fn on_terminating_request(&self, _message: &SipMessage) {
+        self.subscription
+            .subscriber
+            .remove_subscription(self.subscription_key);
+        self.subscription
+            .subscriber
+            .on_event(SubscriberEvent::Terminated(None, true, 0));
     }
 
-    fn on_terminating_response(&self, message: &SipMessage) {
-        todo!()
-    }
+    /// A SUBSCRIBE refused: what sent it tells of the failure, holding the
+    /// subscriber's subscriptions as it may
+    fn on_terminating_response(&self, _message: &SipMessage) {}
 }
 
 pub struct SubscriptionManager {

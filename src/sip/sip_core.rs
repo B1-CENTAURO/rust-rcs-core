@@ -259,13 +259,17 @@ impl SipCore {
                                                 // 		}
                                                 // 	}
 
-                                                dialog.on_request(
+                                                // a dialog the request ended
+                                                // is let go of
+                                                if let Some(on_dispose) = dialog.on_request(
                                                     &transaction,
                                                     tx,
                                                     &rt,
                                                     &mut seq_guard,
                                                     lh_seq,
-                                                );
+                                                ) {
+                                                    on_dispose(Arc::clone(dialog));
+                                                }
 
                                                 continue 'thread;
                                             }
@@ -498,7 +502,10 @@ fn process_out_of_dialog_notify_request(
 
                             if let Ok(dialog) =
                                 SipDialog::try_new_as_uas(message, &resp_message, move |d| {
-                                    match d_tx.blocking_send(d) {
+                                    // the one dialog the channel holds
+                                    // never waits, even from within the
+                                    // runtime, where blocking_send panics
+                                    match d_tx.try_send(d) {
                                         Ok(()) => {}
                                         Err(e) => {}
                                     }

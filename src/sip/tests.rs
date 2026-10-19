@@ -504,6 +504,227 @@ Content-Length: 0\r\n\
     );
 }
 
+#[test]
+fn the_dialog_of_a_subscription_goes_once_it_is_terminated() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (tm, tm_events) = SipTransactionManager::new(&rt);
+    let tm = Arc::new(tm);
+    let sm = Arc::new(SubscriptionManager::new(500));
+    let core = Arc::new(SipCore::new(
+        &sm,
+        &tm,
+        tm_events,
+        vec![b"NOTIFY"],
+        Vec::new(),
+        &rt,
+    ));
+    let transport = Arc::new(SipTransport::new::<DuplexStream>(
+        String::from("192.0.2.10:5060"),
+        SipTransportType::TCP,
+    ));
+    let (ours, theirs) = tokio::io::duplex(65536);
+    let tx = setup_sip_transport(&transport, ours, tm.get_ctrl_itf(), Arc::clone(&rt), || {});
+    tm.register_sip_transport(Arc::clone(&transport), tx);
+    let mut peer = Peer {
+        stream: theirs,
+        parser: SipParser::new(),
+    };
+
+    let (terminated_tx, terminated_rx) = mpsc::channel();
+    let subscriber = Arc::new(Subscriber::new(
+        "test",
+        move |subscriber_event| {
+            if let SubscriberEvent::Terminated(..) = subscriber_event {
+                let _ = terminated_tx.send(());
+            }
+        },
+        move |_, expiration| {
+            let mut message = SipMessage::new_request(SUBSCRIBE, b"sip:conf1@example.com");
+            message.add_header(Header::new(b"Call-ID", b"subscription-1"));
+            message.add_header(Header::new(b"CSeq", b"1 SUBSCRIBE"));
+            message.add_header(Header::new(b"From", b"<sip:alice@example.com>;tag=sub1"));
+            message.add_header(Header::new(b"To", b"<sip:conf1@example.com>"));
+            message.add_header(Header::new(
+                b"Contact",
+                b"<sip:alice@192.0.2.10:5060;transport=tcp>",
+            ));
+            message.add_header(Header::new(b"Expires", expiration.to_string()));
+            message.add_header(Header::new(b"Event", b"conference"));
+            Ok(message)
+        },
+    ));
+    let request = subscriber.build_request(None, 600).unwrap();
+    let subscribe_request =
+        Arc::new(SubscribeRequest::new(&request, Arc::clone(&subscriber)).unwrap());
+    sm.register_request(Arc::clone(&subscribe_request), &rt);
+    tm.send_request(
+        request,
+        &transport,
+        InitialSubscribeContext::new(subscribe_request, Arc::clone(&core), Arc::clone(&rt)),
+        &rt,
+    );
+
+    let subscribe = peer.next(&rt);
+    peer.send(
+        &rt,
+        &ok(
+            &subscribe,
+            "notifier1",
+            "Expires: 600\r\nContact: <sip:conf1@192.0.2.1:5060;transport=tcp>\r\n",
+        ),
+    );
+
+    let notify = |seq: u32, state: &str| {
+        format!(
+            "NOTIFY sip:alice@192.0.2.10:5060;transport=tcp SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bKnotify{}\r\n\
+From: <sip:conf1@example.com>;tag=notifier1\r\n\
+To: <sip:alice@example.com>;tag=sub1\r\n\
+Call-ID: subscription-1\r\n\
+CSeq: {} NOTIFY\r\n\
+Contact: <sip:conf1@192.0.2.1:5060;transport=tcp>\r\n\
+Event: conference\r\n\
+Subscription-State: {}\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\
+\r\n",
+            seq, seq, state
+        )
+    };
+
+    peer.send(&rt, &notify(1, "active;expires=600"));
+    assert_eq!(status_code(&peer.next(&rt)), 200);
+    let dialogs = || core.get_ongoing_dialogs().lock().unwrap().len();
+    assert_eq!(dialogs(), 1, "the subscription's dialog");
+
+    // ended by the notifier, the dialog goes, let go of from within the
+    // runtime as it is
+    peer.send(&rt, &notify(2, "terminated;reason=noresource"));
+    assert_eq!(status_code(&peer.next(&rt)), 200);
+    assert_eq!(terminated_rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+    let gone = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        dialogs() == 0
+    });
+    assert!(gone, "the dialog of the subscription went");
+    assert!(
+        subscriber.get_subscriptions().lock().unwrap().is_empty(),
+        "nor is the subscription kept"
+    );
+}
+
+/// A user of a dialog, telling when the dialog ends under it
+struct EndedUser(std::sync::Mutex<mpsc::Sender<()>>);
+
+impl super::SipDialogEventCallbacks for EndedUser {
+    fn on_ack(&self, _transaction: &Arc<super::ServerTransaction>) {}
+
+    fn on_new_request(
+        &self,
+        _transaction: Arc<super::ServerTransaction>,
+        _tx: tokio::sync::mpsc::Sender<super::ServerTransactionEvent>,
+        _rt: &Arc<Runtime>,
+    ) -> Option<(u16, bool)> {
+        None
+    }
+
+    fn on_terminating_request(&self, _message: &SipMessage) {
+        let _ = self.0.lock().unwrap().send(());
+    }
+
+    fn on_terminating_response(&self, _message: &SipMessage) {}
+}
+
+#[test]
+fn a_dialog_ended_by_a_bye_goes() {
+    use super::sip_core::SipDialogCache;
+
+    let rt = Arc::new(Runtime::new().unwrap());
+    let (tm, tm_events) = SipTransactionManager::new(&rt);
+    let tm = Arc::new(tm);
+    let sm = Arc::new(SubscriptionManager::new(500));
+    let core = Arc::new(SipCore::new(
+        &sm,
+        &tm,
+        tm_events,
+        vec![BYE],
+        Vec::new(),
+        &rt,
+    ));
+    let transport = Arc::new(SipTransport::new::<DuplexStream>(
+        String::from("192.0.2.10:5060"),
+        SipTransportType::TCP,
+    ));
+    let (ours, theirs) = tokio::io::duplex(65536);
+    let tx = setup_sip_transport(&transport, ours, tm.get_ctrl_itf(), Arc::clone(&rt), || {});
+    tm.register_sip_transport(Arc::clone(&transport), tx);
+    let mut peer = Peer {
+        stream: theirs,
+        parser: SipParser::new(),
+    };
+
+    // a session Alice started with us, its dialog made known as a session
+    // makes it: let go of from the core's dialogs once it ends
+    let invite = read_message(
+        b"INVITE sip:bob@192.0.2.10:5060 SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bKinvite1\r\n\
+From: <sip:alice@example.com>;tag=alice1\r\n\
+To: <sip:bob@example.com>\r\n\
+Call-ID: session-1\r\n\
+CSeq: 7 INVITE\r\n\
+Contact: <sip:alice@192.0.2.1:5060;transport=tcp>\r\n\
+Content-Length: 0\r\n\r\n",
+    );
+    let ok = read_message(
+        b"SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bKinvite1\r\n\
+From: <sip:alice@example.com>;tag=alice1\r\n\
+To: <sip:bob@example.com>;tag=bob1\r\n\
+Call-ID: session-1\r\n\
+CSeq: 7 INVITE\r\n\
+Contact: <sip:bob@192.0.2.10:5060;transport=tcp>\r\n\
+Content-Length: 0\r\n\r\n",
+    );
+    let ongoing_dialogs = core.get_ongoing_dialogs();
+    let (d_tx, mut d_rx) = tokio::sync::mpsc::channel(1);
+    let ongoing_dialogs_ = Arc::clone(&ongoing_dialogs);
+    rt.spawn(async move {
+        if let Some(dialog) = d_rx.recv().await {
+            ongoing_dialogs_.remove_dialog(&dialog);
+        }
+    });
+    let dialog = Arc::new(
+        SipDialog::try_new_as_uas(&invite, &ok, move |d| {
+            let _ = d_tx.try_send(d);
+        })
+        .unwrap(),
+    );
+    let (ended_tx, ended_rx) = mpsc::channel();
+    dialog.register_user(EndedUser(std::sync::Mutex::new(ended_tx)));
+    ongoing_dialogs.add_dialog(&dialog);
+    drop(dialog);
+
+    peer.send(
+        &rt,
+        "BYE sip:bob@192.0.2.10:5060;transport=tcp SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bKbye1\r\n\
+From: <sip:alice@example.com>;tag=alice1\r\n\
+To: <sip:bob@example.com>;tag=bob1\r\n\
+Call-ID: session-1\r\n\
+CSeq: 8 BYE\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\
+\r\n",
+    );
+    assert_eq!(status_code(&peer.next(&rt)), 200);
+    assert_eq!(ended_rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+    let gone = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        ongoing_dialogs.lock().unwrap().is_empty()
+    });
+    assert!(gone, "the dialog went");
+}
+
 fn read_message(data: &[u8]) -> SipMessage {
     let mut parser = SipParser::new();
     parser.feed(data);

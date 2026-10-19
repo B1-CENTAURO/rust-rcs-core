@@ -657,19 +657,32 @@ impl SipDialog {
     //     }
     // }
 
-    pub fn on_terminating_request(&self, message: &SipMessage, rt: &Arc<Runtime>) {
+    /// Ends the dialog on `message`, a request ending it such as a BYE: its
+    /// users are told, out of the dialog's lock, and the dialog let go of
+    pub fn on_terminating_request(self: &Arc<Self>, message: &SipMessage, _rt: &Arc<Runtime>) {
+        let (dialog_users, on_dispose) = self.terminate();
+        for callback in &dialog_users {
+            callback.on_terminating_request(message);
+        }
+        if let Some(on_dispose) = on_dispose {
+            on_dispose(Arc::clone(self));
+        }
+    }
+
+    /// The users of the dialog and what lets it go, taken as it terminates;
+    /// none if it had ended already
+    fn terminate(
+        &self,
+    ) -> (
+        Vec<Arc<dyn SipDialogEventCallbacks + Send + Sync>>,
+        Option<Box<dyn FnOnce(Arc<SipDialog>) + Send + Sync>>,
+    ) {
         let mut guard = self.state.lock().unwrap();
-        match &mut *guard {
+        match std::mem::replace(&mut *guard, State::Terminated) {
             State::Early(dialog_users, on_dispose) | State::Confirmed(dialog_users, on_dispose) => {
-                for callback in dialog_users {
-                    callback.on_terminating_request(message);
-                }
-                *guard = State::Terminated;
+                (dialog_users, on_dispose)
             }
-            State::Completed => {
-                *guard = State::Terminated;
-            }
-            _ => {}
+            State::Completed | State::Terminated => (Vec::new(), None),
         }
     }
 
@@ -691,19 +704,15 @@ impl SipDialog {
     //     }
     // }
 
-    pub fn on_terminating_response(&self, message: &SipMessage, rt: &Arc<Runtime>) {
-        let mut guard = self.state.lock().unwrap();
-        match &mut *guard {
-            State::Early(dialog_users, on_dispose) | State::Confirmed(dialog_users, on_dispose) => {
-                for callback in dialog_users {
-                    callback.on_terminating_response(message);
-                }
-                *guard = State::Terminated;
-            }
-            State::Completed => {
-                *guard = State::Terminated;
-            }
-            _ => {}
+    /// Ends the dialog on `message`, a response ending it such as a 481:
+    /// its users are told, out of the dialog's lock, and the dialog let go of
+    pub fn on_terminating_response(self: &Arc<Self>, message: &SipMessage, _rt: &Arc<Runtime>) {
+        let (dialog_users, on_dispose) = self.terminate();
+        for callback in &dialog_users {
+            callback.on_terminating_response(message);
+        }
+        if let Some(on_dispose) = on_dispose {
+            on_dispose(Arc::clone(self));
         }
     }
 
