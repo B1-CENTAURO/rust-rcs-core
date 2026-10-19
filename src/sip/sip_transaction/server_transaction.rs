@@ -403,17 +403,26 @@ pub enum ServerTransactionEvent {
     TransportError,
 }
 
+/// `resp_message` with a Content-Length, which a message over a stream
+/// transport must have (RFC 3261 section 20.14): 0 if it has no body and
+/// none was given
+pub fn with_content_length(mut resp_message: SipMessage) -> SipMessage {
+    let given = resp_message.headers().map_or(false, |headers| {
+        header::search(headers, b"Content-Length", false).is_some()
+    });
+    if !given && !resp_message.has_body() {
+        resp_message.add_header(Header::new("Content-Length", "0"));
+    }
+    resp_message
+}
+
 pub fn send_response(
     transaction: Arc<ServerTransaction>,
-    mut resp_message: SipMessage,
+    resp_message: SipMessage,
     tx: mpsc::Sender<ServerTransactionEvent>,
     rt: &Arc<Runtime>,
     // timer: &Timer,
 ) {
-    if !resp_message.has_body() {
-        resp_message.add_header(Header::new("Content-Length", "0"));
-    }
-
     match &*transaction {
         ServerTransaction::IS(t) => {
             if let Ok(result) = t.send_response(resp_message) {

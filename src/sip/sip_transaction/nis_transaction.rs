@@ -18,6 +18,8 @@ use crate::ffi::log::platform_log;
 use crate::sip::sip_message::{build_message_data, SipMessage};
 use crate::sip::SipTransport;
 
+use super::server_transaction;
+
 const LOG_TAG: &str = "sip_transaction";
 
 enum State {
@@ -64,6 +66,7 @@ impl NISTransaction {
 
     // Returns Ok('should start timer_j') on success
     pub fn send_response(&self, resp_message: SipMessage) -> Result<SendResult, &'static str> {
+        let resp_message = server_transaction::with_content_length(resp_message);
         if let SipMessage::Response(resp_line, _, _) = &resp_message {
             if resp_line.status_code >= 100 && resp_line.status_code < 200 {
                 let mut guard = self.state.lock().unwrap();
