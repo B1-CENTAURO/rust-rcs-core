@@ -29,9 +29,15 @@ pub mod rcs;
 mod tests;
 
 pub use openmls::prelude::{Ciphersuite, Credential, CredentialType};
+/// The signature key of a client, made with `SignatureKeyPair::new()` for the
+/// signature scheme of its ciphersuite, its public key certified by the Home KDS
+pub use openmls_basic_credential::SignatureKeyPair;
 
 pub use client::{CredentialValidator, MlsClient, MlsConfig};
-pub use conversation::{inspect, CommitOutput, IncomingMessage, MessageKind, MlsConversation};
+pub use conversation::{
+    inspect, key_package_info, CommitOutput, IncomingMessage, KeyPackageInfo, MessageKind,
+    MlsConversation,
+};
 pub use provider::MlsProvider;
 
 use crate::ffi::log::platform_log;

@@ -374,3 +374,22 @@ fn groups_of_rcs_clients() {
         _ => panic!("expected a Commit"),
     }
 }
+
+#[test]
+fn a_key_package_from_the_kds_is_checked_for_the_participant_asked_for() {
+    let now = Arc::new(AtomicU64::new(seconds("2026-09-15")));
+    let bob = x509_client(&[BOB, CA], BOB_KEY, BOB_PUBLIC_KEY, now);
+    let info = super::super::key_package_info(&bob.generate_key_package(false).unwrap()).unwrap();
+    let validator = validator("2026-09-15");
+
+    assert!(validator
+        .validate_query(&info.credential, &info.signature_key, "tel:+491707654321")
+        .is_ok());
+    assert_eq!(
+        validator
+            .validate_query(&info.credential, &info.signature_key, "tel:+491701234567")
+            .err(),
+        Some(CertificateError::Identity),
+        "Bob's, asked for Alice's"
+    );
+}

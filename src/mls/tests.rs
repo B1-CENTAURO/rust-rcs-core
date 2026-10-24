@@ -572,3 +572,36 @@ fn other_credential_types() {
         Some(ErrorKind::Crypto)
     );
 }
+
+#[test]
+fn a_key_package_tells_of_its_client_once_checked() {
+    let alice = client("alice");
+    let key_package = alice.generate_key_package(false).unwrap();
+
+    let info = key_package_info(&key_package).unwrap();
+    assert_eq!(info.ciphersuite, CIPHERSUITE);
+    assert_eq!(identity(&info.credential), b"alice");
+    assert_eq!(info.signature_key, alice.signer().public());
+
+    // its signature, last, no longer verifying
+    let mut tampered = key_package.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    assert_eq!(key_package_info(&tampered), Err(ErrorKind::Rejected));
+
+    assert_eq!(
+        key_package_info(b"not a KeyPackage"),
+        Err(ErrorKind::BadFormat)
+    );
+
+    // another MLS message
+    let bob = client("bob");
+    let mut conversation = alice.create_conversation(None, 0).unwrap();
+    let output = conversation
+        .add_members(&alice, &[&bob.generate_key_package(false).unwrap()])
+        .unwrap();
+    assert_eq!(
+        key_package_info(&output.welcome.unwrap()),
+        Err(ErrorKind::UnexpectedMessage)
+    );
+}
