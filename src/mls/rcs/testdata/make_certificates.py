@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Generates the certificate fixtures of src/mls/rcs/testdata/certificates.rs
 #
-# An implementation of the certificate profiles of GSMA RCC.16 v3.0 Annex A that is
+# An implementation of the certificate profiles of GSMA RCC.16 v4.0 Annex A that is
 # independent from the Rust code validating them. Needs the `cryptography` package:
 #
 #     python3 make_certificates.py > certificates.rs && rustfmt --edition 2021 certificates.rs
@@ -15,7 +15,6 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import AuthorityInformationAccessOID, NameOID, ObjectIdentifier
 
 RCS_E2EE = "2.23.146.2.1"
-CLIENT_IDENTIFIER = ObjectIdentifier(RCS_E2EE + ".1")
 POLICY = ObjectIdentifier(RCS_E2EE + ".2")
 KP_RCS_MLS_CLIENT = ObjectIdentifier(RCS_E2EE + ".3")
 PARTICIPANT_INFORMATION = ObjectIdentifier(RCS_E2EE + ".4")
@@ -152,7 +151,8 @@ def client(
     extended_key_usage=(KP_RCS_MLS_CLIENT,),
     unknown_critical=False,
 ):
-    subject = x509.Name([x509.NameAttribute(CLIENT_IDENTIFIER, str(uuid.uuid4()))])
+    # Annex A.3.6: a single commonName, a UUIDv4 as UTF8String
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, str(uuid.uuid4()))])
     san = x509.SubjectAlternativeName([x509.UniformResourceIdentifier(tel)])
     signature_validity = validity(not_before, not_after)
 
