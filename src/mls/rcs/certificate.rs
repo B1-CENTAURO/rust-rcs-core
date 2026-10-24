@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Validation of RCS Client Certificates (RCC.16 Annex A)
+//! RCS Client Certificates (RCC.16 Annex A): their validation, and the
+//! Participant signature a client has them carry
 //!
 //! In RCS, every MLS Client presents an X.509 credential: a Client Certificate
 //! issued by its Home KDS, chained through intermediate CAs to a root that all
@@ -20,18 +21,24 @@
 
 use std::time::{Duration, SystemTime};
 
-use der::asn1::{BitString, ObjectIdentifier, Uint};
+use der::asn1::{
+    Any, BitString, GeneralizedTime, Ia5String, ObjectIdentifier, SetOfVec, Uint, UtcTime,
+    Utf8StringRef,
+};
 use der::oid::AssociatedOid;
 use der::{Decode, Encode, Header, Length, Sequence, Tag};
 use openmls::prelude::tls_codec::{DeserializeBytes, Serialize as _, VLByteSlice, VLBytes};
 use openmls::prelude::{Credential, CredentialType};
-use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::signature::{Signer, Verifier};
+use rand::rngs::OsRng;
 use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
+use x509_cert::attr::AttributeTypeAndValue;
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::{
     BasicConstraints, CertificatePolicies, ExtendedKeyUsage, KeyUsage, SubjectAltName,
 };
-use x509_cert::time::Validity;
+use x509_cert::name::{Name, RdnSequence, RelativeDistinguishedName};
+use x509_cert::time::{Time, Validity};
 use x509_cert::{Certificate, Version};
 
 use super::super::client::CredentialValidator;
@@ -42,6 +49,8 @@ const KP_RCS_MLS_CLIENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.23.1
 const PARTICIPANT_INFORMATION: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.23.146.2.1.4");
 /// id-rcsVendorId, { id-gsmaRCSE2EE 6 }
 const VENDOR_ID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.23.146.2.1.6");
+
+const COMMON_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
 
 const EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
 const SECP256R1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
@@ -58,6 +67,10 @@ const CLIENT_MAX_LIFETIME: Duration = Duration::from_secs(76 * DAY);
 const CA_MAX_LIFETIME: Duration = Duration::from_secs(1827 * DAY);
 /// Validity left on certificates returned by the Home KDS (A.4.1.2)
 const MIN_REMAINING_LIFETIME: Duration = Duration::from_secs(30 * DAY);
+/// How long before its creation a Participant signature is valid from (A.3.8.9)
+const PARTICIPANT_SIGNATURE_BACKDATING: Duration = Duration::from_secs(3600);
+/// Validity of Participant signatures, 76 days as RCC.16 counts them (A.3.5, A.3.8.9)
+const PARTICIPANT_SIGNATURE_LIFETIME: Duration = Duration::from_secs(6_566_340);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CertificateError {
@@ -403,6 +416,152 @@ impl CredentialValidator for RcsCredentialValidator {
     }
 }
 
+/// The Participant Key of the user of the device (RCC.16 sections 3.1, 4.1),
+/// a P-256 ECDSA key: ACS binds it to the user's MSISDN, and it signs the
+/// Participant Information of each Client Certificate of the user (A.3.8.9)
+pub struct ParticipantKey(p256::ecdsa::SigningKey);
+
+/// What a Participant signs of the Client Certificate the Home KDS is to issue
+/// for one of its Clients, which the certificate must carry exactly
+pub struct ClientIdentity<'a> {
+    /// The commonName of the Subject, a UUIDv4 (A.3.6)
+    pub client_id: &'a str,
+    /// The Vendor ID asserted by the root the Home KDS issues under (A.3.8.9)
+    pub vendor_id: u64,
+    /// The MLS signature key of the Client, an uncompressed P-256 or P-384
+    /// point (A.3.7)
+    pub signature_key: &'a [u8],
+    /// The tel URIs of the Subject Alternative Name (A.3.8.5)
+    pub tel_uris: &'a [&'a str],
+}
+
+impl ParticipantKey {
+    pub fn generate() -> ParticipantKey {
+        ParticipantKey(p256::ecdsa::SigningKey::random(&mut OsRng))
+    }
+
+    /// The key to_bytes() gave
+    pub fn from_bytes(bytes: &[u8]) -> Result<ParticipantKey> {
+        p256::ecdsa::SigningKey::from_slice(bytes)
+            .map(ParticipantKey)
+            .map_err(|_| CertificateError::Malformed)
+    }
+
+    /// The private key, to be kept as secret as the MLS state
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_bytes().to_vec()
+    }
+
+    /// The public key, as a DER encoded SubjectPublicKeyInfo: base64url
+    /// encoded, the participant_public_key of the configuration request
+    /// (RCC.07 section 2.3.2.2)
+    pub fn public_key(&self) -> Vec<u8> {
+        let point = self.0.verifying_key().to_encoded_point(false);
+        // a P-256 point always encodes
+        ec_public_key(point.as_bytes())
+            .and_then(|key| key.to_der().map_err(|_| CertificateError::Malformed))
+            .unwrap_or_default()
+    }
+
+    /// The ParticipantInformation extension, DER encoded, for the Home KDS to
+    /// issue the Client Certificate of `client` with (A.3.8.9)
+    ///
+    /// The signature is valid from an hour before `now`, for 76 days.
+    pub fn participant_information(
+        &self,
+        client: &ClientIdentity,
+        now: SystemTime,
+    ) -> Result<Vec<u8>> {
+        // in whole seconds, as certificates count time
+        let now = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| CertificateError::Malformed)?;
+        let not_before = Duration::from_secs(now.as_secs())
+            .checked_sub(PARTICIPANT_SIGNATURE_BACKDATING)
+            .ok_or(CertificateError::Malformed)?;
+        let validity = Validity {
+            not_before: certificate_time(not_before)?,
+            not_after: certificate_time(not_before + PARTICIPANT_SIGNATURE_LIFETIME)?,
+        };
+
+        let vendor_id =
+            Uint::new(&client.vendor_id.to_be_bytes()).map_err(|_| CertificateError::Malformed)?;
+        let subject = RdnSequence(vec![RelativeDistinguishedName(
+            SetOfVec::try_from(vec![AttributeTypeAndValue {
+                oid: COMMON_NAME,
+                value: Any::encode_from(
+                    &Utf8StringRef::new(client.client_id)
+                        .map_err(|_| CertificateError::Malformed)?,
+                )
+                .map_err(|_| CertificateError::Malformed)?,
+            }])
+            .map_err(|_| CertificateError::Malformed)?,
+        )]);
+        let subject_alt_name = SubjectAltName(
+            client
+                .tel_uris
+                .iter()
+                .map(|uri| Ia5String::new(uri).map(GeneralName::UniformResourceIdentifier))
+                .collect::<der::Result<_>>()
+                .map_err(|_| CertificateError::Malformed)?,
+        )
+        .to_der()
+        .map_err(|_| CertificateError::Malformed)?;
+
+        let tbs_participant_info = encode_tbs_participant_info(
+            &subject,
+            &vendor_id,
+            &validity,
+            &ec_public_key(client.signature_key)?,
+            &subject_alt_name,
+        )?;
+        let signature: p256::ecdsa::Signature = self.0.sign(&tbs_participant_info);
+
+        ParticipantInformation {
+            vendor_id,
+            participant_signature_validity: validity,
+            participant_signature_algorithm: AlgorithmIdentifierOwned {
+                oid: ECDSA_WITH_SHA256,
+                parameters: None,
+            },
+            participant_signature_value: BitString::from_bytes(signature.to_der().as_bytes())
+                .map_err(|_| CertificateError::Malformed)?,
+            participant_key: Some(
+                SubjectPublicKeyInfoOwned::from_der(&self.public_key())
+                    .map_err(|_| CertificateError::Malformed)?,
+            ),
+            participant_key_rolls: None,
+        }
+        .to_der()
+        .map_err(|_| CertificateError::Malformed)
+    }
+}
+
+/// The SubjectPublicKeyInfo of an uncompressed P-256 or P-384 point (A.3.7.1)
+fn ec_public_key(point: &[u8]) -> Result<SubjectPublicKeyInfoOwned> {
+    let curve = match point.len() {
+        65 => SECP256R1,
+        97 => SECP384R1,
+        _ => return Err(CertificateError::UnsupportedAlgorithm),
+    };
+    Ok(SubjectPublicKeyInfoOwned {
+        algorithm: AlgorithmIdentifierOwned {
+            oid: EC_PUBLIC_KEY,
+            parameters: Some(Any::encode_from(&curve).map_err(|_| CertificateError::Malformed)?),
+        },
+        subject_public_key: BitString::from_bytes(point)
+            .map_err(|_| CertificateError::Malformed)?,
+    })
+}
+
+/// UTCTime through 2049, GeneralizedTime from 2050 (RFC 5280, Section 4.1.2.5)
+fn certificate_time(since_epoch: Duration) -> Result<Time> {
+    UtcTime::from_unix_duration(since_epoch)
+        .map(Time::UtcTime)
+        .or_else(|_| GeneralizedTime::from_unix_duration(since_epoch).map(Time::GeneralTime))
+        .map_err(|_| CertificateError::Malformed)
+}
+
 /// Builds the MLS credential of a Client from its DER encoded certificate chain,
 /// Client Certificate first (RFC 9420, Section 5.3)
 pub fn x509_credential(chain: &[&[u8]]) -> Credential {
@@ -564,7 +723,10 @@ fn same_tel_uri(uri: &str, expected: &str) -> bool {
 
 /// Verifies the Participant signature and key rolls (A.4.1.1 1c), returning the
 /// asserted Vendor ID and the Participant Key
-fn check_participant_information(leaf: &Certificate, now: SystemTime) -> Result<(u64, Vec<u8>)> {
+pub(super) fn check_participant_information(
+    leaf: &Certificate,
+    now: SystemTime,
+) -> Result<(u64, Vec<u8>)> {
     let value = raw_extension(leaf, PARTICIPANT_INFORMATION)
         .ok_or(CertificateError::ParticipantInformation)?;
     let info = ParticipantInformation::from_der(value)
@@ -617,20 +779,29 @@ fn tbs_participant_info(leaf: &Certificate, info: &ParticipantInformation) -> Re
     let subject_alt_name =
         raw_extension(leaf, SubjectAltName::OID).ok_or(CertificateError::Identity)?;
 
+    encode_tbs_participant_info(
+        &leaf.tbs_certificate.subject,
+        &info.vendor_id,
+        &info.participant_signature_validity,
+        &leaf.tbs_certificate.subject_public_key_info,
+        subject_alt_name,
+    )
+}
+
+/// tbsParticipantInfo, `subject_alt_name` being the DER encoded GeneralNames
+fn encode_tbs_participant_info(
+    subject: &Name,
+    vendor_id: &Uint,
+    validity: &Validity,
+    subject_public_key_info: &SubjectPublicKeyInfoOwned,
+    subject_alt_name: &[u8],
+) -> Result<Vec<u8>> {
     let mut content = Vec::new();
-    leaf.tbs_certificate
-        .subject
+    subject
         .encode_to_vec(&mut content)
-        .and_then(|_| info.vendor_id.encode_to_vec(&mut content))
-        .and_then(|_| {
-            info.participant_signature_validity
-                .encode_to_vec(&mut content)
-        })
-        .and_then(|_| {
-            leaf.tbs_certificate
-                .subject_public_key_info
-                .encode_to_vec(&mut content)
-        })
+        .and_then(|_| vendor_id.encode_to_vec(&mut content))
+        .and_then(|_| validity.encode_to_vec(&mut content))
+        .and_then(|_| subject_public_key_info.encode_to_vec(&mut content))
         .map_err(|_| CertificateError::Malformed)?;
     content.extend_from_slice(subject_alt_name);
 

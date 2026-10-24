@@ -34,7 +34,8 @@ mod certificate_tests;
 mod tests;
 
 pub use certificate::{
-    x509_credential, CertificateError, ClientCertificate, RcsCredentialValidator,
+    x509_credential, CertificateError, ClientCertificate, ClientIdentity, ParticipantKey,
+    RcsCredentialValidator,
 };
 pub use messaging::DecryptedMessage;
 pub use wire::{ClientFailureReason, SecretPayloadType, VerifiableDerivedContent};

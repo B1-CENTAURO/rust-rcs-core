@@ -22,7 +22,10 @@ use openmls_traits::types::SignatureScheme;
 use super::super::{
     Ciphersuite, Credential, CredentialType, ErrorKind, IncomingMessage, MlsClient, MlsConfig,
 };
-use super::certificate::{x509_credential, CertificateError, RcsCredentialValidator};
+use super::certificate::{
+    check_participant_information, x509_credential, CertificateError, ClientIdentity,
+    ParticipantKey, RcsCredentialValidator,
+};
 
 #[allow(dead_code)]
 #[path = "testdata/certificates.rs"]
@@ -392,4 +395,219 @@ fn a_key_package_from_the_kds_is_checked_for_the_participant_asked_for() {
         Some(CertificateError::Identity),
         "Bob's, asked for Alice's"
     );
+}
+
+/// Alice's Client Certificate, with the Participant Information `info` in
+/// place of the one it was issued with
+fn alice_with(info: &[u8]) -> x509_cert::Certificate {
+    use der::Decode;
+    let mut alice = x509_cert::Certificate::from_der(&bytes(ALICE)).unwrap();
+    let extension = alice
+        .tbs_certificate
+        .extensions
+        .iter_mut()
+        .flatten()
+        .find(|extension| extension.extn_id.to_string() == "2.23.146.2.1.4")
+        .unwrap();
+    extension.extn_value = der::asn1::OctetString::new(info).unwrap();
+    alice
+}
+
+/// Alice's Client Certificate, as the Participant signs it
+fn alice_identity(sign: impl FnOnce(&ClientIdentity) -> Vec<u8>) -> Vec<u8> {
+    use der::Decode;
+    let alice = x509_cert::Certificate::from_der(&bytes(ALICE)).unwrap();
+    let common_name = &alice.tbs_certificate.subject.0[0].0.get(0).unwrap().value;
+    sign(&ClientIdentity {
+        client_id: common_name
+            .decode_as::<der::asn1::Utf8StringRef>()
+            .unwrap()
+            .as_str(),
+        vendor_id: 42,
+        signature_key: &bytes(ALICE_PUBLIC_KEY),
+        tel_uris: &["tel:+491701234567"],
+    })
+}
+
+#[test]
+fn a_participant_signs_the_client_certificate_the_kds_is_to_issue() {
+    let participant = ParticipantKey::generate();
+    let now = time("2026-09-15");
+    let info = alice_identity(|alice| participant.participant_information(alice, now).unwrap());
+
+    // the certificate issued with it holds as the validator checks it
+    assert_eq!(
+        check_participant_information(&alice_with(&info), now),
+        Ok((42, participant.public_key()))
+    );
+}
+
+#[test]
+fn a_participant_signature_is_for_that_client_only() {
+    let participant = ParticipantKey::generate();
+    let now = time("2026-09-15");
+    let alice = |client_id: Option<&str>, signature_key: &str, tel_uri: &str| -> Vec<u8> {
+        alice_identity(|identity| {
+            participant
+                .participant_information(
+                    &ClientIdentity {
+                        client_id: client_id.unwrap_or(identity.client_id),
+                        signature_key: &bytes(signature_key),
+                        tel_uris: &[tel_uri],
+                        ..*identity
+                    },
+                    now,
+                )
+                .unwrap()
+        })
+    };
+
+    for (info, signed_for) in [
+        (
+            alice(
+                Some("3f0a6a4e-2d6c-4b8e-9b38-2b1f0d6f2c11"),
+                ALICE_PUBLIC_KEY,
+                "tel:+491701234567",
+            ),
+            "another client",
+        ),
+        (
+            alice(None, BOB_PUBLIC_KEY, "tel:+491701234567"),
+            "another key",
+        ),
+        (
+            alice(None, ALICE_PUBLIC_KEY, "tel:+491707654321"),
+            "another number",
+        ),
+    ] {
+        assert_eq!(
+            check_participant_information(&alice_with(&info), now),
+            Err(CertificateError::ParticipantInformation),
+            "signed for {}",
+            signed_for
+        );
+    }
+}
+
+#[test]
+fn a_participant_signature_is_valid_from_an_hour_before_for_76_days() {
+    let participant = ParticipantKey::generate();
+    let signed = time("2026-09-15") + Duration::from_millis(1500);
+    let info = alice_identity(|alice| participant.participant_information(alice, signed).unwrap());
+    let alice = alice_with(&info);
+
+    // from the whole second signed in
+    let from = time("2026-09-15") + Duration::from_secs(1) - Duration::from_secs(3600);
+    let until = from + Duration::from_secs(6_566_340);
+    for (at, valid) in [
+        (from - Duration::from_secs(1), false),
+        (from, true),
+        (until, true),
+        (until + Duration::from_secs(1), false),
+    ] {
+        assert_eq!(
+            check_participant_information(&alice, at).is_ok(),
+            valid,
+            "at {:?}",
+            at
+        );
+    }
+    assert!(until.duration_since(from).unwrap() > Duration::from_secs(45 * 86400));
+}
+
+#[test]
+fn after_2049_a_participant_signature_ends_in_generalized_time() {
+    use der::Decode;
+    use x509_cert::time::{Time, Validity};
+
+    let participant = ParticipantKey::generate();
+    let info = alice_identity(|alice| {
+        participant
+            .participant_information(alice, time("2049-12-01"))
+            .unwrap()
+    });
+    let fields = Vec::<der::Any>::from_der(&info).unwrap();
+    let validity: Validity = fields[1].decode_as().unwrap();
+    assert!(matches!(validity.not_before, Time::UtcTime(_)));
+    assert!(matches!(validity.not_after, Time::GeneralTime(_)));
+}
+
+#[test]
+fn a_participant_key_is_kept_as_its_bytes() {
+    use der::Decode;
+
+    let participant = ParticipantKey::generate();
+    let kept = ParticipantKey::from_bytes(&participant.to_bytes()).unwrap();
+    assert_eq!(kept.public_key(), participant.public_key());
+    assert_ne!(
+        ParticipantKey::generate().public_key(),
+        participant.public_key()
+    );
+    assert_eq!(
+        ParticipantKey::from_bytes(b"not a key").err(),
+        Some(CertificateError::Malformed)
+    );
+
+    // an EC P-256 SubjectPublicKeyInfo
+    let public_key = spki::SubjectPublicKeyInfoOwned::from_der(&participant.public_key()).unwrap();
+    assert_eq!(public_key.algorithm.oid.to_string(), "1.2.840.10045.2.1");
+    assert_eq!(
+        public_key
+            .algorithm
+            .parameters
+            .unwrap()
+            .decode_as::<der::asn1::ObjectIdentifier>()
+            .unwrap()
+            .to_string(),
+        "1.2.840.10045.3.1.7"
+    );
+    assert_eq!(public_key.subject_public_key.raw_bytes().len(), 65);
+}
+
+#[test]
+fn clients_are_signed_for_with_p256_or_p384_keys() {
+    use der::Decode;
+
+    let participant = ParticipantKey::generate();
+    let now = time("2026-09-15");
+    let p384 = p384::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    let point = p384.verifying_key().to_encoded_point(false);
+
+    // Alice's certificate, issued for a P-384 key
+    let info = alice_identity(|alice| {
+        participant
+            .participant_information(
+                &ClientIdentity {
+                    signature_key: point.as_bytes(),
+                    ..*alice
+                },
+                now,
+            )
+            .unwrap()
+    });
+    let mut alice = alice_with(&info);
+    let p384_key_info = [
+        bytes("3076301006072a8648ce3d020106052b81040022036200"),
+        point.as_bytes().to_vec(),
+    ]
+    .concat();
+    alice.tbs_certificate.subject_public_key_info =
+        spki::SubjectPublicKeyInfoOwned::from_der(&p384_key_info).unwrap();
+    assert!(check_participant_information(&alice, now).is_ok());
+
+    let compressed = &bytes(ALICE_PUBLIC_KEY)[..33];
+    let signing = alice_identity(|alice| {
+        participant
+            .participant_information(
+                &ClientIdentity {
+                    signature_key: compressed,
+                    ..*alice
+                },
+                now,
+            )
+            .err()
+            .map(|e| vec![e as u8])
+            .unwrap_or_default()
+    });
+    assert_eq!(signing, vec![CertificateError::UnsupportedAlgorithm as u8]);
 }
