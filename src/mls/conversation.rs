@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
+use openmls_rust_crypto::RustCrypto;
+use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::OpenMlsProvider;
 
 use super::client::{CredentialValidator, MlsClient};
@@ -23,6 +25,42 @@ use super::rcs::proto::{client_mls_rcs_message, server_mls_rcs_message};
 use super::rcs::wire::{AuthenticatedData, SecretPayloadType, VerifiableDerivedContent};
 use super::rcs::{self, file, metadata, proto, wire};
 use super::{fail, ErrorKind, Result};
+
+/// What a KeyPackage tells of the Client it is from
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyPackageInfo {
+    pub ciphersuite: Ciphersuite,
+    pub credential: Credential,
+    pub signature_key: Vec<u8>,
+}
+
+/// Reads a KeyPackage, once its signature and lifetime are checked (RFC 9420,
+/// Section 10.1), for its credential to be checked against the Participant it
+/// was asked of the KDS for (RCC.16 section A.4.1.2) before it is added
+pub fn key_package_info(key_package: &[u8]) -> Result<KeyPackageInfo> {
+    let key_package = validated_key_package(&RustCrypto::default(), key_package)?;
+    let leaf_node = key_package.leaf_node();
+    Ok(KeyPackageInfo {
+        ciphersuite: key_package.ciphersuite(),
+        credential: leaf_node.credential().clone(),
+        signature_key: leaf_node.signature_key().as_slice().to_vec(),
+    })
+}
+
+/// A KeyPackage, its signature and lifetime checked
+fn validated_key_package(crypto: &impl OpenMlsCrypto, key_package: &[u8]) -> Result<KeyPackage> {
+    let message = MlsMessageIn::tls_deserialize_exact(key_package)
+        .map_err(fail("KeyPackage decoding", ErrorKind::BadFormat))?;
+
+    let key_package = match message.extract() {
+        MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+        _ => return Err(ErrorKind::UnexpectedMessage),
+    };
+
+    key_package
+        .validate(crypto, ProtocolVersion::Mls10)
+        .map_err(fail("KeyPackage validation", ErrorKind::Rejected))
+}
 
 /// What kind of MLS message some received bytes hold, for routing them
 pub enum MessageKind {
@@ -1036,17 +1074,7 @@ impl MlsConversation {
     }
 
     fn read_key_package(&self, client: &MlsClient, key_package: &[u8]) -> Result<KeyPackage> {
-        let message = MlsMessageIn::tls_deserialize_exact(key_package)
-            .map_err(fail("KeyPackage decoding", ErrorKind::BadFormat))?;
-
-        let key_package = match message.extract() {
-            MlsMessageBodyIn::KeyPackage(key_package) => key_package,
-            _ => return Err(ErrorKind::UnexpectedMessage),
-        };
-
-        let key_package = key_package
-            .validate(client.provider().crypto(), ProtocolVersion::Mls10)
-            .map_err(fail("KeyPackage validation", ErrorKind::Rejected))?;
+        let key_package = validated_key_package(client.provider().crypto(), key_package)?;
 
         if key_package.ciphersuite() != self.group.ciphersuite() {
             return Err(ErrorKind::Rejected);
