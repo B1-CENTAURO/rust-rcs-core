@@ -570,6 +570,57 @@ cpm.Payload-Type: text\r\n\
 }
 
 #[test]
+fn the_mls_signature_of_a_message_is_given_out() {
+    // as RCC.16 sections 7.2.2 and 7.6.1 have it, its name in either spelling
+    for (namespace, name) in [
+        ("mls", "MLS-Derived-Content-Signature"),
+        ("m", "mls-derived-content-signature"),
+    ] {
+        let data = format!(
+            "From: <tel:+15550001>\r\n\
+To: <tel:+15550002>\r\n\
+DateTime: 2026-10-25T12:00:00.000Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: imdn-1\r\n\
+NS: {0} <http://www.gsma.com/rcs/mls>\r\n\
+{0}.{1}: AAEC+/8=\r\n\
+{0}.Era-ID: 2\r\n\
+\r\n\
+Content-Type: message/imdn+xml\r\n\
+\r\n\
+<imdn/>",
+            namespace, name
+        );
+        let message = parse(data.as_bytes());
+        assert_eq!(
+            message.get_info().unwrap().mls_derived_content_signature,
+            Some(&b"AAEC+/8="[..]),
+            "{}",
+            name
+        );
+    }
+
+    // in another namespace, it is another header
+    let message = parse(
+        b"From: <tel:+15550001>\r\n\
+To: <tel:+15550002>\r\n\
+DateTime: 2026-10-25T12:00:00.000Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: imdn-1\r\n\
+NS: rcs <http://www.gsma.com/rcs>\r\n\
+rcs.MLS-Derived-Content-Signature: AAEC\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hi",
+    );
+    assert_eq!(
+        message.get_info().unwrap().mls_derived_content_signature,
+        None
+    );
+}
+
+#[test]
 fn a_display_notification_is_read() {
     // RFC 5438 section 7.2.1.2, with the blank line between the CPIM headers
     // and the MIME object that RFC 3862 has

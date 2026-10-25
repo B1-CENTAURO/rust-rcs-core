@@ -35,6 +35,12 @@ use super::cpim_namespace::{CPIMNamespace, CORE_NAMESPACE};
 
 const LOG_TAG: &str = "cpim";
 
+/// Whether `name`, in the MLS namespace, is the MLS-Derived-Content-Signature,
+/// which RCC.16 section 7.2.2 spells both capitalised and in lower case
+fn is_derived_content_signature(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"MLS-Derived-Content-Signature")
+}
+
 pub enum CPIMHeaders {
     Deflated(Vec<Header>),
     Inflated(Vec<Header>),
@@ -126,6 +132,7 @@ impl<'a> CPIMMessage {
         let mut payload_type: Option<&[u8]> = None;
         let mut imdn_message_id: Option<&[u8]> = None;
         let mut disposition_notification: Option<&[u8]> = None;
+        let mut mls_derived_content_signature: Option<&[u8]> = None;
 
         for (n, v) in headers {
             platform_log(
@@ -151,6 +158,11 @@ impl<'a> CPIMMessage {
                 imdn_message_id.get_or_insert(v);
             } else if &n == b"<urn:ietf:params:imdn>.Disposition-Notification" {
                 disposition_notification.get_or_insert(v);
+            } else if n
+                .strip_prefix(&b"<http://www.gsma.com/rcs/mls>."[..])
+                .is_some_and(is_derived_content_signature)
+            {
+                mls_derived_content_signature.get_or_insert(v);
             }
         }
 
@@ -185,6 +197,7 @@ impl<'a> CPIMMessage {
                 to_uri,
                 payload_type,
                 disposition_notification,
+                mls_derived_content_signature,
             });
         }
 
