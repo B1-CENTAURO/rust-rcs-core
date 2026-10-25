@@ -841,6 +841,40 @@ fn leaving_through_proposal_list() {
 }
 
 #[test]
+fn proposal_lists_apply_whole() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let (_, mut other_conversation, _) = establish(&alice, &bob);
+
+    // a Proposal of another group in the list voids all of it
+    let proposal = bob_conversation.leave(&bob).unwrap();
+    let other = other_conversation.leave(&bob).unwrap();
+    let list = wire::encode_message_list(&[&proposal, &other]).unwrap();
+    assert_eq!(
+        alice_conversation.process_message_list(&alice, &list).err(),
+        Some(ErrorKind::UnexpectedMessage)
+    );
+    assert_eq!(
+        alice_conversation.mls_group().pending_proposals().count(),
+        0
+    );
+
+    let list = wire::encode_message_list(&[&proposal]).unwrap();
+    assert!(matches!(
+        alice_conversation
+            .process_message_list(&alice, &list)
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Proposal { .. }]
+    ));
+    assert_eq!(
+        alice_conversation.mls_group().pending_proposals().count(),
+        1
+    );
+}
+
+#[test]
 fn one_to_one_group_id() {
     let alice = client("alice");
 

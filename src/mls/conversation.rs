@@ -717,12 +717,27 @@ impl MlsConversation {
     }
 
     /// Handles each MlsMessage of a ProposalList or CommitList
+    ///
+    /// A list of more than one message is tried out on a copy of the client
+    /// first, so that one failing midway leaves the group as it was, as for
+    /// a bundle (RCC.16 section 6.2.6).
     pub fn process_message_list(
         &mut self,
         client: &MlsClient,
         list: &[u8],
     ) -> Result<Vec<IncomingMessage>> {
-        wire::decode_message_list(list)?
+        let messages = wire::decode_message_list(list)?;
+        if messages.len() > 1 {
+            let fork = client.fork()?;
+            let mut copy = fork.load_conversation(self.group_id())?;
+            copy.applied_commit = self.applied_commit.clone();
+            copy.pending_commit = self.pending_commit.clone();
+            for message in &messages {
+                copy.process(&fork, message)?;
+            }
+        }
+
+        messages
             .iter()
             .map(|message| self.process(client, message))
             .collect()
