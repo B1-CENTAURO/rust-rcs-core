@@ -23,8 +23,8 @@ use super::super::{
     Ciphersuite, Credential, CredentialType, ErrorKind, IncomingMessage, MlsClient, MlsConfig,
 };
 use super::certificate::{
-    check_participant_information, x509_credential, CertificateError, ClientIdentity,
-    ParticipantKey, RcsCredentialValidator,
+    check_participant_information, credential_tel_uris, same_tel_uri, x509_credential,
+    CertificateError, ClientIdentity, ParticipantKey, RcsCredentialValidator,
 };
 
 #[allow(dead_code)]
@@ -610,4 +610,48 @@ fn clients_are_signed_for_with_p256_or_p384_keys() {
             .unwrap_or_default()
     });
     assert_eq!(signing, vec![CertificateError::UnsupportedAlgorithm as u8]);
+}
+
+#[test]
+fn the_identity_of_a_credential_is_the_tel_uris_of_its_client_certificate() {
+    assert_eq!(
+        credential_tel_uris(&credential(&[ALICE, CA])),
+        Ok(vec![String::from("tel:+491701234567")])
+    );
+    assert_eq!(
+        credential_tel_uris(&credential(&[BOB, CA, ROOT])),
+        Ok(vec![String::from("tel:+491707654321")])
+    );
+    // taken without validation, which joining the group did
+    assert_eq!(
+        credential_tel_uris(&credential(&[MALLORY])),
+        Ok(vec![String::from("tel:+491701234567")])
+    );
+
+    // nor any for what is not one
+    assert_eq!(
+        credential_tel_uris(&Credential::new(CredentialType::Basic, b"alice".to_vec())),
+        Err(CertificateError::Malformed)
+    );
+    assert_eq!(
+        credential_tel_uris(&credential(&[])),
+        Err(CertificateError::Malformed)
+    );
+    assert_eq!(
+        credential_tel_uris(&x509_credential(&[b"not a certificate"])),
+        Err(CertificateError::Malformed)
+    );
+    // a CA names no one
+    assert_eq!(
+        credential_tel_uris(&credential(&[CA])),
+        Err(CertificateError::Identity)
+    );
+}
+
+#[test]
+fn tel_uris_are_the_same_by_their_number() {
+    assert!(same_tel_uri("tel:+491701234567", "tel:+491701234567"));
+    assert!(same_tel_uri("TEL:+491701234567", "tel:+491701234567"));
+    assert!(same_tel_uri("tel:+491701234567", "+491701234567"));
+    assert!(!same_tel_uri("tel:+491701234567", "tel:+491707654321"));
 }
