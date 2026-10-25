@@ -515,6 +515,39 @@ impl MlsConversation {
             .map_err(fail("proposal encoding", ErrorKind::BadFormat))
     }
 
+    /// Proposes to leave as `leave()` does, giving the `message/mls-rcs-client`
+    /// body with the ProposalList for the BYE (RCC.16 sections 7.9.4, 9.4)
+    pub fn leave_message(&mut self, client: &MlsClient) -> Result<Vec<u8>> {
+        let proposal = self.leave(client)?;
+        let proposal_list = wire::encode_message_list(&[&proposal])?;
+        Ok(proto::encode(&proto::ClientMlsRcsMessage {
+            payload: Some(client_mls_rcs_message::Payload::ProposalList(proposal_list)),
+        }))
+    }
+
+    /// Drops the pending Proposals of this client, e.g. its self_remove once the
+    /// Conversation Focus refused the leave, as OpenMLS makes no Commit while that
+    /// is pending; those of other members are kept
+    ///
+    /// Only for Proposals the Conversation Focus did not take: this client could
+    /// not process a Commit covering them once they are dropped.
+    pub fn withdraw_own_proposals(&mut self, client: &MlsClient) -> Result<()> {
+        let own = Sender::Member(self.group.own_leaf_index());
+        let withdrawn: Vec<_> = self
+            .group
+            .pending_proposals()
+            .filter(|proposal| proposal.sender() == &own)
+            .map(|proposal| proposal.proposal_reference_ref().clone())
+            .collect();
+
+        for proposal_ref in &withdrawn {
+            self.group
+                .remove_pending_proposal(client.provider().storage(), proposal_ref)
+                .map_err(fail("withdrawing proposal", ErrorKind::Storage))?;
+        }
+        Ok(())
+    }
+
     /// Encrypts application data for the group, in its current epoch
     pub fn encrypt(&mut self, client: &MlsClient, plaintext: &[u8]) -> Result<Vec<u8>> {
         self.encrypt_with_aad(client, plaintext, Vec::new())
