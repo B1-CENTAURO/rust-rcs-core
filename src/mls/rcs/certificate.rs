@@ -711,7 +711,16 @@ fn tel_uris(certificate: &Certificate) -> Result<Vec<String>> {
         .collect())
 }
 
-fn same_tel_uri(uri: &str, expected: &str) -> bool {
+/// The tel URIs of the Subject Alternative Name of the Client Certificate in
+/// `credential`, the MLS identity of a member, as validated when its leaf
+/// joined the group (RCC.16 section 9.1.1)
+pub fn credential_tel_uris(credential: &Credential) -> Result<Vec<String>> {
+    let chain = certificate_chain(credential)?;
+    tel_uris(chain.first().ok_or(CertificateError::Malformed)?)
+}
+
+/// Whether the tel URIs `uri` and `expected` are of the same number
+pub fn same_tel_uri(uri: &str, expected: &str) -> bool {
     let number = |s: &str| {
         s.strip_prefix("tel:")
             .or_else(|| s.strip_prefix("TEL:"))
