@@ -27,4 +27,8 @@ pub struct CPIMInfo<'a> {
     pub payload_type: Option<&'a [u8]>,
 
     pub disposition_notification: Option<&'a [u8]>,
+
+    /// The MLS-Derived-Content-Signature of a signed message, Base64 encoded
+    /// (RCC.16 section 7.2.2)
+    pub mls_derived_content_signature: Option<&'a [u8]>,
 }
