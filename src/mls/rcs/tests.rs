@@ -841,6 +841,115 @@ fn leaving_through_proposal_list() {
 }
 
 #[test]
+fn leave_message() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    // not while a Commit of bob's own is pending
+    let output = bob_conversation.update_keys(&bob).unwrap();
+    assert_eq!(
+        bob_conversation.leave_message(&bob).err(),
+        Some(ErrorKind::InvalidState)
+    );
+    bob_conversation
+        .process_commit_bundle(&bob, &accept(&output))
+        .unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap();
+
+    // the BYE's body holds the ProposalList, which the Focus forwards as it is
+    let body = bob_conversation.leave_message(&bob).unwrap();
+    let message: ClientMlsRcsMessage = proto::decode(&body).unwrap();
+    let list = match message.payload {
+        Some(client_mls_rcs_message::Payload::ProposalList(list)) => list,
+        _ => panic!("expected a ProposalList"),
+    };
+    let proposals = wire::decode_message_list(&list).unwrap();
+    assert_eq!(proposals.len(), 1);
+    assert!(proposals[0].windows(3).any(|w| w == [2, 0xF0, 0x03]));
+
+    let forwarded = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ProposalList(list)),
+    });
+    match alice_conversation
+        .process_server_message(&alice, &forwarded)
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Proposal { sender }] => assert_eq!(sender.serialized_content(), b"bob"),
+        _ => panic!("expected a Proposal"),
+    }
+
+    let output = alice_conversation.commit_pending_proposals(&alice).unwrap();
+    deliver((&mut alice_conversation, &alice), vec![], &output);
+    match bob_conversation
+        .process_commit_bundle(&bob, &accept(&output))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { self_removed, .. }] => assert!(*self_removed),
+        _ => panic!("expected a Commit"),
+    }
+    assert_eq!(alice_conversation.members().len(), 1);
+}
+
+#[test]
+fn withdrawing_own_proposals() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    // a leave the Focus refused: bob's own self_remove would keep him from
+    // committing anything
+    bob_conversation.leave_message(&bob).unwrap();
+    assert_eq!(
+        bob_conversation.update_keys(&bob).err(),
+        Some(ErrorKind::InvalidState)
+    );
+    bob_conversation.withdraw_own_proposals(&bob).unwrap();
+    assert_eq!(bob_conversation.mls_group().pending_proposals().count(), 0);
+
+    let output = bob_conversation.update_keys(&bob).unwrap();
+    bob_conversation
+        .process_commit_bundle(&bob, &accept(&output))
+        .unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap();
+    assert_eq!(alice_conversation.members().len(), 2);
+
+    // those of others stay, for bob to commit
+    bob_conversation.leave(&bob).unwrap();
+    let proposal = alice_conversation.leave(&alice).unwrap();
+    assert!(matches!(
+        bob_conversation.process(&bob, &proposal).unwrap(),
+        IncomingMessage::Proposal { .. }
+    ));
+    bob_conversation.withdraw_own_proposals(&bob).unwrap();
+    let alice_leaf = alice_conversation.mls_group().own_leaf_index();
+    let senders: Vec<_> = bob_conversation
+        .mls_group()
+        .pending_proposals()
+        .map(|proposal| proposal.sender().clone())
+        .collect();
+    assert_eq!(senders, [openmls::prelude::Sender::Member(alice_leaf)]);
+
+    let output = bob_conversation.commit_pending_proposals(&bob).unwrap();
+    deliver((&mut bob_conversation, &bob), vec![], &output);
+    match alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { self_removed, .. }] => assert!(*self_removed),
+        _ => panic!("expected a Commit"),
+    }
+    assert_eq!(bob_conversation.members(), [bob.credential().clone()]);
+}
+
+#[test]
 fn proposal_lists_apply_whole() {
     let alice = client("alice");
     let bob = client("bob");
