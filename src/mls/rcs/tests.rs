@@ -950,6 +950,96 @@ fn withdrawing_own_proposals() {
 }
 
 #[test]
+fn leaving_members() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    assert!(alice_conversation.leaving_members().is_empty());
+
+    // bob's self_remove, but not alice's own
+    let proposal = bob_conversation.leave(&bob).unwrap();
+    alice_conversation.process(&alice, &proposal).unwrap();
+    alice_conversation.leave(&alice).unwrap();
+    assert_eq!(
+        alice_conversation.leaving_members(),
+        [bob.credential().clone()]
+    );
+    assert!(bob_conversation.leaving_members().is_empty());
+
+    // no longer once committed
+    alice_conversation.withdraw_own_proposals(&alice).unwrap();
+    let output = alice_conversation.commit_pending_proposals(&alice).unwrap();
+    deliver((&mut alice_conversation, &alice), vec![], &output);
+    assert!(alice_conversation.leaving_members().is_empty());
+
+    // a Remove of another is not a leave
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let alice_leaf = alice_conversation.mls_group().own_leaf_index();
+    let remove = bob_conversation
+        .mls_group()
+        .propose_remove_member(bob.provider(), bob.signer(), alice_leaf)
+        .unwrap()
+        .0
+        .to_bytes()
+        .unwrap();
+    assert!(matches!(
+        alice_conversation.process(&alice, &remove).unwrap(),
+        IncomingMessage::Proposal { .. }
+    ));
+    assert!(alice_conversation.leaving_members().is_empty());
+}
+
+#[test]
+fn a_leave_committed_with_the_other_clients_of_the_leaver() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let tablet = client("bob-tablet");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let key_package = tablet.generate_key_package(false).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_package])
+        .unwrap();
+    deliver(
+        (&mut alice_conversation, &alice),
+        vec![(&mut bob_conversation, &bob)],
+        &output,
+    );
+    let bundle = accept(&output);
+    let mut tablet_conversation = tablet
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+
+    // bob leaves from his phone; his tablet is removed in the same Commit
+    let proposal = bob_conversation.leave(&bob).unwrap();
+    alice_conversation.process(&alice, &proposal).unwrap();
+    tablet_conversation.process(&tablet, &proposal).unwrap();
+    assert_eq!(
+        alice_conversation.leaving_members(),
+        [bob.credential().clone()]
+    );
+    let output = alice_conversation
+        .remove_members(&alice, &[tablet.credential().clone()])
+        .unwrap();
+    deliver((&mut alice_conversation, &alice), vec![], &output);
+    assert_eq!(alice_conversation.members(), [alice.credential().clone()]);
+    for (conversation, client) in [
+        (&mut bob_conversation, &bob),
+        (&mut tablet_conversation, &tablet),
+    ] {
+        assert!(matches!(
+            conversation
+                .process_commit_bundle(client, &accept(&output))
+                .unwrap()
+                .as_slice(),
+            [IncomingMessage::Commit {
+                self_removed: true,
+                ..
+            }]
+        ));
+    }
+}
+
+#[test]
 fn proposal_lists_apply_whole() {
     let alice = client("alice");
     let bob = client("bob");

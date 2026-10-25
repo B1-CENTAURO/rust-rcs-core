@@ -548,6 +548,22 @@ impl MlsConversation {
         Ok(())
     }
 
+    /// The members with a self_remove Proposal pending, this client aside:
+    /// those leaving, whose Proposals the Conversation Focus forwards for a
+    /// member to commit, with the other Clients of their Participants (RCC.16
+    /// section 9.4)
+    pub fn leaving_members(&self) -> Vec<Credential> {
+        let own = self.group.own_leaf_index();
+        self.group
+            .pending_proposals()
+            .filter(|proposal| matches!(proposal.proposal(), Proposal::SelfRemove))
+            .filter_map(|proposal| match proposal.sender() {
+                Sender::Member(index) if *index != own => self.group.member(*index).cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Encrypts application data for the group, in its current epoch
     pub fn encrypt(&mut self, client: &MlsClient, plaintext: &[u8]) -> Result<Vec<u8>> {
         self.encrypt_with_aad(client, plaintext, Vec::new())
