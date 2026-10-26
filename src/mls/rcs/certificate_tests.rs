@@ -847,3 +847,56 @@ fn members_whose_certificate_expired_are_to_be_replaced() {
         [credential(&[ALICE, CA])]
     );
 }
+
+#[test]
+fn the_continuity_token_carries_over_to_a_new_era_of_the_same_participants() {
+    use super::era::EraBase;
+    use super::proto::MlsGroupInfo;
+
+    const ALICE_TEL: &str = "tel:+491701234567";
+    const BOB_TEL: &str = "tel:+491707654321";
+    const CAROL_TEL: &str = "tel:+491700000001";
+    let now = Arc::new(AtomicU64::new(seconds("2026-09-15")));
+    let alice = x509_client(&[ALICE, CA], ALICE_KEY, ALICE_PUBLIC_KEY, now.clone());
+    let bob = x509_client(&[BOB, CA], BOB_KEY, BOB_PUBLIC_KEY, now.clone());
+    let group_with_bob = |group_id: &[u8]| {
+        let mut alice_conversation = alice.create_conversation(Some(group_id), 0).unwrap();
+        let key_package = bob.generate_key_package(false).unwrap();
+        let output = alice_conversation
+            .add_members(&alice, &[&key_package])
+            .unwrap();
+        alice_conversation.merge_pending_commit(&alice).unwrap();
+        let bob_conversation = bob
+            .join_conversation(&output.welcome.unwrap(), &output.ratchet_tree.unwrap())
+            .unwrap();
+        let group_info = MlsGroupInfo {
+            group_info: output.group_info,
+            ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+            pending_proposals: Vec::new(),
+        };
+        (bob_conversation, group_info)
+    };
+    let (bob_conversation, group_info) = group_with_bob(b"conversation-1");
+    let base = EraBase::of_group_info(&group_info).unwrap();
+
+    // the Participants are the members of the group, which has no members
+    // the client did not know of (RCC.16 section 8.3.1.2)
+    assert!(base.continuity_holds(Some(&bob_conversation), &[ALICE_TEL, BOB_TEL]));
+    assert!(base.continuity_holds(Some(&bob_conversation), &[BOB_TEL]));
+    // not with a Participant who is not a member
+    assert!(!base.continuity_holds(Some(&bob_conversation), &[ALICE_TEL, BOB_TEL, CAROL_TEL]));
+    // nor without the group of the client to compare with
+    assert!(!base.continuity_holds(None, &[ALICE_TEL, BOB_TEL]));
+    let (other_group, _) = group_with_bob(b"conversation-2");
+    assert!(!base.continuity_holds(Some(&other_group), &[ALICE_TEL, BOB_TEL]));
+    // nor with a member the client did not know of
+    let alone = x509_client(&[BOB, CA], BOB_KEY, BOB_PUBLIC_KEY, now.clone())
+        .create_conversation(Some(b"conversation-1"), 0)
+        .unwrap();
+    assert!(!base.continuity_holds(Some(&alone), &[ALICE_TEL, BOB_TEL]));
+
+    // the group of the client, unless a Participant is not a member
+    let local = EraBase::of_conversation(&bob_conversation);
+    assert!(local.continuity_holds(None, &[ALICE_TEL, BOB_TEL]));
+    assert!(!local.continuity_holds(None, &[ALICE_TEL, CAROL_TEL]));
+}
