@@ -207,6 +207,11 @@ impl RcsCredentialValidator {
         self
     }
 
+    /// The time now, as the validator tells it
+    pub fn now(&self) -> SystemTime {
+        (self.clock)()
+    }
+
     /// Default Validation Requirements (A.4.1.1) for the credential of an MLS
     /// leaf whose signature key is `signature_key`
     pub fn validate_credential(

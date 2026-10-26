@@ -274,6 +274,11 @@ fn replacement_validation() {
 }
 
 #[test]
+fn a_validator_tells_the_time_of_its_clock() {
+    assert_eq!(validator("2026-09-15").now(), time("2026-09-15"));
+}
+
+#[test]
 fn trusted_roots() {
     assert_eq!(
         RcsCredentialValidator::new(&[&bytes(CA)]).err(),
