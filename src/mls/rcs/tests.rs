@@ -2591,3 +2591,275 @@ fn external_commit_removals_are_validated() {
         .is_ok());
     assert_eq!(alice_conversation.members().len(), 2);
 }
+
+/// A key update of `client` in `conversation`, applied by it and by the
+/// others in `members` as the Conversation Focus forwards it
+fn key_update(
+    client: &MlsClient,
+    conversation: &mut MlsConversation,
+    members: &mut [(&MlsClient, &mut MlsConversation)],
+) {
+    let bundle = accept(&conversation.update_keys(client).unwrap());
+    conversation.process_commit_bundle(client, &bundle).unwrap();
+    for (member, member_conversation) in members {
+        member_conversation
+            .process_commit_bundle(member, &bundle)
+            .unwrap();
+    }
+}
+
+fn send(client: &MlsClient, conversation: &mut MlsConversation, count: u32) {
+    for _ in 0..count {
+        conversation
+            .encrypt_cpim(client, b"hi", b"msg", b"")
+            .unwrap();
+    }
+}
+
+/// The time the clients of a test tell, which it moves on
+#[derive(Clone)]
+struct TestClock(std::sync::Arc<std::sync::Mutex<std::time::SystemTime>>);
+
+impl TestClock {
+    fn new() -> TestClock {
+        TestClock(std::sync::Arc::new(std::sync::Mutex::new(
+            std::time::SystemTime::now(),
+        )))
+    }
+
+    fn now(&self) -> std::time::SystemTime {
+        *self.0.lock().unwrap()
+    }
+
+    fn set(&self, time: std::time::SystemTime) {
+        *self.0.lock().unwrap() = time;
+    }
+
+    /// Has `client` tell this time
+    fn keep(&self, client: &mut MlsClient) {
+        let clock = self.clone();
+        client.set_clock(std::sync::Arc::new(move || clock.now()));
+    }
+}
+
+fn timed_client(identity: &str, clock: &TestClock) -> MlsClient {
+    let mut client = client(identity);
+    clock.keep(&mut client);
+    client
+}
+
+const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[test]
+fn key_updates_by_days_and_messages() {
+    use std::time::Duration;
+
+    let clock = TestClock::new();
+    let start = clock.now();
+    let alice = timed_client("alice", &clock);
+    let bob = timed_client("bob", &clock);
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let due = |conversation: &MlsConversation, client: &MlsClient, after: Duration| {
+        clock.set(start + after);
+        conversation.key_update_due(client).unwrap()
+    };
+
+    // after 30 days at most, not before 7 (RCC.16 section 9.5.2)
+    for (conversation, client) in [(&alice_conversation, &alice), (&bob_conversation, &bob)] {
+        assert!(!due(conversation, client, Duration::ZERO));
+        assert!(!due(conversation, client, 30 * DAY - MINUTE));
+        assert!(due(conversation, client, 30 * DAY + MINUTE));
+    }
+    // or after 50 messages
+    send(&bob, &mut bob_conversation, 49);
+    assert!(!due(&bob_conversation, &bob, 8 * DAY));
+    send(&bob, &mut bob_conversation, 1);
+    assert!(due(&bob_conversation, &bob, 7 * DAY + MINUTE));
+    assert!(!due(&bob_conversation, &bob, 7 * DAY - MINUTE));
+    // the count kept with the rest of the client
+    let mut restored = MlsClient::restore(
+        &bob.snapshot().unwrap(),
+        MlsConfig::default(),
+        Box::new(AllowAll),
+    )
+    .unwrap();
+    clock.keep(&mut restored);
+    let restored_conversation = restored
+        .load_conversation(bob_conversation.group_id())
+        .unwrap();
+    assert!(due(&restored_conversation, &restored, 7 * DAY + MINUTE));
+
+    // the Commits of others leave it as it is
+    clock.set(start);
+    key_update(
+        &alice,
+        &mut alice_conversation,
+        &mut [(&bob, &mut bob_conversation)],
+    );
+    assert!(due(&bob_conversation, &bob, 7 * DAY + MINUTE));
+    // as do those of this client without UpdatePath
+    send(&alice, &mut alice_conversation, 50);
+    let carol = client("carol");
+    let key_package = carol.generate_key_package(false).unwrap();
+    clock.set(start + DAY);
+    let bundle = accept(
+        &alice_conversation
+            .add_members(&alice, &[&key_package])
+            .unwrap(),
+    );
+    assert!(alice_conversation
+        .mls_group()
+        .pending_commit()
+        .is_some_and(|commit| commit.update_path_leaf_node().is_none()));
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .unwrap();
+    assert!(due(&alice_conversation, &alice, 7 * DAY + MINUTE));
+
+    // a key update starts over, from when it is applied
+    clock.set(start + 10 * DAY);
+    key_update(
+        &bob,
+        &mut bob_conversation,
+        &mut [(&alice, &mut alice_conversation)],
+    );
+    assert!(!due(&bob_conversation, &bob, 40 * DAY - MINUTE));
+    assert!(due(&bob_conversation, &bob, 40 * DAY + MINUTE));
+    send(&bob, &mut bob_conversation, 49);
+    assert!(!due(&bob_conversation, &bob, 18 * DAY));
+}
+
+#[test]
+fn key_updates_after_joining_with_a_last_resort_key_package() {
+    use std::time::Duration;
+
+    let clock = TestClock::new();
+    let start = clock.now();
+    let alice = timed_client("alice", &clock);
+    let bob = timed_client("bob", &clock);
+    let (mut alice_conversation, _, _) = establish(&alice, &bob);
+    let carol = timed_client("carol", &clock);
+    let key_package = carol.generate_key_package(true).unwrap();
+    let bundle = accept(
+        &alice_conversation
+            .add_members(&alice, &[&key_package])
+            .unwrap(),
+    );
+    let mut carol_conversation = carol
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    let due = |conversation: &MlsConversation, after: Duration| {
+        clock.set(start + after);
+        conversation.key_update_due(&carol).unwrap()
+    };
+
+    // after a day at most, or 30 messages, at any time (RCC.16 section 9.5.2)
+    assert!(!due(&carol_conversation, Duration::ZERO));
+    assert!(!due(&carol_conversation, DAY - MINUTE));
+    assert!(due(&carol_conversation, DAY + MINUTE));
+    send(&carol, &mut carol_conversation, 29);
+    assert!(!due(&carol_conversation, Duration::ZERO));
+    send(&carol, &mut carol_conversation, 1);
+    assert!(due(&carol_conversation, Duration::ZERO));
+
+    // and as others after the first
+    clock.set(start);
+    key_update(
+        &carol,
+        &mut carol_conversation,
+        &mut [(&alice, &mut alice_conversation)],
+    );
+    assert!(!due(&carol_conversation, 2 * DAY));
+    send(&carol, &mut carol_conversation, 30);
+    assert!(!due(&carol_conversation, 2 * DAY));
+    send(&carol, &mut carol_conversation, 20);
+    assert!(!due(&carol_conversation, 7 * DAY - MINUTE));
+    assert!(due(&carol_conversation, 7 * DAY + MINUTE));
+}
+
+#[test]
+fn no_key_updates_in_groups_unencrypted_or_left() {
+    let clock = TestClock::new();
+    let start = clock.now();
+    let alice = timed_client("alice", &clock);
+    let bob = timed_client("bob", &clock);
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    // nor in one with no record of when its leaf was last updated
+    let carol = timed_client("carol", &clock);
+    let carol_conversation = carol.create_conversation(None, 0).unwrap();
+    assert!(!carol_conversation.key_update_due(&carol).unwrap());
+    carol_conversation.forget_own_leaf(&carol).unwrap();
+    assert!(carol_conversation.key_update_due(&carol).unwrap());
+
+    let output = alice_conversation
+        .remove_members(&alice, &[bob.credential().clone()])
+        .unwrap();
+    let bundle = accept(&output);
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .unwrap();
+    assert!(!bob_conversation.is_active());
+    assert!(!bob_conversation.is_encryption_ended());
+    clock.set(start + 31 * DAY);
+    assert!(!bob_conversation.key_update_due(&bob).unwrap());
+
+    clock.set(start);
+    let output = alice_conversation
+        .set_encryption_ended(
+            &alice,
+            Some(proto::EndMlsReason::ClientFailureEncryptionNotAvailable),
+        )
+        .unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap();
+    clock.set(start + 31 * DAY);
+    assert!(!alice_conversation.key_update_due(&alice).unwrap());
+
+    // nothing of it kept once the group is let go of
+    let group_id = alice_conversation.group_id().to_vec();
+    let kept = |client: &MlsClient| {
+        client
+            .provider()
+            .read_value(&key_update::own_leaf_key(&group_id))
+            .unwrap()
+    };
+    assert!(kept(&alice).is_some());
+    alice_conversation.delete(&alice).unwrap();
+    assert_eq!(kept(&alice), None);
+}
+
+#[test]
+fn key_updates_start_over_on_rejoining() {
+    let clock = TestClock::new();
+    let start = clock.now();
+    let alice = timed_client("alice", &clock);
+    let bob = timed_client("bob", &clock);
+    let (alice_conversation, mut bob_conversation, group_info) = establish(&alice, &bob);
+    send(&bob, &mut bob_conversation, 50);
+    clock.set(start + 8 * DAY);
+    assert!(bob_conversation.key_update_due(&bob).unwrap());
+
+    // the External Commit taking the place of the leaf of bob
+    clock.set(start);
+    let (bob_conversation, _) = bob
+        .rejoin_conversation(&MlsGroupInfo {
+            group_info,
+            ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+            pending_proposals: Vec::new(),
+        })
+        .unwrap();
+    clock.set(start + 8 * DAY);
+    assert!(!bob_conversation.key_update_due(&bob).unwrap());
+}

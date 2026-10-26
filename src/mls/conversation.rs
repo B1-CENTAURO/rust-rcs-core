@@ -475,10 +475,18 @@ impl MlsConversation {
 
     /// Applies the Commit last created by this client
     pub fn merge_pending_commit(&mut self, client: &MlsClient) -> Result<()> {
+        // its leaf updated by an UpdatePath (RCC.16 section 9.5.2)
+        let updated = self
+            .group
+            .pending_commit()
+            .is_some_and(|staged_commit| staged_commit.update_path_leaf_node().is_some());
         self.group
             .merge_pending_commit(client.provider())
             .map_err(fail("merging own Commit", ErrorKind::InvalidState))?;
         self.applied_commit = self.pending_commit.take();
+        if updated {
+            self.own_leaf_updated(client, false)?;
+        }
 
         // what was tried out on a copy before is done to the group itself as well
         if let Some(pending) = metadata::take_pending_epoch(client, self.group_id())? {
@@ -943,6 +951,7 @@ impl MlsConversation {
         client
             .provider()
             .remove_value(&key_generation_key(self.group_id()))?;
+        self.forget_own_leaf(client)?;
 
         self.group
             .delete(client.provider().storage())

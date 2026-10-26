@@ -22,6 +22,7 @@ pub mod certificate;
 pub mod file;
 pub mod heal;
 pub mod imdn;
+pub mod key_update;
 pub mod messaging;
 pub mod metadata;
 pub mod proto;

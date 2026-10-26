@@ -84,7 +84,10 @@ impl MlsConversation {
             payload,
         ))?;
 
-        self.encrypt_with_aad(client, &payload, wire::encode(authenticated_data)?)
+        let message = self.encrypt_with_aad(client, &payload, wire::encode(authenticated_data)?)?;
+        // towards the next key update (RCC.16 section 9.5.2)
+        self.count_sent(client)?;
+        Ok(message)
     }
 
     /// Decrypts an encrypted message received as `message/mls`

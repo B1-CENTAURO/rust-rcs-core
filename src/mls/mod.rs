@@ -33,7 +33,7 @@ pub use openmls::prelude::{Ciphersuite, Credential, CredentialType};
 /// signature scheme of its ciphersuite, its public key certified by the Home KDS
 pub use openmls_basic_credential::SignatureKeyPair;
 
-pub use client::{CredentialValidator, MlsClient, MlsConfig};
+pub use client::{Clock, CredentialValidator, MlsClient, MlsConfig};
 pub use conversation::{
     inspect, key_package_info, CommitOutput, IncomingMessage, KeyPackageInfo, MessageKind,
     MlsConversation,
