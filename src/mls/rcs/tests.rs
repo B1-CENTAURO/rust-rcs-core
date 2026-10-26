@@ -2764,10 +2764,7 @@ fn no_key_updates_in_groups_unencrypted_or_left() {
         .unwrap());
 
     let output = alice_conversation
-        .set_encryption_ended(
-            &alice,
-            Some(proto::EndMlsReason::ClientFailureEncryptionNotAvailable),
-        )
+        .remove_members(&alice, &[bob.credential().clone()])
         .unwrap();
     let bundle = accept(&output);
     alice_conversation
@@ -2776,19 +2773,32 @@ fn no_key_updates_in_groups_unencrypted_or_left() {
     bob_conversation
         .process_commit_bundle(&bob, &bundle)
         .unwrap();
-    assert!(!alice_conversation.key_update_due(&alice, later).unwrap());
+    assert!(!bob_conversation.is_active());
+    assert!(!bob_conversation.is_encryption_ended());
+    assert!(!bob_conversation.key_update_due(&bob, later).unwrap());
 
     let output = alice_conversation
-        .remove_members(&alice, &[bob.credential().clone()])
+        .set_encryption_ended(
+            &alice,
+            Some(proto::EndMlsReason::ClientFailureEncryptionNotAvailable),
+        )
         .unwrap();
-    let bundle = accept(&output);
-    bob_conversation
-        .process_commit_bundle(&bob, &bundle)
+    alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
         .unwrap();
-    assert!(!bob_conversation.is_active());
-    let output = bob_conversation.set_encryption_ended(&bob, None);
-    assert!(output.is_err());
-    assert!(!bob_conversation.key_update_due(&bob, later).unwrap());
+    assert!(!alice_conversation.key_update_due(&alice, later).unwrap());
+
+    // nothing of it kept once the group is let go of
+    let group_id = alice_conversation.group_id().to_vec();
+    let kept = |client: &MlsClient| {
+        client
+            .provider()
+            .read_value(&key_update::own_leaf_key(&group_id))
+            .unwrap()
+    };
+    assert!(kept(&alice).is_some());
+    alice_conversation.delete(&alice).unwrap();
+    assert_eq!(kept(&alice), None);
 }
 
 #[test]

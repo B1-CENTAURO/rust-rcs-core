@@ -90,7 +90,7 @@ impl OwnLeaf {
 
 /// Storage key of what is kept of the leaf of this client in the group
 /// `group_id`, apart from the keys OpenMLS uses
-fn own_leaf_key(group_id: &[u8]) -> Vec<u8> {
+pub(crate) fn own_leaf_key(group_id: &[u8]) -> Vec<u8> {
     [&b"RcsOwnLeaf"[..], group_id].concat()
 }
 
