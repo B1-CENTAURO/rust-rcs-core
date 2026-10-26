@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::OpenMlsProvider;
@@ -373,13 +374,45 @@ impl MlsConversation {
     }
 
     /// Replaces this client's own key material, for post-compromise security
-    /// (RCC.16 section 9.5.2)
+    /// (RCC.16 section 9.5.2), and with it the credential and signature key of
+    /// its leaf, if the client renewed them since (section 9.5.3)
     pub fn update_keys(&mut self, client: &MlsClient) -> Result<CommitOutput> {
+        let extras = CommitExtras {
+            renewed: self.credential_outdated(client),
+            ..CommitExtras::default()
+        };
         self.commit(
             client,
             |builder| Ok(builder.force_self_update(true)),
-            CommitExtras::default(),
+            extras,
         )
+    }
+
+    /// Whether the leaf of this client in the group has another credential
+    /// than the client, which renewed its certificate since (RCC.16 section
+    /// 9.5.3)
+    pub fn credential_outdated(&self, client: &MlsClient) -> bool {
+        self.group.own_leaf_node().is_some_and(|leaf_node| {
+            leaf_node.credential() != client.credential()
+                || leaf_node.signature_key().as_slice() != client.signer().public()
+        })
+    }
+
+    /// The signature key of the leaf of this client in the group, which signs
+    /// what the client sends there: the client's, or the one it had before it
+    /// renewed its certificate, until the leaf is updated
+    pub(crate) fn signer(&self, client: &MlsClient) -> Result<SignatureKeyPair> {
+        match self.group.own_leaf_node() {
+            Some(leaf_node) if leaf_node.signature_key().as_slice() != client.signer().public() => {
+                SignatureKeyPair::read(
+                    client.provider().storage(),
+                    leaf_node.signature_key().as_slice(),
+                    client.ciphersuite().signature_algorithm(),
+                )
+                .ok_or(ErrorKind::Storage)
+            }
+            _ => Ok(client.signer().clone()),
+        }
     }
 
     /// Commits the proposals received so far
@@ -517,7 +550,7 @@ impl MlsConversation {
     /// member has to commit it
     pub fn leave(&mut self, client: &MlsClient) -> Result<Vec<u8>> {
         self.group
-            .leave_group_via_self_remove(client.provider(), client.signer())
+            .leave_group_via_self_remove(client.provider(), &self.signer(client)?)
             .map_err(fail("leaving group", ErrorKind::InvalidState))?
             .to_bytes()
             .map_err(fail("proposal encoding", ErrorKind::BadFormat))
@@ -599,7 +632,7 @@ impl MlsConversation {
         let key_generation = self.key_generation(client)?;
         let message = self
             .group
-            .create_message(client.provider(), client.signer(), plaintext)
+            .create_message(client.provider(), &self.signer(client)?, plaintext)
             .map_err(fail("encrypting message", ErrorKind::InvalidState))?;
         self.set_key_generation(client, key_generation + 1)?;
 
@@ -980,20 +1013,27 @@ impl MlsConversation {
     ) -> Result<CommitMessageBundle> {
         let welcome_extensions =
             metadata::welcome_extensions(self, client, extras.metadata.as_ref())?;
+        let signer = self.signer(client)?;
 
-        build(self.group.commit_builder())?
+        let builder = build(self.group.commit_builder())?
             .load_psks(client.provider().storage())
             .map_err(fail("loading PSKs", ErrorKind::Storage))?
             .create_group_info_with_extensions(welcome_extensions)
             .map_err(fail("Welcome extensions", ErrorKind::InvalidState))?
             // the GroupInfo for the Conversation Focus is made in commit_output()
-            .create_group_info(false)
-            .build(
-                client.provider().rand(),
-                client.provider().crypto(),
-                client.signer(),
-                |_| true,
-            )
+            .create_group_info(false);
+        let rand = client.provider().rand();
+        let crypto = client.provider().crypto();
+        let builder = if extras.renewed {
+            let renewed = NewSignerBundle {
+                signer: client.signer(),
+                credential_with_key: client.credential_with_key().clone(),
+            };
+            builder.build_with_new_signer(rand, crypto, &signer, renewed, |_| true)
+        } else {
+            builder.build(rand, crypto, &signer, |_| true)
+        };
+        builder
             .map_err(fail("creating Commit", ErrorKind::InvalidState))?
             .stage_commit(client.provider())
             .map_err(fail("staging Commit", ErrorKind::InvalidState))
@@ -1050,7 +1090,7 @@ impl MlsConversation {
             .group
             .export_group_info_with_additional_extensions(
                 fork.provider().crypto(),
-                fork.signer(),
+                &next.signer(&fork)?,
                 false,
                 metadata::group_info_extensions(&next, &fork, &keys)?,
             )
@@ -1179,6 +1219,9 @@ pub(crate) struct CommitExtras {
     pub bundled: Option<(Vec<u8>, Vec<u8>)>,
     /// Group metadata of this client once the Commit is applied, if it changes
     pub metadata: Option<proto::GroupMetadataKeys>,
+    /// Whether the UpdatePath brings in the credential and signature key the
+    /// client renewed, the Commit signed with those of its leaf until then
+    pub renewed: bool,
 }
 
 fn is_end_mls(extension: &Extension) -> bool {

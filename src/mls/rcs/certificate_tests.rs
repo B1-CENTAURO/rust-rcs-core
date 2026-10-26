@@ -655,3 +655,137 @@ fn tel_uris_are_the_same_by_their_number() {
     assert!(same_tel_uri("tel:+491701234567", "+491701234567"));
     assert!(!same_tel_uri("tel:+491701234567", "tel:+491707654321"));
 }
+
+#[test]
+fn a_renewed_certificate_is_brought_into_groups_with_a_key_update() {
+    let now = Arc::new(AtomicU64::new(seconds("2026-09-15")));
+    let mut alice = x509_client(&[ALICE, CA], ALICE_KEY, ALICE_PUBLIC_KEY, now.clone());
+    let bob = x509_client(&[BOB, CA], BOB_KEY, BOB_PUBLIC_KEY, now.clone());
+    let group_with_bob = |alice: &MlsClient| {
+        let mut alice_conversation = alice.create_conversation(None, 0).unwrap();
+        let key_package = bob.generate_key_package(false).unwrap();
+        let output = alice_conversation
+            .add_members(alice, &[&key_package])
+            .unwrap();
+        alice_conversation.merge_pending_commit(alice).unwrap();
+        let bob_conversation = bob
+            .join_conversation(&output.welcome.unwrap(), &output.ratchet_tree.unwrap())
+            .unwrap();
+        (alice_conversation, bob_conversation)
+    };
+    let (mut alice_updated, mut bob_updated) = group_with_bob(&alice);
+    let (mut alice_other, mut bob_other) = group_with_bob(&alice);
+    let renewed_signer = || {
+        SignatureKeyPair::from_raw(
+            SignatureScheme::ECDSA_SECP256R1_SHA256,
+            bytes(ALICE_RENEWED_KEY),
+            bytes(ALICE_RENEWED_PUBLIC_KEY),
+        )
+    };
+
+    // a credential not for the key, or one of another scheme, is refused
+    now.store(seconds("2026-10-05"), Ordering::Relaxed);
+    assert_eq!(
+        alice.renew(credential(&[BOB, CA]), renewed_signer()),
+        Err(ErrorKind::InvalidCredential)
+    );
+    assert_eq!(
+        alice.renew(
+            credential(&[ALICE_RENEWED, CA]),
+            SignatureKeyPair::new(SignatureScheme::ED25519).unwrap()
+        ),
+        Err(ErrorKind::Crypto)
+    );
+    assert_eq!(alice.credential(), &credential(&[ALICE, CA]));
+    assert!(!alice_updated.credential_outdated(&alice));
+
+    alice
+        .renew(credential(&[ALICE_RENEWED, CA]), renewed_signer())
+        .unwrap();
+    assert_eq!(alice.credential(), &credential(&[ALICE_RENEWED, CA]));
+    assert_eq!(alice.signer().public(), bytes(ALICE_RENEWED_PUBLIC_KEY));
+
+    // the groups go on with the former leaf until it is updated
+    for (alice_conversation, bob_conversation) in [
+        (&mut alice_updated, &mut bob_updated),
+        (&mut alice_other, &mut bob_other),
+    ] {
+        assert!(alice_conversation.credential_outdated(&alice));
+        assert!(alice_conversation.key_update_due(&alice).unwrap());
+        let message = alice_conversation
+            .encrypt_cpim(&alice, b"hi", b"msg-1", b"")
+            .unwrap();
+        let decrypted = bob_conversation.decrypt(&bob, &message, b"msg-1").unwrap();
+        assert_eq!(decrypted.sender, credential(&[ALICE, CA]));
+        // and signed notifications
+        let signature = alice_conversation.sign(&alice, b"derived").unwrap();
+        assert_eq!(
+            bob_conversation.verify_signature(&bob, &signature, b"derived"),
+            Ok(credential(&[ALICE, CA]))
+        );
+    }
+    // and Proposals
+    let proposal = alice_other.leave(&alice).unwrap();
+    match bob_other.process(&bob, &proposal).unwrap() {
+        IncomingMessage::Proposal { sender } => assert_eq!(sender, credential(&[ALICE, CA])),
+        _ => panic!("expected a Proposal"),
+    }
+    alice_other.withdraw_own_proposals(&alice).unwrap();
+
+    // until the key update brings in the new one, which Bob takes
+    let output = alice_updated.update_keys(&alice).unwrap();
+    match bob_updated.process(&bob, &output.commit).unwrap() {
+        IncomingMessage::Commit { sender, .. } => {
+            assert_eq!(sender, credential(&[ALICE, CA]))
+        }
+        _ => panic!("expected a Commit"),
+    }
+    alice_updated.merge_pending_commit(&alice).unwrap();
+    assert!(!alice_updated.credential_outdated(&alice));
+    assert!(!alice_updated.key_update_due(&alice).unwrap());
+    let message = alice_updated
+        .encrypt_cpim(&alice, b"hi", b"msg-2", b"")
+        .unwrap();
+    let decrypted = bob_updated.decrypt(&bob, &message, b"msg-2").unwrap();
+    assert_eq!(decrypted.sender, credential(&[ALICE_RENEWED, CA]));
+    assert!(bob_updated
+        .members()
+        .contains(&credential(&[ALICE_RENEWED, CA])));
+
+    // the former key kept with the client for the group not updated yet
+    let restored = MlsClient::restore(
+        &alice.snapshot().unwrap(),
+        MlsConfig::default(),
+        Box::new(
+            RcsCredentialValidator::new(&[&bytes(ROOT)])
+                .unwrap()
+                .with_clock(|| time("2026-10-05")),
+        ),
+    )
+    .unwrap();
+    assert_eq!(restored.credential(), &credential(&[ALICE_RENEWED, CA]));
+    let mut alice_other = restored.load_conversation(alice_other.group_id()).unwrap();
+    assert!(alice_other.credential_outdated(&restored));
+    let message = alice_other
+        .encrypt_cpim(&restored, b"hi", b"msg-3", b"")
+        .unwrap();
+    let decrypted = bob_other.decrypt(&bob, &message, b"msg-3").unwrap();
+    assert_eq!(decrypted.sender, credential(&[ALICE, CA]));
+
+    // as does the GroupInfo of another Commit of it, which Bob rejoins with
+    let output = alice_other
+        .set_encryption_ended(
+            &restored,
+            Some(super::proto::EndMlsReason::ClientFailureEncryptionNotAvailable),
+        )
+        .unwrap();
+    alice_other.merge_pending_commit(&restored).unwrap();
+    assert!(alice_other.credential_outdated(&restored));
+    assert!(bob
+        .rejoin_conversation(&super::proto::MlsGroupInfo {
+            group_info: output.group_info,
+            ratchet_tree: alice_other.ratchet_tree().unwrap(),
+            pending_proposals: Vec::new(),
+        })
+        .is_ok());
+}

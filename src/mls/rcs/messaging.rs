@@ -177,7 +177,7 @@ impl MlsConversation {
             .group
             .propose_custom_proposal_by_value(
                 client.provider(),
-                client.signer(),
+                &self.signer(client)?,
                 CustomProposal::new(PROPOSAL_RCS_SIGNATURE, Vec::new()),
             )
             .map_err(fail("signing", ErrorKind::InvalidState))?;

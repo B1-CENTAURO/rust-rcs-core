@@ -109,12 +109,19 @@ impl MlsConversation {
     /// resort KeyPackage and has not updated its leaf since, else of
     /// `REGULAR_KEY_UPDATE`
     ///
+    /// One is due at once, too, while the leaf has another credential than
+    /// the client, which renewed its certificate since: the key update brings
+    /// the new one into the group (section 9.5.3).
+    ///
     /// Never in a group moved to unencrypted, nor in one this client is no
     /// longer a member of. A group with no record of when its leaf was last
     /// updated, as one joined before such records were kept, is due.
     pub fn key_update_due(&self, client: &MlsClient) -> Result<bool> {
         if self.is_encryption_ended() || !self.is_active() {
             return Ok(false);
+        }
+        if self.credential_outdated(client) {
+            return Ok(true);
         }
         let Some(own_leaf) = self.own_leaf(client)? else {
             return Ok(true);

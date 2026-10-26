@@ -222,6 +222,37 @@ impl MlsClient {
         &self.credential.credential
     }
 
+    pub(crate) fn credential_with_key(&self) -> &CredentialWithKey {
+        &self.credential
+    }
+
+    /// Takes on `credential`, a certificate renewed for the public key of
+    /// `signer`, in place of the one the client had (RCC.16 section 9.5.3):
+    /// KeyPackages, groups created and External Commits use them from now on,
+    /// and `update_keys()` brings them into the groups the client is in
+    ///
+    /// The former signature key is kept, as each group goes on signing with
+    /// the key of its leaf until its leaf is updated. The credential has to
+    /// pass the validator.
+    pub fn renew(&mut self, credential: Credential, signer: SignatureKeyPair) -> Result<()> {
+        if signer.signature_scheme() != self.ciphersuite.signature_algorithm() {
+            return Err(ErrorKind::Crypto);
+        }
+        if !self.validator.validate(&credential, signer.public()) {
+            return Err(ErrorKind::InvalidCredential);
+        }
+        signer
+            .store(self.provider.storage())
+            .map_err(fail("storing signature key", ErrorKind::Storage))?;
+
+        self.credential = CredentialWithKey {
+            credential,
+            signature_key: signer.to_public_vec().into(),
+        };
+        self.signer = signer;
+        Ok(())
+    }
+
     pub fn ciphersuite(&self) -> Ciphersuite {
         self.ciphersuite
     }
