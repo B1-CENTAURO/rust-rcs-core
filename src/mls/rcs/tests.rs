@@ -2790,3 +2790,25 @@ fn no_key_updates_in_groups_unencrypted_or_left() {
     assert!(output.is_err());
     assert!(!bob_conversation.key_update_due(&bob, later).unwrap());
 }
+
+#[test]
+fn key_updates_start_over_on_rejoining() {
+    use std::time::{Duration, SystemTime};
+
+    let alice = client("alice");
+    let bob = client("bob");
+    let (alice_conversation, mut bob_conversation, group_info) = establish(&alice, &bob);
+    send(&bob, &mut bob_conversation, 50);
+    let later = SystemTime::now() + Duration::from_secs(8 * 24 * 60 * 60);
+    assert!(bob_conversation.key_update_due(&bob, later).unwrap());
+
+    // the External Commit taking the place of the leaf of bob
+    let (bob_conversation, _) = bob
+        .rejoin_conversation(&MlsGroupInfo {
+            group_info,
+            ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+            pending_proposals: Vec::new(),
+        })
+        .unwrap();
+    assert!(!bob_conversation.key_update_due(&bob, later).unwrap());
+}
