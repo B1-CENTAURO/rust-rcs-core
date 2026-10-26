@@ -2591,3 +2591,202 @@ fn external_commit_removals_are_validated() {
         .is_ok());
     assert_eq!(alice_conversation.members().len(), 2);
 }
+
+/// A key update of `client` in `conversation`, applied by it and by the
+/// others in `members` as the Conversation Focus forwards it
+fn key_update(
+    client: &MlsClient,
+    conversation: &mut MlsConversation,
+    members: &mut [(&MlsClient, &mut MlsConversation)],
+) {
+    let bundle = accept(&conversation.update_keys(client).unwrap());
+    conversation.process_commit_bundle(client, &bundle).unwrap();
+    for (member, member_conversation) in members {
+        member_conversation
+            .process_commit_bundle(member, &bundle)
+            .unwrap();
+    }
+}
+
+fn send(client: &MlsClient, conversation: &mut MlsConversation, count: u32) {
+    for _ in 0..count {
+        conversation
+            .encrypt_cpim(client, b"hi", b"msg", b"")
+            .unwrap();
+    }
+}
+
+#[test]
+fn key_updates_by_days_and_messages() {
+    use std::time::{Duration, SystemTime};
+
+    let day = Duration::from_secs(24 * 60 * 60);
+    let minute = Duration::from_secs(60);
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let now = SystemTime::now();
+    let due = |conversation: &MlsConversation, client: &MlsClient, after: Duration| {
+        conversation.key_update_due(client, now + after).unwrap()
+    };
+
+    // after 30 days at most, not before 7 (RCC.16 section 9.5.2)
+    for (conversation, client) in [(&alice_conversation, &alice), (&bob_conversation, &bob)] {
+        assert!(!due(conversation, client, Duration::ZERO));
+        assert!(!due(conversation, client, 30 * day - minute));
+        assert!(due(conversation, client, 30 * day + minute));
+    }
+    // or after 50 messages
+    send(&bob, &mut bob_conversation, 49);
+    assert!(!due(&bob_conversation, &bob, 8 * day));
+    send(&bob, &mut bob_conversation, 1);
+    assert!(due(&bob_conversation, &bob, 7 * day + minute));
+    assert!(!due(&bob_conversation, &bob, 7 * day - minute));
+    // the count kept with the rest of the client
+    let restored = MlsClient::restore(
+        &bob.snapshot().unwrap(),
+        MlsConfig::default(),
+        Box::new(AllowAll),
+    )
+    .unwrap();
+    let restored_conversation = restored
+        .load_conversation(bob_conversation.group_id())
+        .unwrap();
+    assert!(due(&restored_conversation, &restored, 7 * day + minute));
+
+    // the Commits of others leave it as it is
+    key_update(
+        &alice,
+        &mut alice_conversation,
+        &mut [(&bob, &mut bob_conversation)],
+    );
+    assert!(due(&bob_conversation, &bob, 7 * day + minute));
+    // as do those of this client without UpdatePath
+    send(&alice, &mut alice_conversation, 50);
+    let carol = client("carol");
+    let key_package = carol.generate_key_package(false).unwrap();
+    let bundle = accept(
+        &alice_conversation
+            .add_members(&alice, &[&key_package])
+            .unwrap(),
+    );
+    assert!(alice_conversation
+        .mls_group()
+        .pending_commit()
+        .is_some_and(|commit| commit.update_path_leaf_node().is_none()));
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .unwrap();
+    assert!(due(&alice_conversation, &alice, 7 * day + minute));
+
+    // a key update starts over
+    key_update(
+        &bob,
+        &mut bob_conversation,
+        &mut [(&alice, &mut alice_conversation)],
+    );
+    assert!(!due(&bob_conversation, &bob, 30 * day - minute));
+    send(&bob, &mut bob_conversation, 49);
+    assert!(!due(&bob_conversation, &bob, 8 * day));
+}
+
+#[test]
+fn key_updates_after_joining_with_a_last_resort_key_package() {
+    use std::time::{Duration, SystemTime};
+
+    let day = Duration::from_secs(24 * 60 * 60);
+    let minute = Duration::from_secs(60);
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, _, _) = establish(&alice, &bob);
+    let carol = client("carol");
+    let key_package = carol.generate_key_package(true).unwrap();
+    let bundle = accept(
+        &alice_conversation
+            .add_members(&alice, &[&key_package])
+            .unwrap(),
+    );
+    let mut carol_conversation = carol
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    let now = SystemTime::now();
+    let due = |conversation: &MlsConversation, after: Duration| {
+        conversation.key_update_due(&carol, now + after).unwrap()
+    };
+
+    // after a day at most, or 30 messages, at any time (RCC.16 section 9.5.2)
+    assert!(!due(&carol_conversation, Duration::ZERO));
+    assert!(!due(&carol_conversation, day - minute));
+    assert!(due(&carol_conversation, day + minute));
+    send(&carol, &mut carol_conversation, 29);
+    assert!(!due(&carol_conversation, Duration::ZERO));
+    send(&carol, &mut carol_conversation, 1);
+    assert!(due(&carol_conversation, Duration::ZERO));
+
+    // and as others after the first
+    key_update(
+        &carol,
+        &mut carol_conversation,
+        &mut [(&alice, &mut alice_conversation)],
+    );
+    assert!(!due(&carol_conversation, 2 * day));
+    send(&carol, &mut carol_conversation, 30);
+    assert!(!due(&carol_conversation, 2 * day));
+    send(&carol, &mut carol_conversation, 20);
+    assert!(!due(&carol_conversation, 7 * day - minute));
+    assert!(due(&carol_conversation, 7 * day + minute));
+}
+
+#[test]
+fn no_key_updates_in_groups_unencrypted_or_left() {
+    use std::time::{Duration, SystemTime};
+
+    let later = SystemTime::now() + Duration::from_secs(31 * 24 * 60 * 60);
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    // nor in one with no record of when its leaf was last updated
+    let carol = client("carol");
+    let carol_conversation = carol.create_conversation(None, 0).unwrap();
+    assert!(!carol_conversation
+        .key_update_due(&carol, SystemTime::now())
+        .unwrap());
+    carol_conversation.forget_own_leaf(&carol).unwrap();
+    assert!(carol_conversation
+        .key_update_due(&carol, SystemTime::now())
+        .unwrap());
+
+    let output = alice_conversation
+        .set_encryption_ended(
+            &alice,
+            Some(proto::EndMlsReason::ClientFailureEncryptionNotAvailable),
+        )
+        .unwrap();
+    let bundle = accept(&output);
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .unwrap();
+    assert!(!alice_conversation.key_update_due(&alice, later).unwrap());
+
+    let output = alice_conversation
+        .remove_members(&alice, &[bob.credential().clone()])
+        .unwrap();
+    let bundle = accept(&output);
+    bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .unwrap();
+    assert!(!bob_conversation.is_active());
+    let output = bob_conversation.set_encryption_ended(&bob, None);
+    assert!(output.is_err());
+    assert!(!bob_conversation.key_update_due(&bob, later).unwrap());
+}

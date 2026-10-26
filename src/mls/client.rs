@@ -380,7 +380,9 @@ impl MlsClient {
         )
         .map_err(fail("group creation", ErrorKind::InvalidState))?;
 
-        Ok(MlsConversation::new(group))
+        let conversation = MlsConversation::new(group);
+        conversation.own_leaf_updated(self, false)?;
+        Ok(conversation)
     }
 
     /// Joins a group through a Welcome generated for one of this client's KeyPackages
@@ -453,6 +455,7 @@ impl MlsClient {
 
         let conversation = MlsConversation::new(group);
         rcs::metadata::receive_welcome(&conversation, self, &welcome_extensions)?;
+        conversation.own_leaf_updated(self, conversation.own_leaf_from_last_resort())?;
         Ok(conversation)
     }
 
@@ -585,6 +588,7 @@ impl MlsClient {
             first_in_era: false,
         };
         conversation.applied_commit = Some(commit);
+        conversation.own_leaf_updated(self, false)?;
 
         Ok((conversation, output))
     }
