@@ -585,6 +585,7 @@ impl MlsConversation {
             CommitExtras {
                 bundled: Some((proto::encode(&sent), message_id.to_vec())),
                 metadata: Some(keys),
+                ..CommitExtras::default()
             },
         )?;
         Ok((output, encrypted))
@@ -621,8 +622,8 @@ impl MlsConversation {
                 remove_extension(extensions, EXTENSION_GROUP_METADATA_KEYS_REQUESTED);
             },
             CommitExtras {
-                bundled: None,
                 metadata: Some(keys),
+                ..CommitExtras::default()
             },
         )
     }
@@ -680,7 +681,7 @@ impl MlsConversation {
             |extensions| remove_extension(extensions, EXTENSION_GROUP_METADATA_KEYS_REQUESTED),
             CommitExtras {
                 bundled,
-                metadata: None,
+                ..CommitExtras::default()
             },
         )
     }

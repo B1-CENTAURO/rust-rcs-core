@@ -2863,3 +2863,33 @@ fn key_updates_start_over_on_rejoining() {
     clock.set(start + 8 * DAY);
     assert!(!bob_conversation.key_update_due(&bob).unwrap());
 }
+
+#[test]
+fn a_leaf_is_behind_a_client_renewed_with_another_credential_or_key() {
+    use openmls::prelude::BasicCredential;
+    use openmls_basic_credential::SignatureKeyPair;
+
+    let bob = client("bob");
+
+    // another credential, for the same key
+    let mut alice = client("alice");
+    let (alice_conversation, _, _) = establish(&alice, &bob);
+    assert!(!alice_conversation.credential_outdated(&alice));
+    let signer = alice.signer().clone();
+    alice
+        .renew(BasicCredential::new(b"alice 2".to_vec()).into(), signer)
+        .unwrap();
+    assert!(alice_conversation.credential_outdated(&alice));
+
+    // the same credential, for another key
+    let mut carol = client("carol");
+    let (carol_conversation, _, _) = establish(&carol, &bob);
+    let credential = carol.credential().clone();
+    carol
+        .renew(
+            credential,
+            SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap(),
+        )
+        .unwrap();
+    assert!(carol_conversation.credential_outdated(&carol));
+}
