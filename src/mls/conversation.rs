@@ -113,28 +113,32 @@ pub struct CommitOutput {
 
 impl CommitOutput {
     /// `message/mls-rcs-client` body for the Conversation Focus (RCC.16 section 7.9.2)
+    ///
+    /// The first Commit of an Era goes in a WelcomeCommitBundle with the
+    /// ratchet tree, which the Focus keeps from it (section 7.9.3), also when
+    /// it adds no one, as that of an Unencrypted Singleton Era (section
+    /// 11.2.1): its Welcome is then empty.
     pub fn to_client_message(&self) -> Result<Vec<u8>> {
         let commit_list = wire::encode_message_list(&[&self.commit])?;
 
-        let payload = match &self.welcome {
-            Some(welcome) => {
-                client_mls_rcs_message::Payload::WelcomeCommitBundle(proto::WelcomeCommitBundle {
-                    commit_list,
-                    welcome: welcome.clone(),
-                    group_info: self.group_info.clone(),
-                    epoch_authenticator: self.epoch_authenticator.clone(),
-                    ratchet_tree: match self.first_in_era {
-                        true => self.ratchet_tree.clone().unwrap_or_default(),
-                        false => Vec::new(),
-                    },
-                })
-            }
-            None => client_mls_rcs_message::Payload::CommitBundle(proto::CommitBundle {
+        let payload = if self.welcome.is_some() || self.first_in_era {
+            client_mls_rcs_message::Payload::WelcomeCommitBundle(proto::WelcomeCommitBundle {
+                commit_list,
+                welcome: self.welcome.clone().unwrap_or_default(),
+                group_info: self.group_info.clone(),
+                epoch_authenticator: self.epoch_authenticator.clone(),
+                ratchet_tree: match self.first_in_era {
+                    true => self.ratchet_tree.clone().unwrap_or_default(),
+                    false => Vec::new(),
+                },
+            })
+        } else {
+            client_mls_rcs_message::Payload::CommitBundle(proto::CommitBundle {
                 commit_list,
                 private_message: self.private_message.clone().unwrap_or_default(),
                 group_info: self.group_info.clone(),
                 epoch_authenticator: self.epoch_authenticator.clone(),
-            }),
+            })
         };
 
         Ok(proto::encode(&proto::ClientMlsRcsMessage {
@@ -248,20 +252,17 @@ impl MlsConversation {
     /// Why the conversation was moved to unencrypted, if it was (RCC.16 section
     /// 7.11.2.2); Unset when the end_mls extension gives no reason
     pub fn encryption_ended_reason(&self) -> Option<proto::EndMlsReason> {
-        self.group
-            .extensions()
-            .iter()
-            .find_map(|extension| match extension {
-                Extension::Unknown(rcs::EXTENSION_END_MLS, UnknownExtension(data)) => Some(
-                    proto::decode::<proto::EndMlsMetadata>(data)
-                        .ok()
-                        .and_then(|metadata| {
-                            proto::EndMlsReason::try_from(metadata.downgrade_reason).ok()
-                        })
-                        .unwrap_or(proto::EndMlsReason::Unset),
-                ),
-                _ => None,
-            })
+        end_mls_reason(self.group.extensions())
+    }
+
+    /// Why the pending Commit of this client moves the conversation to
+    /// unencrypted, if it adds the end_mls extension (RCC.16 sections 11.2,
+    /// 11.2.1)
+    pub fn pending_encryption_end(&self) -> Option<proto::EndMlsReason> {
+        if self.is_encryption_ended() {
+            return None;
+        }
+        end_mls_reason(self.group.pending_commit()?.group_context().extensions())
     }
 
     /// TLS encoded ratchet tree of the current epoch, which the Conversation Focus
@@ -1276,6 +1277,20 @@ pub(crate) struct CommitExtras {
 
 fn is_end_mls(extension: &Extension) -> bool {
     matches!(extension, Extension::Unknown(rcs::EXTENSION_END_MLS, _))
+}
+
+/// The reason given in the end_mls extension among `extensions`, if there is
+/// one; Unset when it gives none
+fn end_mls_reason(extensions: &Extensions<GroupContext>) -> Option<proto::EndMlsReason> {
+    extensions.iter().find_map(|extension| match extension {
+        Extension::Unknown(rcs::EXTENSION_END_MLS, UnknownExtension(data)) => Some(
+            proto::decode::<proto::EndMlsMetadata>(data)
+                .ok()
+                .and_then(|metadata| proto::EndMlsReason::try_from(metadata.downgrade_reason).ok())
+                .unwrap_or(proto::EndMlsReason::Unset),
+        ),
+        _ => None,
+    })
 }
 
 /// Runs every credential a Commit of another client introduces through the
