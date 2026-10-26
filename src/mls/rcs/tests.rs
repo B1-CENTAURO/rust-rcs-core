@@ -3216,3 +3216,145 @@ fn a_key_package_update_replaces_stale_leaves_with_a_welcome() {
     }
     assert_eq!(alice_conversation.stale_members(&alice).unwrap(), []);
 }
+
+/// The GroupContext extensions of `conversation`, but for the Era
+fn extensions_besides_era(conversation: &mut MlsConversation) -> Vec<(u16, Vec<u8>)> {
+    use openmls::prelude::{Extension, UnknownExtension};
+    conversation
+        .mls_group()
+        .extensions()
+        .iter()
+        .filter_map(|extension| match extension {
+            Extension::Unknown(extension_type, UnknownExtension(data))
+                if *extension_type != EXTENSION_ERA =>
+            {
+                Some((*extension_type, data.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_new_era_is_made_from_the_group_info_of_the_focus() {
+    use super::era::EraBase;
+
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let group_id = alice_conversation.group_id().to_vec();
+    let (output, _) = alice_conversation
+        .set_group_subject(&alice, "Team", b"msg-subject")
+        .unwrap();
+    deliver(
+        (&mut alice_conversation, &alice),
+        vec![(&mut bob_conversation, &bob)],
+        &output,
+    );
+    let token = bob.group_metadata(&group_id).unwrap().continuity_token;
+
+    // the Era after that of the GroupInfo, with its GroupContext extensions
+    // (RCC.16 section 8.3.1)
+    let base = EraBase::of_group_info(&MlsGroupInfo {
+        group_info: output.group_info.clone(),
+        ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+        pending_proposals: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(base.group_id(), group_id.as_slice());
+    assert_eq!(base.era(), 2);
+    assert_eq!(
+        base.members(),
+        [alice.credential().clone(), bob.credential().clone()]
+    );
+    let mut next = bob.create_next_era(&base, false).unwrap();
+    assert_eq!((next.era(), next.epoch()), (Some(3), 0));
+    assert_eq!(next.members(), [bob.credential().clone()]);
+    assert_eq!(
+        extensions_besides_era(&mut next),
+        extensions_besides_era(&mut alice_conversation)
+    );
+    assert!(!extensions_besides_era(&mut next).is_empty());
+    // in place of the group of the Era before, the continuity token kept
+    assert_eq!(bob.load_conversation(&group_id).unwrap().era(), Some(3));
+    assert_eq!(
+        bob.group_metadata(&group_id).unwrap().continuity_token,
+        token
+    );
+
+    // its first Commit gives the Conversation Focus the ratchet tree
+    let key_package = alice.generate_key_package(false).unwrap();
+    let output = next.add_members(&bob, &[&key_package]).unwrap();
+    let message: ClientMlsRcsMessage = proto::decode(&output.to_client_message().unwrap()).unwrap();
+    match message.payload.unwrap() {
+        client_mls_rcs_message::Payload::WelcomeCommitBundle(bundle) => {
+            assert!(!bundle.ratchet_tree.is_empty())
+        }
+        _ => panic!("expected a WelcomeCommitBundle"),
+    }
+    let bundle = accept(&output);
+    next.process_commit_bundle(&bob, &bundle).unwrap();
+
+    // a member joins it in place of its group of the Era before, still
+    // active, with the key of the subject
+    assert!(alice_conversation.is_active());
+    let mut alice_next = alice
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    assert_eq!(alice_next.era(), Some(3));
+    assert!(alice_next.group_metadata_in_sync(&alice).unwrap());
+    let message = next.encrypt_cpim(&bob, b"hi", b"msg-1", b"").unwrap();
+    let decrypted = alice_next.decrypt(&alice, &message, b"msg-1").unwrap();
+    assert_eq!(&decrypted.sender, bob.credential());
+
+    // a next Era from the group of the client, its token renewed
+    let base = EraBase::of_conversation(&alice_next);
+    assert_eq!(base.era(), 3);
+    let mut renewed = alice.create_next_era(&base, true).unwrap();
+    assert_eq!(renewed.era(), Some(4));
+    assert_eq!(renewed.members(), [alice.credential().clone()]);
+    assert_eq!(
+        extensions_besides_era(&mut renewed),
+        extensions_besides_era(&mut alice_next)
+    );
+    assert_ne!(
+        alice.group_metadata(&group_id).unwrap().continuity_token,
+        token
+    );
+}
+
+#[test]
+fn a_welcome_takes_the_place_of_a_group_still_active_for_a_later_era_only() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (alice_conversation, _, _) = establish(&alice, &bob);
+    let group_id = alice_conversation.group_id().to_vec();
+    let carol = client("carol");
+    let welcome_of_era = |era: u32| {
+        if let Ok(old) = carol.load_conversation(&group_id) {
+            old.delete(&carol).unwrap();
+        }
+        let mut carols = carol.create_conversation(Some(&group_id), era).unwrap();
+        let key_package = alice.generate_key_package(false).unwrap();
+        let output = carols.add_members(&carol, &[&key_package]).unwrap();
+        (output.welcome.unwrap(), output.ratchet_tree.unwrap())
+    };
+    let kept = || {
+        let conversation = alice.load_conversation(&group_id).unwrap();
+        (conversation.era(), conversation.members().len())
+    };
+
+    // not of the same Era, nor of an earlier one
+    for era in [2, 1] {
+        let (welcome, ratchet_tree) = welcome_of_era(era);
+        assert!(alice.join_conversation(&welcome, &ratchet_tree).is_err());
+        assert_eq!(kept(), (Some(2), 2));
+    }
+
+    // of a later one
+    let (welcome, ratchet_tree) = welcome_of_era(3);
+    let joined = alice.join_conversation(&welcome, &ratchet_tree).unwrap();
+    assert_eq!(joined.era(), Some(3));
+    assert_eq!(kept(), (Some(3), 2));
+    assert!(joined.members().contains(carol.credential()));
+}

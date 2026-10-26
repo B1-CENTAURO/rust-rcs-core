@@ -401,7 +401,6 @@ impl MlsClient {
             None => GroupId::from_slice(uuid::Uuid::new_v4().simple().to_string().as_bytes()),
         };
 
-        rcs::metadata::ensure_continuity_token(self, group_id.as_slice())?;
         let mut extensions = vec![Extension::Unknown(
             rcs::EXTENSION_ERA,
             UnknownExtension(era.to_be_bytes().to_vec()),
@@ -410,6 +409,18 @@ impl MlsClient {
             self,
             group_id.as_slice(),
         )?);
+        self.create_group(group_id, extensions)
+    }
+
+    /// Creates the group `group_id` with this client as its only member and
+    /// `extensions` in its GroupContext, with the continuity token kept for
+    /// it, or a new one
+    pub(crate) fn create_group(
+        &self,
+        group_id: GroupId,
+        extensions: Vec<Extension>,
+    ) -> Result<MlsConversation> {
+        rcs::metadata::ensure_continuity_token(self, group_id.as_slice())?;
         let extensions = Extensions::from_vec(extensions)
             .map_err(fail("GroupContext extensions", ErrorKind::InvalidState))?;
 
@@ -467,14 +478,18 @@ impl MlsClient {
             builder = builder.with_ratchet_tree(ratchet_tree);
         }
 
-        // being added again to a group this client was removed from earlier; a
-        // group still active locally is never replaced
-        let group_id = builder
-            .processed_welcome()
-            .unverified_group_info()
-            .group_id();
+        // being added again to a group this client was removed from earlier,
+        // or to a new Era of it (RCC.16 section 8.3); a group still active
+        // locally is otherwise never replaced
+        let group_info = builder.processed_welcome().unverified_group_info();
+        let group_id = group_info.group_id();
+        let era = rcs::era::era_of(group_info.group_context().extensions());
         let builder = match MlsGroup::load(self.provider.storage(), group_id) {
-            Ok(Some(old_group)) if !old_group.is_active() => builder.replace_old_group(),
+            Ok(Some(old_group))
+                if !old_group.is_active() || rcs::era::era_of(old_group.extensions()) < era =>
+            {
+                builder.replace_old_group()
+            }
             _ => builder,
         };
 

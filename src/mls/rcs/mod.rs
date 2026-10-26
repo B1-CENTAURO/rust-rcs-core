@@ -19,6 +19,7 @@
 //! (RCC.16 section 5.1), so fetching and uploading KeyPackages is left to the caller.
 
 pub mod certificate;
+pub mod era;
 pub mod file;
 pub mod heal;
 pub mod imdn;
