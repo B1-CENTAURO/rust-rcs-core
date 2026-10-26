@@ -3362,8 +3362,15 @@ fn an_unencrypted_singleton_era_gives_the_focus_its_ratchet_tree_without_a_welco
 
     let alice = client("alice");
     let bob = client("bob");
-    let (alice_conversation, _, _) = establish(&alice, &bob);
+    let (mut alice_conversation, _, _) = establish(&alice, &bob);
     let group_id = alice_conversation.group_id().to_vec();
+    // a GroupContext extension other than end_mls
+    let (output, _) = alice_conversation
+        .set_group_subject(&alice, "Team", b"msg-subject")
+        .unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap();
     let base = EraBase::of_conversation(&alice_conversation);
     assert!(!base.is_encryption_ended());
 
