@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -68,6 +69,9 @@ pub struct MlsConfig {
     pub max_past_epochs: Option<usize>,
 }
 
+/// What tells a client the time
+pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
+
 /// One MLS client, i.e. one device of a user
 pub struct MlsClient {
     provider: MlsProvider,
@@ -76,6 +80,7 @@ pub struct MlsClient {
     ciphersuite: Ciphersuite,
     config: MlsConfig,
     validator: Arc<dyn CredentialValidator>,
+    clock: Clock,
 }
 
 impl MlsClient {
@@ -128,6 +133,7 @@ impl MlsClient {
             ciphersuite,
             config,
             validator: validator.into(),
+            clock: Arc::new(SystemTime::now),
         })
     }
 
@@ -183,6 +189,7 @@ impl MlsClient {
             ciphersuite,
             config,
             validator: validator.into(),
+            clock: Arc::new(SystemTime::now),
         })
     }
 
@@ -233,6 +240,17 @@ impl MlsClient {
         self.validator.as_ref()
     }
 
+    /// Has the client tell the time with `clock` rather than the system clock,
+    /// as when key updates are due (`rcs::key_update`)
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
+    }
+
+    /// The time now, as the client tells it
+    pub fn now(&self) -> SystemTime {
+        (self.clock)()
+    }
+
     /// Copy of this client and its state, to try out changes on
     pub(crate) fn fork(&self) -> Result<MlsClient> {
         Ok(MlsClient {
@@ -242,6 +260,7 @@ impl MlsClient {
             ciphersuite: self.ciphersuite,
             config: self.config,
             validator: self.validator.clone(),
+            clock: self.clock.clone(),
         })
     }
 

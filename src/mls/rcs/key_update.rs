@@ -101,18 +101,18 @@ fn seconds_since_epoch(time: SystemTime) -> u64 {
 }
 
 impl MlsConversation {
-    /// Whether this client is to update its keys in the group at `now`, with
-    /// `update_keys()` (RCC.16 section 9.5.2): once the maximum number of days
-    /// or of messages sent since its leaf was last updated is reached, and not
-    /// before the minimum number of days, by the intervals of
-    /// `INITIAL_LAST_RESORT_KEY_UPDATE` if it joined with a last resort
-    /// KeyPackage and has not updated its leaf since, else of
+    /// Whether this client is to update its keys in the group now, as it
+    /// tells the time, with `update_keys()` (RCC.16 section 9.5.2): once the
+    /// maximum number of days or of messages sent since its leaf was last
+    /// updated is reached, and not before the minimum number of days, by the
+    /// intervals of `INITIAL_LAST_RESORT_KEY_UPDATE` if it joined with a last
+    /// resort KeyPackage and has not updated its leaf since, else of
     /// `REGULAR_KEY_UPDATE`
     ///
     /// Never in a group moved to unencrypted, nor in one this client is no
     /// longer a member of. A group with no record of when its leaf was last
     /// updated, as one joined before such records were kept, is due.
-    pub fn key_update_due(&self, client: &MlsClient, now: SystemTime) -> Result<bool> {
+    pub fn key_update_due(&self, client: &MlsClient) -> Result<bool> {
         if self.is_encryption_ended() || !self.is_active() {
             return Ok(false);
         }
@@ -122,7 +122,7 @@ impl MlsConversation {
 
         let interval = own_leaf.interval();
         let elapsed =
-            Duration::from_secs(seconds_since_epoch(now).saturating_sub(own_leaf.updated));
+            Duration::from_secs(seconds_since_epoch(client.now()).saturating_sub(own_leaf.updated));
         Ok(elapsed >= interval.min
             && (elapsed >= interval.max || own_leaf.sent >= interval.max_messages))
     }
@@ -141,7 +141,7 @@ impl MlsConversation {
     /// KeyPackage
     pub(crate) fn own_leaf_updated(&self, client: &MlsClient, last_resort: bool) -> Result<()> {
         let own_leaf = OwnLeaf {
-            updated: seconds_since_epoch(SystemTime::now()),
+            updated: seconds_since_epoch(client.now()),
             sent: 0,
             last_resort,
         };
