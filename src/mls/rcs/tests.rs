@@ -697,12 +697,11 @@ fn ending_encryption() {
     let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
     assert!(!alice_conversation.is_encryption_ended());
 
-    let output = alice_conversation
-        .set_encryption_ended(
-            &alice,
-            Some(proto::EndMlsReason::GroupMemberFailsCapabilitiesCheck),
-        )
+    // a Commit not adding end_mls
+    let (output, _) = alice_conversation
+        .set_group_subject(&alice, "Team", b"msg-subject")
         .unwrap();
+    assert_eq!(alice_conversation.pending_encryption_end(), None);
     let bundle = accept(&output);
     alice_conversation
         .process_commit_bundle(&alice, &bundle)
@@ -710,6 +709,32 @@ fn ending_encryption() {
     bob_conversation
         .process_commit_bundle(&bob, &bundle)
         .unwrap();
+
+    let output = alice_conversation
+        .set_encryption_ended(
+            &alice,
+            Some(proto::EndMlsReason::GroupMemberFailsCapabilitiesCheck),
+        )
+        .unwrap();
+    assert_eq!(
+        alice_conversation.pending_encryption_end(),
+        Some(proto::EndMlsReason::GroupMemberFailsCapabilitiesCheck)
+    );
+    assert!(!alice_conversation.is_encryption_ended());
+    // not the first Commit of the Era
+    let message: ClientMlsRcsMessage = proto::decode(&output.to_client_message().unwrap()).unwrap();
+    assert!(matches!(
+        message.payload,
+        Some(client_mls_rcs_message::Payload::CommitBundle(_))
+    ));
+    let bundle = accept(&output);
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .unwrap();
+    assert_eq!(alice_conversation.pending_encryption_end(), None);
 
     for conversation in [&alice_conversation, &bob_conversation] {
         assert!(conversation.is_encryption_ended());
@@ -726,7 +751,15 @@ fn ending_encryption() {
         Some(ErrorKind::InvalidState)
     );
 
+    // nor one removing it, or giving another reason
+    let output = bob_conversation
+        .set_encryption_ended(&bob, Some(proto::EndMlsReason::InternalClientError))
+        .unwrap();
+    assert_eq!(bob_conversation.pending_encryption_end(), None);
+    bob_conversation.discard_pending_commit(&bob).unwrap();
+    drop(output);
     let output = bob_conversation.set_encryption_ended(&bob, None).unwrap();
+    assert_eq!(bob_conversation.pending_encryption_end(), None);
     let bundle = accept(&output);
     alice_conversation
         .process_commit_bundle(&alice, &bundle)
@@ -3321,6 +3354,76 @@ fn a_new_era_is_made_from_the_group_info_of_the_focus() {
         alice.group_metadata(&group_id).unwrap().continuity_token,
         token
     );
+}
+
+#[test]
+fn an_unencrypted_singleton_era_gives_the_focus_its_ratchet_tree_without_a_welcome() {
+    use super::era::EraBase;
+
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, _, _) = establish(&alice, &bob);
+    let group_id = alice_conversation.group_id().to_vec();
+    // a GroupContext extension other than end_mls
+    let (output, _) = alice_conversation
+        .set_group_subject(&alice, "Team", b"msg-subject")
+        .unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap();
+    let base = EraBase::of_conversation(&alice_conversation);
+    assert!(!base.is_encryption_ended());
+
+    // the next Era with the client alone, moved to unencrypted (RCC.16
+    // section 11.2.1)
+    let mut singleton = alice.create_next_era(&base, false).unwrap();
+    assert_eq!(singleton.pending_encryption_end(), None);
+    let output = singleton
+        .set_encryption_ended(&alice, Some(proto::EndMlsReason::OutgoingCommitFailed))
+        .unwrap();
+    assert_eq!(
+        singleton.pending_encryption_end(),
+        Some(proto::EndMlsReason::OutgoingCommitFailed)
+    );
+    assert!(!singleton.is_encryption_ended());
+
+    // its first Commit, adding no one, gives the Conversation Focus the
+    // ratchet tree all the same (sections 7.9.2, 7.9.3)
+    assert_eq!(output.welcome, None);
+    let message: ClientMlsRcsMessage = proto::decode(&output.to_client_message().unwrap()).unwrap();
+    let bundle = match message.payload.unwrap() {
+        client_mls_rcs_message::Payload::WelcomeCommitBundle(bundle) => bundle,
+        _ => panic!("expected a WelcomeCommitBundle"),
+    };
+    assert!(bundle.welcome.is_empty());
+    assert_eq!(Some(&bundle.ratchet_tree), output.ratchet_tree.as_ref());
+    assert!(!bundle.ratchet_tree.is_empty());
+    assert_eq!(bundle.group_info, output.group_info);
+    // its GroupInfo telling the group unencrypted, in the next Era, with the
+    // client alone
+    let next = EraBase::of_group_info(&MlsGroupInfo {
+        group_info: bundle.group_info,
+        ratchet_tree: bundle.ratchet_tree,
+        pending_proposals: Vec::new(),
+    })
+    .unwrap();
+    assert!(next.is_encryption_ended());
+    assert_eq!(next.group_id(), group_id.as_slice());
+    assert_eq!(next.era(), 3);
+    assert_eq!(next.members(), [alice.credential().clone()]);
+
+    // applied once accepted
+    singleton
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap();
+    assert!(singleton.is_encryption_ended());
+    assert_eq!(
+        singleton.encryption_ended_reason(),
+        Some(proto::EndMlsReason::OutgoingCommitFailed)
+    );
+    assert_eq!(singleton.pending_encryption_end(), None);
+    assert_eq!((singleton.era(), singleton.epoch()), (Some(3), 1));
+    assert!(EraBase::of_conversation(&singleton).is_encryption_ended());
 }
 
 #[test]

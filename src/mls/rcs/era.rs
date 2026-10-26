@@ -21,7 +21,7 @@ use super::super::client::MlsClient;
 use super::super::conversation::MlsConversation;
 use super::super::{fail, ErrorKind, Result};
 use super::certificate::{credential_tel_uris, same_tel_uri};
-use super::{proto, EXTENSION_ERA};
+use super::{proto, EXTENSION_END_MLS, EXTENSION_ERA};
 
 /// What the next Era of a group is made from: the group as the GroupInfo of
 /// its Conversation Focus tells it, or else as this client has it (RCC.16
@@ -113,6 +113,14 @@ impl EraBase {
 
     pub fn members(&self) -> &[Credential] {
         &self.members
+    }
+
+    /// Whether the group was moved to unencrypted, having the end_mls
+    /// extension (RCC.16 sections 10.1, 11.2)
+    pub fn is_encryption_ended(&self) -> bool {
+        self.extensions
+            .iter()
+            .any(|(extension_type, _)| *extension_type == EXTENSION_END_MLS)
     }
 
     /// Whether the continuity token kept for the group carries over to the
