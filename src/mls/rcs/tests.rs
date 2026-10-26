@@ -3061,7 +3061,17 @@ fn no_leaves_are_replaced_of_members_leaving_nor_in_groups_unencrypted_or_left()
     assert!(!bob_conversation.is_active());
     assert_eq!(stale(&bob_conversation, &bob), []);
 
+    // nothing of it kept once the group is let go of
+    assert!(kept(&alice).is_some());
+    alice_conversation.delete(&alice).unwrap();
+    assert_eq!(kept(&alice), None);
+
     // a group moved to unencrypted
+    let (mut alice_conversation, _, _) = establish(&alice, &bob);
+    assert_eq!(
+        stale(&alice_conversation, &alice),
+        [bob.credential().clone()]
+    );
     let output = alice_conversation
         .set_encryption_ended(
             &alice,
@@ -3072,11 +3082,6 @@ fn no_leaves_are_replaced_of_members_leaving_nor_in_groups_unencrypted_or_left()
         .process_commit_bundle(&alice, &accept(&output))
         .unwrap();
     assert_eq!(stale(&alice_conversation, &alice), []);
-
-    // nothing of it kept once the group is let go of
-    assert!(kept(&alice).is_some());
-    alice_conversation.delete(&alice).unwrap();
-    assert_eq!(kept(&alice), None);
 }
 
 #[test]
