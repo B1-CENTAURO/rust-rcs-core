@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! When this client updates its keys in a group (RCC.16 section 9.5.2)
+//! When this client updates its keys in a group, and replaces the leaves of
+//! other members (RCC.16 sections 9.5.2, 9.5.4)
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use openmls::prelude::ExtensionType;
+use openmls::prelude::{Credential, ExtensionType};
 
 use super::super::client::MlsClient;
 use super::super::conversation::MlsConversation;
@@ -47,6 +48,10 @@ pub const REGULAR_KEY_UPDATE: KeyUpdateInterval = KeyUpdateInterval {
     max: Duration::from_secs(30 * 24 * 60 * 60),
     max_messages: 50,
 };
+
+/// Leaf keys of other members not updated for longer than this are replaced
+/// with a KeyPackage Update (RCC.16 section 9.5.4)
+pub const LEAF_KEY_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// What is kept of the leaf of this client in a group
 #[derive(Debug, PartialEq)]
@@ -92,6 +97,56 @@ impl OwnLeaf {
 /// `group_id`, apart from the keys OpenMLS uses
 pub(crate) fn own_leaf_key(group_id: &[u8]) -> Vec<u8> {
     [&b"RcsOwnLeaf"[..], group_id].concat()
+}
+
+/// When this client first saw each leaf key of a group: the encryption key
+/// of the leaf, and the time in seconds since the Unix epoch
+#[derive(Debug, Default, PartialEq)]
+struct LeafKeys(Vec<(Vec<u8>, u64)>);
+
+impl LeafKeys {
+    fn encode(&self) -> Vec<u8> {
+        let mut value = Vec::new();
+        for (key, seen) in &self.0 {
+            value.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            value.extend_from_slice(key);
+            value.extend_from_slice(&seen.to_be_bytes());
+        }
+        value
+    }
+
+    fn decode(mut value: &[u8]) -> Result<LeafKeys> {
+        let mut leaf_keys = Vec::new();
+        while !value.is_empty() {
+            let length = usize::from(u16::from_be_bytes(
+                value
+                    .get(..2)
+                    .ok_or(ErrorKind::BadFormat)?
+                    .try_into()
+                    .unwrap(),
+            ));
+            let key = value.get(2..2 + length).ok_or(ErrorKind::BadFormat)?;
+            let seen = value
+                .get(2 + length..10 + length)
+                .ok_or(ErrorKind::BadFormat)?;
+            leaf_keys.push((key.to_vec(), u64::from_be_bytes(seen.try_into().unwrap())));
+            value = &value[10 + length..];
+        }
+        Ok(LeafKeys(leaf_keys))
+    }
+
+    fn first_seen(&self, key: &[u8]) -> Option<u64> {
+        self.0
+            .iter()
+            .find(|(seen_key, _)| seen_key == key)
+            .map(|(_, seen)| *seen)
+    }
+}
+
+/// Storage key of when this client first saw each leaf key of the group
+/// `group_id`, apart from the keys OpenMLS uses
+pub(crate) fn leaf_keys_key(group_id: &[u8]) -> Vec<u8> {
+    [&b"RcsLeafKeys"[..], group_id].concat()
 }
 
 fn seconds_since_epoch(time: SystemTime) -> u64 {
@@ -185,5 +240,79 @@ impl MlsConversation {
         client
             .provider()
             .remove_value(&own_leaf_key(self.group_id()))
+    }
+
+    /// The Clients of other members whose leaves this client is to replace
+    /// with `replace_members()`, as it tells the time (RCC.16 section
+    /// 9.5.4): those whose credential expired, or no longer passes the
+    /// validator otherwise, and those whose leaf keys were not updated in
+    /// over 30 days, since this client first saw them (`LEAF_KEY_MAX_AGE`)
+    ///
+    /// Not those leaving, whose self_remove a Commit is to take. None in a
+    /// group moved to unencrypted, nor in one this client is no longer a
+    /// member of. A leaf key this client has no record of, as one of a group
+    /// joined before such records were kept, is not counted as old.
+    pub fn stale_members(&self, client: &MlsClient) -> Result<Vec<Credential>> {
+        if self.is_encryption_ended() || !self.is_active() {
+            return Ok(Vec::new());
+        }
+        let own = self.group.own_leaf_index();
+        let leaving = self.leaving_members();
+        let leaf_keys = self.leaf_keys(client)?;
+        let now = seconds_since_epoch(client.now());
+
+        Ok(self
+            .group
+            .members()
+            .filter(|member| member.index != own && !leaving.contains(&member.credential))
+            .filter(|member| {
+                !client
+                    .validator()
+                    .validate(&member.credential, &member.signature_key)
+                    || leaf_keys
+                        .first_seen(&member.encryption_key)
+                        .is_some_and(|seen| now.saturating_sub(seen) > LEAF_KEY_MAX_AGE.as_secs())
+            })
+            .map(|member| member.credential)
+            .collect())
+    }
+
+    fn leaf_keys(&self, client: &MlsClient) -> Result<LeafKeys> {
+        Ok(client
+            .provider()
+            .read_value(&leaf_keys_key(self.group_id()))?
+            .map(|value| LeafKeys::decode(&value))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    /// Forgets when this client first saw the leaf keys of the group
+    pub(crate) fn forget_leaf_keys(&self, client: &MlsClient) -> Result<()> {
+        client
+            .provider()
+            .remove_value(&leaf_keys_key(self.group_id()))
+    }
+
+    /// Takes note of the leaf keys of the group this client sees for the
+    /// first time, now that it joined it or moved to a new epoch, and
+    /// forgets those no longer in it
+    pub(crate) fn note_leaf_keys(&self, client: &MlsClient) -> Result<()> {
+        let kept = self.leaf_keys(client)?;
+        let now = seconds_since_epoch(client.now());
+        let leaf_keys = LeafKeys(
+            self.group
+                .members()
+                .map(|member| {
+                    let seen = kept.first_seen(&member.encryption_key).unwrap_or(now);
+                    (member.encryption_key, seen)
+                })
+                .collect(),
+        );
+        if leaf_keys == kept {
+            return Ok(());
+        }
+        client
+            .provider()
+            .write_value(leaf_keys_key(self.group_id()), leaf_keys.encode())
     }
 }

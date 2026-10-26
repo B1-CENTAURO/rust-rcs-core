@@ -2893,3 +2893,326 @@ fn a_leaf_is_behind_a_client_renewed_with_another_credential_or_key() {
         .unwrap();
     assert!(carol_conversation.credential_outdated(&carol));
 }
+
+#[test]
+fn leaves_not_updated_in_30_days_are_to_be_replaced() {
+    use std::time::Duration;
+
+    let clock = TestClock::new();
+    let start = clock.now();
+    let alice = timed_client("alice", &clock);
+    let bob = timed_client("bob", &clock);
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let stale = |conversation: &MlsConversation, client: &MlsClient, after: Duration| {
+        clock.set(start + after);
+        conversation.stale_members(client).unwrap()
+    };
+
+    // over 30 days since the client first saw them, never the client itself
+    // (RCC.16 section 9.5.4)
+    assert_eq!(stale(&alice_conversation, &alice, 30 * DAY - MINUTE), []);
+    assert_eq!(
+        stale(&alice_conversation, &alice, 30 * DAY + MINUTE),
+        [bob.credential().clone()]
+    );
+    assert_eq!(
+        stale(&bob_conversation, &bob, 30 * DAY + MINUTE),
+        [alice.credential().clone()]
+    );
+
+    // a key update makes the leaf new, from when it is applied
+    clock.set(start + 20 * DAY);
+    key_update(
+        &bob,
+        &mut bob_conversation,
+        &mut [(&alice, &mut alice_conversation)],
+    );
+    // and other leaves stay as old as they were
+    assert_eq!(
+        stale(&bob_conversation, &bob, 30 * DAY + MINUTE),
+        [alice.credential().clone()]
+    );
+    // a leaf added is new too
+    clock.set(start + 25 * DAY);
+    let carol = timed_client("carol", &clock);
+    let key_package = carol.generate_key_package(false).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_package])
+        .unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap();
+    assert_eq!(stale(&alice_conversation, &alice, 50 * DAY - MINUTE), []);
+    assert_eq!(
+        stale(&alice_conversation, &alice, 50 * DAY + MINUTE),
+        [bob.credential().clone()]
+    );
+    assert_eq!(
+        stale(&alice_conversation, &alice, 55 * DAY + MINUTE),
+        [bob.credential().clone(), carol.credential().clone()]
+    );
+
+    // kept with the rest of the client
+    let mut restored = MlsClient::restore(
+        &alice.snapshot().unwrap(),
+        MlsConfig::default(),
+        Box::new(AllowAll),
+    )
+    .unwrap();
+    clock.keep(&mut restored);
+    let restored_conversation = restored
+        .load_conversation(alice_conversation.group_id())
+        .unwrap();
+    assert_eq!(
+        stale(&restored_conversation, &restored, 50 * DAY + MINUTE),
+        [bob.credential().clone()]
+    );
+
+    // a client taking the place of another through an External Commit sees
+    // the leaves from then on
+    clock.set(start + 60 * DAY);
+    let new_bob = timed_client("bob-2", &clock);
+    let (new_bob_conversation, _) = new_bob
+        .rejoin_conversation_replacing(
+            &MlsGroupInfo {
+                group_info: output.group_info,
+                ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+                pending_proposals: Vec::new(),
+            },
+            &[bob.credential().clone()],
+        )
+        .unwrap();
+    assert_eq!(
+        stale(&new_bob_conversation, &new_bob, 90 * DAY - MINUTE),
+        []
+    );
+    assert_eq!(
+        stale(&new_bob_conversation, &new_bob, 90 * DAY + MINUTE),
+        [alice.credential().clone(), carol.credential().clone()]
+    );
+}
+
+#[test]
+fn no_leaves_are_replaced_of_members_leaving_nor_in_groups_unencrypted_or_left() {
+    let clock = TestClock::new();
+    let start = clock.now();
+    let alice = timed_client("alice", &clock);
+    let bob = timed_client("bob", &clock);
+    let carol = timed_client("carol", &clock);
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let key_package = carol.generate_key_package(false).unwrap();
+    let bundle = accept(
+        &alice_conversation
+            .add_members(&alice, &[&key_package])
+            .unwrap(),
+    );
+    let mut carol_conversation = carol
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    for (client, conversation) in [
+        (&alice, &mut alice_conversation),
+        (&bob, &mut bob_conversation),
+    ] {
+        conversation.process_commit_bundle(client, &bundle).unwrap();
+    }
+    let stale = |conversation: &MlsConversation, client: &MlsClient| {
+        clock.set(start + 31 * DAY);
+        let stale = conversation.stale_members(client).unwrap();
+        clock.set(start);
+        stale
+    };
+
+    // a member whose self_remove a Commit is to take
+    let proposal = carol_conversation.leave(&carol).unwrap();
+    for (client, conversation) in [
+        (&alice, &mut alice_conversation),
+        (&bob, &mut bob_conversation),
+    ] {
+        conversation.process(client, &proposal).unwrap();
+    }
+    assert_eq!(
+        stale(&alice_conversation, &alice),
+        [bob.credential().clone()]
+    );
+
+    // a group with no record of when the leaf keys were first seen
+    let group_id = alice_conversation.group_id().to_vec();
+    let kept = |client: &MlsClient| {
+        client
+            .provider()
+            .read_value(&key_update::leaf_keys_key(&group_id))
+            .unwrap()
+    };
+    assert!(kept(&bob).is_some());
+    bob_conversation.forget_leaf_keys(&bob).unwrap();
+    assert_eq!(stale(&bob_conversation, &bob), []);
+
+    // a client removed
+    let output = alice_conversation
+        .remove_members(&alice, &[bob.credential().clone()])
+        .unwrap();
+    let bundle = accept(&output);
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .unwrap();
+    assert!(!bob_conversation.is_active());
+    assert_eq!(stale(&bob_conversation, &bob), []);
+
+    // nothing of it kept once the group is let go of
+    assert!(kept(&alice).is_some());
+    alice_conversation.delete(&alice).unwrap();
+    assert_eq!(kept(&alice), None);
+
+    // a group moved to unencrypted
+    let (mut alice_conversation, _, _) = establish(&alice, &bob);
+    assert_eq!(
+        stale(&alice_conversation, &alice),
+        [bob.credential().clone()]
+    );
+    let output = alice_conversation
+        .set_encryption_ended(
+            &alice,
+            Some(proto::EndMlsReason::ClientFailureEncryptionNotAvailable),
+        )
+        .unwrap();
+    alice_conversation
+        .process_commit_bundle(&alice, &accept(&output))
+        .unwrap();
+    assert_eq!(stale(&alice_conversation, &alice), []);
+}
+
+#[test]
+fn a_key_package_update_replaces_stale_leaves_with_a_welcome() {
+    use openmls::prelude::BasicCredential;
+    use openmls_basic_credential::SignatureKeyPair;
+
+    let clock = TestClock::new();
+    let start = clock.now();
+    let mut alice = timed_client("alice", &clock);
+    let phone = timed_client("bob-1", &clock);
+    let tablet = timed_client("bob-2", &clock);
+    let (mut alice_conversation, mut phone_conversation, _) = establish(&alice, &phone);
+    let key_package = tablet.generate_key_package(false).unwrap();
+    let bundle = accept(
+        &alice_conversation
+            .add_members(&alice, &[&key_package])
+            .unwrap(),
+    );
+    let mut tablet_conversation = tablet
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    for (client, conversation) in [
+        (&alice, &mut alice_conversation),
+        (&phone, &mut phone_conversation),
+    ] {
+        conversation.process_commit_bundle(client, &bundle).unwrap();
+    }
+    clock.set(start + 10 * DAY);
+    key_update(
+        &tablet,
+        &mut tablet_conversation,
+        &mut [
+            (&alice, &mut alice_conversation),
+            (&phone, &mut phone_conversation),
+        ],
+    );
+    clock.set(start + 31 * DAY);
+    let stale = alice_conversation.stale_members(&alice).unwrap();
+    assert_eq!(stale, [phone.credential().clone()]);
+
+    // alice renewed her certificate meanwhile
+    alice
+        .renew(
+            BasicCredential::new(b"alice 2".to_vec()).into(),
+            SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap(),
+        )
+        .unwrap();
+
+    // what the Home KDS returns for the Participants: KeyPackages of the
+    // phone, of the tablet, which stays, and of alice herself
+    let from_phone = phone.generate_key_package(false).unwrap();
+    let again_from_phone = phone.generate_key_package(false).unwrap();
+    let from_tablet = tablet.generate_key_package(false).unwrap();
+    let from_alice = alice.generate_key_package(false).unwrap();
+    let output = alice_conversation
+        .replace_members(
+            &alice,
+            &stale,
+            &[&from_phone, &again_from_phone, &from_tablet, &from_alice],
+        )
+        .unwrap();
+    let staged_commit = alice_conversation.mls_group().pending_commit().unwrap();
+    let removed: Vec<_> = staged_commit
+        .remove_proposals()
+        .map(|p| p.remove_proposal().removed())
+        .collect();
+    assert_eq!(removed, [phone_conversation.mls_group().own_leaf_index()]);
+    let added: Vec<_> = staged_commit
+        .add_proposals()
+        .map(|p| p.add_proposal().key_package().clone())
+        .collect();
+    assert_eq!(added.len(), 1);
+    assert_eq!(
+        added[0].leaf_node().signature_key().as_slice(),
+        phone.signer().public()
+    );
+    // with the Welcome, and no ratchet tree for the Conversation Focus
+    // (RCC.16 section 7.9.2)
+    let message: ClientMlsRcsMessage = proto::decode(&output.to_client_message().unwrap()).unwrap();
+    match message.payload.unwrap() {
+        client_mls_rcs_message::Payload::WelcomeCommitBundle(bundle) => {
+            assert!(!bundle.welcome.is_empty());
+            assert!(bundle.ratchet_tree.is_empty());
+        }
+        _ => panic!("expected a WelcomeCommitBundle"),
+    }
+
+    // the tablet takes it
+    let bundle = accept(&output);
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    assert!(!alice_conversation.credential_outdated(&alice));
+    match tablet_conversation
+        .process_commit_bundle(&tablet, &bundle)
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit {
+            sender,
+            added,
+            removed,
+            self_removed: false,
+        }] => {
+            assert_eq!(sender.serialized_content(), b"alice");
+            assert_eq!(added, &[phone.credential().clone()]);
+            assert_eq!(removed, &[phone.credential().clone()]);
+        }
+        _ => panic!("expected a Commit"),
+    }
+    // the phone is removed, and joins again with the Welcome
+    phone_conversation
+        .process_commit_bundle(&phone, &bundle)
+        .unwrap();
+    assert!(!phone_conversation.is_active());
+    let mut phone_conversation = phone
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    assert!(phone_conversation.is_active());
+    assert!(!phone_conversation.key_update_due(&phone).unwrap());
+
+    let message = alice_conversation
+        .encrypt_cpim(&alice, b"hi", b"msg-1", b"")
+        .unwrap();
+    for (client, conversation) in [
+        (&phone, &mut phone_conversation),
+        (&tablet, &mut tablet_conversation),
+    ] {
+        let decrypted = conversation.decrypt(client, &message, b"msg-1").unwrap();
+        assert_eq!(&decrypted.sender, alice.credential());
+    }
+    assert_eq!(alice_conversation.stale_members(&alice).unwrap(), []);
+}
