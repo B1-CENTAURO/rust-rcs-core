@@ -506,6 +506,7 @@ impl MlsClient {
         let conversation = MlsConversation::new(group);
         rcs::metadata::receive_welcome(&conversation, self, &welcome_extensions)?;
         conversation.own_leaf_updated(self, conversation.own_leaf_from_last_resort())?;
+        conversation.note_leaf_keys(self)?;
         Ok(conversation)
     }
 
@@ -639,6 +640,7 @@ impl MlsClient {
         };
         conversation.applied_commit = Some(commit);
         conversation.own_leaf_updated(self, false)?;
+        conversation.note_leaf_keys(self)?;
 
         Ok((conversation, output))
     }

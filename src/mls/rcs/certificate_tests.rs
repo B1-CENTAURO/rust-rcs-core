@@ -794,3 +794,56 @@ fn a_renewed_certificate_is_brought_into_groups_with_a_key_update() {
         })
         .is_ok());
 }
+
+#[test]
+fn members_whose_certificate_expired_are_to_be_replaced() {
+    let now = Arc::new(AtomicU64::new(seconds("2026-09-15")));
+    let timed = |mut client: MlsClient| {
+        let now = now.clone();
+        client.set_clock(Arc::new(move || {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(now.load(Ordering::Relaxed))
+        }));
+        client
+    };
+    let alice = timed(x509_client(
+        &[ALICE, CA],
+        ALICE_KEY,
+        ALICE_PUBLIC_KEY,
+        now.clone(),
+    ));
+    let bob = timed(x509_client(
+        &[BOB, CA],
+        BOB_KEY,
+        BOB_PUBLIC_KEY,
+        now.clone(),
+    ));
+    let mut alice_conversation = alice.create_conversation(None, 0).unwrap();
+    let key_package = bob.generate_key_package(false).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_package])
+        .unwrap();
+    alice_conversation.merge_pending_commit(&alice).unwrap();
+    let mut bob_conversation = bob
+        .join_conversation(&output.welcome.unwrap(), &output.ratchet_tree.unwrap())
+        .unwrap();
+
+    // bob updates his keys in time
+    now.store(seconds("2026-10-14"), Ordering::Relaxed);
+    assert_eq!(alice_conversation.stale_members(&alice).unwrap(), []);
+    let output = bob_conversation.update_keys(&bob).unwrap();
+    alice_conversation.process(&alice, &output.commit).unwrap();
+    bob_conversation.merge_pending_commit(&bob).unwrap();
+    now.store(seconds("2026-10-31"), Ordering::Relaxed);
+    assert_eq!(alice_conversation.stale_members(&alice).unwrap(), []);
+
+    // but his certificate expires (RCC.16 sections 6.2.6, 9.5.4)
+    now.store(seconds("2026-11-02"), Ordering::Relaxed);
+    assert_eq!(
+        alice_conversation.stale_members(&alice).unwrap(),
+        [credential(&[BOB, CA])]
+    );
+    assert_eq!(
+        bob_conversation.stale_members(&bob).unwrap(),
+        [credential(&[ALICE, CA])]
+    );
+}

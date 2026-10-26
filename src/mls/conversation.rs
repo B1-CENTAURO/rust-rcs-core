@@ -356,6 +356,53 @@ impl MlsConversation {
         )
     }
 
+    /// Replaces the leaves of the members holding one of `stale`, as
+    /// `stale_members()` tells them, with the Clients of `key_packages`, each
+    /// an MLSMessage holding a KeyPackage the Home KDS returned for their
+    /// Participants: a KeyPackage Update (RCC.16 section 9.5.4), a Commit
+    /// removing those leaves and adding the KeyPackages, with a Welcome for
+    /// the Clients added
+    ///
+    /// The Home KDS returns KeyPackages of all the Clients of a Participant
+    /// (section 5.3): those of Clients that stay members, as their signature
+    /// key tells, and those of this client are left out. The leaf of this
+    /// client takes on its renewed certificate, if it has one (section 9.5.3).
+    pub fn replace_members(
+        &mut self,
+        client: &MlsClient,
+        stale: &[Credential],
+        key_packages: &[&[u8]],
+    ) -> Result<CommitOutput> {
+        let removed = self.leaf_indices(stale)?;
+        let mut staying: Vec<Vec<u8>> = self
+            .group
+            .members()
+            .filter(|member| !removed.contains(&member.index))
+            .map(|member| member.signature_key)
+            .collect();
+        staying.push(client.signer().public().to_vec());
+
+        let mut added = Vec::new();
+        for key_package in key_packages {
+            let key_package = self.read_key_package(client, key_package)?;
+            let signature_key = key_package.leaf_node().signature_key().as_slice();
+            if !staying.iter().any(|key| key == signature_key) {
+                staying.push(signature_key.to_vec());
+                added.push(key_package);
+            }
+        }
+
+        let extras = CommitExtras {
+            renewed: self.credential_outdated(client),
+            ..CommitExtras::default()
+        };
+        self.commit(
+            client,
+            |builder| Ok(builder.propose_removals(removed).propose_adds(added)),
+            extras,
+        )
+    }
+
     /// Leaves of the members holding one of `credentials`, each holding at least one
     fn leaf_indices(&self, credentials: &[Credential]) -> Result<Vec<LeafNodeIndex>> {
         let mut leaf_indices = Vec::new();
@@ -520,6 +567,7 @@ impl MlsConversation {
         if updated {
             self.own_leaf_updated(client, false)?;
         }
+        self.note_leaf_keys(client)?;
 
         // what was tried out on a copy before is done to the group itself as well
         if let Some(pending) = metadata::take_pending_epoch(client, self.group_id())? {
@@ -936,6 +984,7 @@ impl MlsConversation {
                 self.group
                     .merge_staged_commit(client.provider(), *staged_commit)
                     .map_err(fail("merging Commit", ErrorKind::Storage))?;
+                self.note_leaf_keys(client)?;
 
                 // a Commit of this client still pending is void now
                 self.pending_commit = None;
@@ -985,6 +1034,7 @@ impl MlsConversation {
             .provider()
             .remove_value(&key_generation_key(self.group_id()))?;
         self.forget_own_leaf(client)?;
+        self.forget_leaf_keys(client)?;
 
         self.group
             .delete(client.provider().storage())
