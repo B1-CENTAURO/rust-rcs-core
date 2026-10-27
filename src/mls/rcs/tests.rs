@@ -3427,6 +3427,104 @@ fn an_unencrypted_singleton_era_gives_the_focus_its_ratchet_tree_without_a_welco
 }
 
 #[test]
+fn a_group_moved_to_unencrypted_is_resurrected_with_one_commit() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let carol = client("carol");
+    let dave = client("dave");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let key_package = dave.generate_key_package(false).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_package])
+        .unwrap();
+    let bundle = accept(&output);
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .unwrap();
+    let mut dave_conversation = dave
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+
+    // not while encrypted
+    assert_eq!(
+        alice_conversation.resurrect(&alice, &[], &[]).err(),
+        Some(ErrorKind::InvalidState)
+    );
+    let output = alice_conversation
+        .set_encryption_ended(
+            &alice,
+            Some(proto::EndMlsReason::GroupMemberFailsCapabilitiesCheck),
+        )
+        .unwrap();
+    let bundle = accept(&output);
+    for (client, conversation) in [
+        (&alice, &mut alice_conversation),
+        (&bob, &mut bob_conversation),
+        (&dave, &mut dave_conversation),
+    ] {
+        conversation.process_commit_bundle(client, &bundle).unwrap();
+        assert!(conversation.is_encryption_ended());
+    }
+
+    // back to encrypted with one Commit (RCC.16 section 11.1.2): Dave no
+    // longer a Participant, Carol one now, and Bob's KeyPackage left out,
+    // as he stays a member
+    let carols = carol.generate_key_package(false).unwrap();
+    let bobs = bob.generate_key_package(false).unwrap();
+    let output = alice_conversation
+        .resurrect(&alice, &[dave.credential().clone()], &[&carols, &bobs])
+        .unwrap();
+    assert!(alice_conversation.is_encryption_ended());
+    assert_eq!(alice_conversation.pending_encryption_end(), None);
+    let message: ClientMlsRcsMessage = proto::decode(&output.to_client_message().unwrap()).unwrap();
+    match message.payload.unwrap() {
+        client_mls_rcs_message::Payload::WelcomeCommitBundle(bundle) => {
+            assert!(!bundle.welcome.is_empty());
+            // not the first Commit of the Era
+            assert!(bundle.ratchet_tree.is_empty());
+        }
+        _ => panic!("expected a WelcomeCommitBundle"),
+    }
+
+    let bundle = accept(&output);
+    for (client, conversation) in [
+        (&alice, &mut alice_conversation),
+        (&bob, &mut bob_conversation),
+        (&dave, &mut dave_conversation),
+    ] {
+        conversation.process_commit_bundle(client, &bundle).unwrap();
+    }
+    assert!(!dave_conversation.is_active());
+    let mut carol_conversation = carol
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    for conversation in [&alice_conversation, &bob_conversation, &carol_conversation] {
+        assert!(!conversation.is_encryption_ended());
+        assert_eq!(conversation.era(), Some(2));
+        let members = conversation.members();
+        assert_eq!(members.len(), 3);
+        for member in [&alice, &bob, &carol] {
+            assert!(members.contains(member.credential()));
+        }
+    }
+
+    // its messages encrypted again
+    let message = alice_conversation
+        .encrypt_cpim(&alice, b"hi", b"msg-1", b"")
+        .unwrap();
+    for (client, conversation) in [
+        (&bob, &mut bob_conversation),
+        (&carol, &mut carol_conversation),
+    ] {
+        let decrypted = conversation.decrypt(client, &message, b"msg-1").unwrap();
+        assert_eq!(&decrypted.sender, alice.credential());
+    }
+}
+
+#[test]
 fn a_welcome_takes_the_place_of_a_group_still_active_for_a_later_era_only() {
     let alice = client("alice");
     let bob = client("bob");

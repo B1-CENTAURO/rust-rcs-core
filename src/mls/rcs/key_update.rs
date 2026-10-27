@@ -17,7 +17,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use openmls::prelude::{Credential, ExtensionType};
+use openmls::prelude::{Credential, ExtensionType, Member};
 
 use super::super::client::MlsClient;
 use super::super::conversation::MlsConversation;
@@ -256,25 +256,44 @@ impl MlsConversation {
         if self.is_encryption_ended() || !self.is_active() {
             return Ok(Vec::new());
         }
-        let own = self.group.own_leaf_index();
-        let leaving = self.leaving_members();
         let leaf_keys = self.leaf_keys(client)?;
         let now = seconds_since_epoch(client.now());
 
-        Ok(self
-            .group
+        Ok(self.others(|member| {
+            !client
+                .validator()
+                .validate(&member.credential, &member.signature_key)
+                || leaf_keys
+                    .first_seen(&member.encryption_key)
+                    .is_some_and(|seen| now.saturating_sub(seen) > LEAF_KEY_MAX_AGE.as_secs())
+        }))
+    }
+
+    /// The Clients of other members whose credential expired, or no longer
+    /// passes the validator otherwise, as this client tells the time: those
+    /// to replace when moving the group back to encrypted with `resurrect()`
+    /// (RCC.16 section 11.1.2), whether it is encrypted or not
+    ///
+    /// Not those leaving, whose self_remove a Commit is to take.
+    pub fn expired_members(&self, client: &MlsClient) -> Vec<Credential> {
+        self.others(|member| {
+            !client
+                .validator()
+                .validate(&member.credential, &member.signature_key)
+        })
+    }
+
+    /// The credentials of the members besides this client and those leaving
+    /// that `filter` keeps
+    fn others(&self, filter: impl Fn(&Member) -> bool) -> Vec<Credential> {
+        let own = self.group.own_leaf_index();
+        let leaving = self.leaving_members();
+        self.group
             .members()
             .filter(|member| member.index != own && !leaving.contains(&member.credential))
-            .filter(|member| {
-                !client
-                    .validator()
-                    .validate(&member.credential, &member.signature_key)
-                    || leaf_keys
-                        .first_seen(&member.encryption_key)
-                        .is_some_and(|seen| now.saturating_sub(seen) > LEAF_KEY_MAX_AGE.as_secs())
-            })
+            .filter(|member| filter(member))
             .map(|member| member.credential)
-            .collect())
+            .collect()
     }
 
     fn leaf_keys(&self, client: &MlsClient) -> Result<LeafKeys> {

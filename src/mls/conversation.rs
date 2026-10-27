@@ -374,7 +374,45 @@ impl MlsConversation {
         stale: &[Credential],
         key_packages: &[&[u8]],
     ) -> Result<CommitOutput> {
-        let removed = self.leaf_indices(stale)?;
+        self.replace(client, stale, key_packages, None)
+    }
+
+    /// Moves the conversation back to encrypted, resurrecting its MLS group
+    /// (RCC.16 section 11.1.2): one Commit removing the end_mls extension,
+    /// the leaves of the members holding one of `removed`, Clients of those
+    /// no longer Participants and those whose certificate expired, and adding
+    /// the Clients of `key_packages`, those of the Participants missing from
+    /// the group or whose certificate expired, with a Welcome for them
+    ///
+    /// The KeyPackages are taken as `replace_members()` takes them, those of
+    /// Clients that stay members and of this client left out. Not in a
+    /// conversation that is encrypted.
+    pub fn resurrect(
+        &mut self,
+        client: &MlsClient,
+        removed: &[Credential],
+        key_packages: &[&[u8]],
+    ) -> Result<CommitOutput> {
+        if !self.is_encryption_ended() {
+            return Err(ErrorKind::InvalidState);
+        }
+        let extensions = self.context_extensions(|extensions| {
+            extensions.retain(|extension| !is_end_mls(extension));
+        })?;
+        self.replace(client, removed, key_packages, Some(extensions))
+    }
+
+    /// A Commit removing the leaves of the members holding one of `removed`
+    /// and adding the Clients of `key_packages` that are not members still,
+    /// setting the GroupContext extensions to `extensions` if given
+    fn replace(
+        &mut self,
+        client: &MlsClient,
+        removed: &[Credential],
+        key_packages: &[&[u8]],
+        extensions: Option<Extensions<GroupContext>>,
+    ) -> Result<CommitOutput> {
+        let removed = self.leaf_indices(removed)?;
         let mut staying: Vec<Vec<u8>> = self
             .group
             .members()
@@ -399,7 +437,15 @@ impl MlsConversation {
         };
         self.commit(
             client,
-            |builder| Ok(builder.propose_removals(removed).propose_adds(added)),
+            |builder| {
+                let builder = builder.propose_removals(removed).propose_adds(added);
+                match extensions {
+                    Some(extensions) => builder
+                        .propose_group_context_extensions(extensions)
+                        .map_err(fail("updating extensions", ErrorKind::InvalidState)),
+                    None => Ok(builder),
+                }
+            },
             extras,
         )
     }
@@ -511,6 +557,23 @@ impl MlsConversation {
         change: impl FnOnce(&mut Vec<Extension>),
         extras: CommitExtras,
     ) -> Result<CommitOutput> {
+        let extensions = self.context_extensions(change)?;
+        self.commit(
+            client,
+            |builder| {
+                builder
+                    .propose_group_context_extensions(extensions)
+                    .map_err(fail("updating extensions", ErrorKind::InvalidState))
+            },
+            extras,
+        )
+    }
+
+    /// The GroupContext extensions of the group as `change` changes them
+    fn context_extensions(
+        &self,
+        change: impl FnOnce(&mut Vec<Extension>),
+    ) -> Result<Extensions<GroupContext>> {
         let current = self.group.extensions();
         let mut extensions: Vec<Extension> = current
             .iter()
@@ -540,18 +603,8 @@ impl MlsConversation {
             ),
         ));
 
-        let extensions = Extensions::from_vec(extensions)
-            .map_err(fail("GroupContext extensions", ErrorKind::InvalidState))?;
-
-        self.commit(
-            client,
-            |builder| {
-                builder
-                    .propose_group_context_extensions(extensions)
-                    .map_err(fail("updating extensions", ErrorKind::InvalidState))
-            },
-            extras,
-        )
+        Extensions::from_vec(extensions)
+            .map_err(fail("GroupContext extensions", ErrorKind::InvalidState))
     }
 
     /// Applies the Commit last created by this client
