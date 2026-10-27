@@ -836,6 +836,8 @@ fn members_whose_certificate_expired_are_to_be_replaced() {
     now.store(seconds("2026-10-31"), Ordering::Relaxed);
     assert_eq!(alice_conversation.stale_members(&alice).unwrap(), []);
 
+    assert_eq!(alice_conversation.expired_members(&alice), []);
+
     // but his certificate expires (RCC.16 sections 6.2.6, 9.5.4)
     now.store(seconds("2026-11-02"), Ordering::Relaxed);
     assert_eq!(
@@ -846,6 +848,32 @@ fn members_whose_certificate_expired_are_to_be_replaced() {
         bob_conversation.stale_members(&bob).unwrap(),
         [credential(&[ALICE, CA])]
     );
+    assert_eq!(
+        alice_conversation.expired_members(&alice),
+        [credential(&[BOB, CA])]
+    );
+
+    // once the group is moved to unencrypted, it is not to be replaced as
+    // stale, but when the group is resurrected (section 11.1.2)
+    alice_conversation
+        .set_encryption_ended(
+            &alice,
+            Some(super::proto::EndMlsReason::PersistentRefreshFailure),
+        )
+        .unwrap();
+    alice_conversation.merge_pending_commit(&alice).unwrap();
+    assert_eq!(alice_conversation.stale_members(&alice).unwrap(), []);
+    assert_eq!(
+        alice_conversation.expired_members(&alice),
+        [credential(&[BOB, CA])]
+    );
+    alice_conversation
+        .resurrect(&alice, &[credential(&[BOB, CA])], &[])
+        .unwrap();
+    alice_conversation.merge_pending_commit(&alice).unwrap();
+    assert!(!alice_conversation.is_encryption_ended());
+    assert_eq!(alice_conversation.members(), [credential(&[ALICE, CA])]);
+    assert_eq!(alice_conversation.expired_members(&alice), []);
 }
 
 #[test]
