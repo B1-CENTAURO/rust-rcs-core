@@ -14,6 +14,7 @@
 
 use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
+use openmls_traits::storage::StorageProvider as _;
 use openmls_traits::OpenMlsProvider;
 use sha2::{Digest, Sha256};
 
@@ -1283,6 +1284,22 @@ fn resent_messages() {
     );
     let decrypted = bob_conversation.decrypt(&bob, &message, b"msg-5").unwrap();
     assert_eq!(decrypted.sender.serialized_content(), b"carol");
+    assert_eq!(decrypted.payload, None);
+    assert_eq!(decrypted.resent_failure, Some(ResentFailure::NotDecrypted));
+
+    // nor can one once the key pair of the leaf is no longer held
+    bob.provider()
+        .storage()
+        .delete_encryption_epoch_key_pairs(
+            bob_conversation.group.group_id(),
+            &bob_conversation.group.epoch(),
+            bob_conversation.group.own_leaf_index().u32(),
+        )
+        .unwrap();
+    let message = carol_conversation
+        .encrypt_resent(&carol, b"lost", bob.credential(), b"msg-10", b"msg-1")
+        .unwrap();
+    let decrypted = bob_conversation.decrypt(&bob, &message, b"msg-10").unwrap();
     assert_eq!(decrypted.payload, None);
     assert_eq!(decrypted.resent_failure, Some(ResentFailure::NotDecrypted));
 
