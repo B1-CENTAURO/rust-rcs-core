@@ -635,6 +635,7 @@ DateTime: 2026-10-25T12:00:00.000Z\r\n\
 NS: imdn <urn:ietf:params:imdn>\r\n\
 imdn.Message-ID: imdn-2\r\n\
 NS: {0} <{1}>\r\n\
+{0}.Era-ID: 2\r\n\
 {0}.Original-Message-ID: 34jk324j\r\n\
 \r\n\
 Content-Type: message/mls\r\n\
