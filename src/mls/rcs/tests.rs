@@ -14,6 +14,7 @@
 
 use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
+use openmls_traits::storage::StorageProvider as _;
 use openmls_traits::OpenMlsProvider;
 use sha2::{Digest, Sha256};
 
@@ -30,8 +31,9 @@ use super::proto::{
     MlsEnhancedGroupInfo, MlsGroupInfo, ServerCommitBundle, ServerMlsRcsMessage,
 };
 use super::wire::{
-    AuthenticatedData, DeliveryNotificationStatus, DisplayNotificationStatus, SecretPayload,
-    VerifiableDeliveryImdn, VerifiableDisplayImdn, VerifiableResentMessage,
+    AuthenticatedData, DeliveryNotificationStatus, DisplayNotificationStatus,
+    HpkeInnerEncapsulatedKeyAndCiphertext, SecretPayload, VerifiableDeliveryImdn,
+    VerifiableDisplayImdn, VerifiableResentMessage,
 };
 use super::*;
 
@@ -1162,6 +1164,7 @@ fn resent_messages() {
     assert_eq!(decrypted.payload_type, SecretPayloadType::Hpke1To1Message);
     assert_eq!(decrypted.payload.as_deref(), Some(&original[..]));
     assert_eq!(decrypted.original_message_id, b"msg-1");
+    assert_eq!(decrypted.resent_failure, None);
     assert!(bob_conversation
         .resent_matches(&bob, &decrypted.original_message_hmac, original)
         .unwrap());
@@ -1173,6 +1176,7 @@ fn resent_messages() {
     assert_eq!(decrypted.payload_type, SecretPayloadType::Hpke1To1Message);
     assert_eq!(decrypted.payload, None);
     assert_eq!(decrypted.original_message_id, b"msg-1");
+    assert_eq!(decrypted.resent_failure, None);
 
     // members that decrypted the Original Message check they got the same one
     let hmac = &decrypted.original_message_hmac;
@@ -1189,6 +1193,61 @@ fn resent_messages() {
         Some(ErrorKind::BadFormat)
     );
 
+    // a message that is not the one its HMAC is of is dropped, its sender not
+    // told (Annex C.4.2); the others cannot tell
+    let message = alice_conversation
+        .encrypt_resent_mismatched(
+            &alice,
+            original,
+            b"another",
+            bob.credential(),
+            b"msg-8",
+            b"msg-1",
+        )
+        .unwrap();
+    let decrypted = bob_conversation.decrypt(&bob, &message, b"msg-8").unwrap();
+    assert_eq!(decrypted.sender.serialized_content(), b"alice");
+    assert_eq!(decrypted.payload, None);
+    assert_eq!(decrypted.original_message_id, b"msg-1");
+    assert_eq!(decrypted.resent_failure, Some(ResentFailure::NotMatching));
+    let decrypted = carol_conversation
+        .decrypt(&carol, &message, b"msg-8")
+        .unwrap();
+    assert_eq!((decrypted.payload, decrypted.resent_failure), (None, None));
+
+    // nor is one whose inner layer cannot be decrypted, which its sender is
+    // told of (sections 10.2, 10.4)
+    let era = alice_conversation.era().unwrap();
+    let inner = wire::encode(&HpkeInnerEncapsulatedKeyAndCiphertext {
+        receiver_leaf_index: bob_conversation.group.own_leaf_index().u32(),
+        encapsulated_key: vec![1; 32].into(),
+        ciphertext: vec![2; 48].into(),
+        original_message_hmac: vec![3; 64].into(),
+    })
+    .unwrap();
+    let message = alice_conversation
+        .encrypt_secret_payload(
+            &alice,
+            SecretPayloadType::Hpke1To1Message,
+            inner,
+            &AuthenticatedData::new(
+                b"msg-9",
+                b"msg-1",
+                era,
+                VerifiableDerivedContent::ResentMessage(VerifiableResentMessage::new(b"msg-1")),
+            ),
+        )
+        .unwrap();
+    let decrypted = bob_conversation.decrypt(&bob, &message, b"msg-9").unwrap();
+    assert_eq!(decrypted.sender.serialized_content(), b"alice");
+    assert_eq!(decrypted.payload, None);
+    assert_eq!(decrypted.original_message_id, b"msg-1");
+    assert_eq!(decrypted.resent_failure, Some(ResentFailure::NotDecrypted));
+    let decrypted = carol_conversation
+        .decrypt(&carol, &message, b"msg-9")
+        .unwrap();
+    assert_eq!((decrypted.payload, decrypted.resent_failure), (None, None));
+
     // padded as files are
     let short = alice_conversation
         .encrypt_resent(&alice, &[b'a'; 2000], bob.credential(), b"msg-3", b"msg-1")
@@ -1199,7 +1258,7 @@ fn resent_messages() {
     assert_eq!(short.len(), long.len());
 
     // sealed to the leaf key Bob has at the time; once he replaced it, a message
-    // re-sent before can no longer be read
+    // re-sent before can no longer be read, which its sender is told of
     let output = bob_conversation.update_keys(&bob).unwrap();
     let message = carol_conversation
         .encrypt_resent(&carol, b"again", bob.credential(), b"msg-5", b"msg-1")
@@ -1223,10 +1282,26 @@ fn resent_messages() {
             .as_deref(),
         Some(&b"later"[..])
     );
-    assert_eq!(
-        bob_conversation.decrypt(&bob, &message, b"msg-5").err(),
-        Some(ErrorKind::Rejected)
-    );
+    let decrypted = bob_conversation.decrypt(&bob, &message, b"msg-5").unwrap();
+    assert_eq!(decrypted.sender.serialized_content(), b"carol");
+    assert_eq!(decrypted.payload, None);
+    assert_eq!(decrypted.resent_failure, Some(ResentFailure::NotDecrypted));
+
+    // nor can one once the key pair of the leaf is no longer held
+    bob.provider()
+        .storage()
+        .delete_encryption_epoch_key_pairs(
+            bob_conversation.group.group_id(),
+            &bob_conversation.group.epoch(),
+            bob_conversation.group.own_leaf_index().u32(),
+        )
+        .unwrap();
+    let message = carol_conversation
+        .encrypt_resent(&carol, b"lost", bob.credential(), b"msg-10", b"msg-1")
+        .unwrap();
+    let decrypted = bob_conversation.decrypt(&bob, &message, b"msg-10").unwrap();
+    assert_eq!(decrypted.payload, None);
+    assert_eq!(decrypted.resent_failure, Some(ResentFailure::NotDecrypted));
 
     // only to members
     let mallory = client("mallory");
@@ -1298,6 +1373,44 @@ fn imdn_failure_reasons() {
     ] {
         assert_eq!(imdn::failure_reason(imdn), None);
     }
+}
+
+#[test]
+fn negative_deliveries_of_clients() {
+    use crate::imdn::notification::{Imdn, Notification, Status};
+
+    // a failed delivery of the message, with the reason of the client
+    // (RCC.16 sections 7.7.2.2, 7.7.2.3)
+    for reason in [
+        ClientFailureReason::FailureToDecrypt,
+        ClientFailureReason::InnerResentMessageFailureToDecrypt,
+    ] {
+        let xml = imdn::negative_delivery("34jk324j", "2026-10-25T12:00:00.000Z", reason);
+        assert_eq!(
+            imdn::failure_reason(xml.as_bytes()),
+            Some(imdn::FailureReason::Client(reason))
+        );
+        let notification = Imdn::from_xml(xml.as_bytes()).unwrap();
+        assert_eq!(notification.message_id, "34jk324j");
+        assert_eq!(notification.datetime, "2026-10-25T12:00:00.000Z");
+        assert_eq!(notification.notification, Notification::Delivery);
+        assert_eq!(notification.status, Status::Failed);
+    }
+
+    // with none, a failed delivery as any
+    let xml = imdn::negative_delivery("1", "2026-10-25T12:00:00.000Z", ClientFailureReason::Unset);
+    assert!(
+        xml.contains("<delivery-notification><status><failed/></status></delivery-notification>")
+    );
+    assert_eq!(imdn::failure_reason(xml.as_bytes()), None);
+
+    // the message ID escaped as any
+    let xml = imdn::negative_delivery(
+        "a<b",
+        "2026-10-25T12:00:00.000Z",
+        ClientFailureReason::FailureToDecrypt,
+    );
+    assert_eq!(Imdn::from_xml(xml.as_bytes()).unwrap().message_id, "a<b");
 }
 
 #[test]

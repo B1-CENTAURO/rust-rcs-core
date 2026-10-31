@@ -31,4 +31,8 @@ pub struct CPIMInfo<'a> {
     /// The MLS-Derived-Content-Signature of a signed message, Base64 encoded
     /// (RCC.16 section 7.2.2)
     pub mls_derived_content_signature: Option<&'a [u8]>,
+
+    /// The Original-Message-ID of a Re-Sent Message, or of a notification of
+    /// one (RCC.16 sections 7.2.3, 7.7.1)
+    pub mls_original_message_id: Option<&'a [u8]>,
 }

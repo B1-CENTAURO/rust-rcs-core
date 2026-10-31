@@ -621,6 +621,50 @@ hi",
 }
 
 #[test]
+fn the_original_message_id_of_a_resent_message_is_given_out() {
+    // as RCC.16 section 7.2.3 has it, in the MLS namespace only
+    for (namespace, uri, expected) in [
+        ("mls", "http://www.gsma.com/rcs/mls", Some(&b"34jk324j"[..])),
+        ("m", "http://www.gsma.com/rcs/mls", Some(&b"34jk324j"[..])),
+        ("rcs", "http://www.gsma.com/rcs", None),
+    ] {
+        let data = format!(
+            "From: <tel:+15550001>\r\n\
+To: <tel:+15550002>\r\n\
+DateTime: 2026-10-25T12:00:00.000Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: imdn-2\r\n\
+NS: {0} <{1}>\r\n\
+{0}.Era-ID: 2\r\n\
+{0}.Original-Message-ID: 34jk324j\r\n\
+\r\n\
+Content-Type: message/mls\r\n\
+\r\n\
+mls",
+            namespace, uri
+        );
+        let message = parse(data.as_bytes());
+        let info = message.get_info().unwrap();
+        assert_eq!(info.mls_original_message_id, expected, "{}", namespace);
+        assert_eq!(info.imdn_message_id, b"imdn-2");
+    }
+
+    // none in a message that was not re-sent
+    let message = parse(
+        b"From: <tel:+15550001>\r\n\
+To: <tel:+15550002>\r\n\
+DateTime: 2026-10-25T12:00:00.000Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: imdn-1\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hi",
+    );
+    assert_eq!(message.get_info().unwrap().mls_original_message_id, None);
+}
+
+#[test]
 fn a_display_notification_is_read() {
     // RFC 5438 section 7.2.1.2, with the blank line between the CPIM headers
     // and the MIME object that RFC 3862 has
