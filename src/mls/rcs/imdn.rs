@@ -17,6 +17,8 @@
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
+use crate::imdn::notification::{Imdn, Notification, Status};
+
 use super::wire::ClientFailureReason;
 use super::ServerFailureReason;
 
@@ -84,4 +86,21 @@ pub fn failed_status(reason: ClientFailureReason) -> String {
         ),
         None => "<status><failed/></status>".to_string(),
     }
+}
+
+/// A client generated Negative-Delivery IMDN telling that the message
+/// `message_id`, of DateTime `datetime`, failed for `reason` (RCC.16 sections
+/// 7.7.2.2, 7.7.2.3)
+pub fn negative_delivery(message_id: &str, datetime: &str, reason: ClientFailureReason) -> String {
+    let imdn = Imdn {
+        message_id: String::from(message_id),
+        datetime: String::from(datetime),
+        recipient_uri: None,
+        original_recipient_uri: None,
+        notification: Notification::Delivery,
+        status: Status::Failed,
+    };
+    // a failed delivery goes with a delivery notification
+    let xml = imdn.to_xml().unwrap_or_default();
+    xml.replacen("<status><failed/></status>", &failed_status(reason), 1)
 }

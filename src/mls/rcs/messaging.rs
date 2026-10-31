@@ -25,17 +25,34 @@ use super::wire::{
 };
 use super::PROPOSAL_RCS_SIGNATURE;
 
+/// Why the inner layer of a Re-Sent Message addressed to this client gave no
+/// Original Message (RCC.16 section 10.4, Annex C.4.2)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResentFailure {
+    /// It could not be decrypted, as when it was sealed to a leaf key this
+    /// client replaced since; its sender is to be told so (sections 10.2,
+    /// 10.4)
+    NotDecrypted,
+    /// What it holds is not the message its HMAC is of: it is dropped, and
+    /// its sender not told (Annex C.4.2)
+    NotMatching,
+}
+
 pub struct DecryptedMessage {
     pub sender: Credential,
     pub payload_type: SecretPayloadType,
     /// The CPIM message without its unencrypted headers; for a Re-Sent Message,
-    /// the Original Message, or None when it was re-sent to another client
+    /// the Original Message, or None when it was re-sent to another client or
+    /// `resent_failure` tells why not
     pub payload: Option<Vec<u8>>,
     /// Original-Message-ID bound to the message, empty unless re-sent
     pub original_message_id: Vec<u8>,
     /// For a Re-Sent Message, what `resent_matches()` checks the Original
     /// Message against; empty otherwise
     pub original_message_hmac: Vec<u8>,
+    /// For a Re-Sent Message addressed to this client, why it gave no
+    /// Original Message, if it did not
+    pub resent_failure: Option<ResentFailure>,
 }
 
 impl MlsConversation {
@@ -141,19 +158,23 @@ impl MlsConversation {
         }
 
         let mut original_message_hmac = Vec::new();
+        let mut resent_failure = None;
         let payload = match secret_payload.payload_type {
             SecretPayloadType::Application | SecretPayloadType::GroupMetadataKeys => {
                 Some(secret_payload.payload.into())
             }
             SecretPayloadType::Hpke1To1Message => {
-                let (payload, hmac) = self.open_resent(
+                let (opened, hmac) = self.open_resent(
                     client,
                     secret_payload.payload.as_slice(),
                     epoch,
                     sender_leaf_index,
                 )?;
                 original_message_hmac = hmac;
-                payload
+                opened.unwrap_or_else(|failure| {
+                    resent_failure = Some(failure);
+                    None
+                })
             }
         };
 
@@ -163,6 +184,7 @@ impl MlsConversation {
             payload,
             original_message_id,
             original_message_hmac,
+            resent_failure,
         })
     }
 

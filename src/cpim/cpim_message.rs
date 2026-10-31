@@ -41,6 +41,12 @@ fn is_derived_content_signature(name: &[u8]) -> bool {
     name.eq_ignore_ascii_case(b"MLS-Derived-Content-Signature")
 }
 
+/// Whether `name`, in the MLS namespace, is the Original-Message-ID (RCC.16
+/// section 7.2.3)
+fn is_original_message_id(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"Original-Message-ID")
+}
+
 pub enum CPIMHeaders {
     Deflated(Vec<Header>),
     Inflated(Vec<Header>),
@@ -133,6 +139,7 @@ impl<'a> CPIMMessage {
         let mut imdn_message_id: Option<&[u8]> = None;
         let mut disposition_notification: Option<&[u8]> = None;
         let mut mls_derived_content_signature: Option<&[u8]> = None;
+        let mut mls_original_message_id: Option<&[u8]> = None;
 
         for (n, v) in headers {
             platform_log(
@@ -163,6 +170,11 @@ impl<'a> CPIMMessage {
                 .is_some_and(is_derived_content_signature)
             {
                 mls_derived_content_signature.get_or_insert(v);
+            } else if n
+                .strip_prefix(&b"<http://www.gsma.com/rcs/mls>."[..])
+                .is_some_and(is_original_message_id)
+            {
+                mls_original_message_id.get_or_insert(v);
             }
         }
 
@@ -198,6 +210,7 @@ impl<'a> CPIMMessage {
                 payload_type,
                 disposition_notification,
                 mls_derived_content_signature,
+                mls_original_message_id,
             });
         }
 
