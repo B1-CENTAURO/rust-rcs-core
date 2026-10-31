@@ -3424,6 +3424,26 @@ fn an_unencrypted_singleton_era_gives_the_focus_its_ratchet_tree_without_a_welco
     assert_eq!(singleton.pending_encryption_end(), None);
     assert_eq!((singleton.era(), singleton.epoch()), (Some(3), 1));
     assert!(EraBase::of_conversation(&singleton).is_encryption_ended());
+
+    // the next Era moving it back to encrypted copies its GroupContext
+    // extensions but end_mls (section 8.3.1)
+    let base = EraBase::of_conversation(&singleton).without_encryption_end();
+    assert!(!base.is_encryption_ended());
+    assert_eq!(base.era(), 3);
+    assert_eq!(base.members(), [alice.credential().clone()]);
+    let mut next = alice.create_next_era(&base, false).unwrap();
+    assert!(!next.is_encryption_ended());
+    assert_eq!(next.era(), Some(4));
+    let mut kept = extensions_besides_era(&mut singleton);
+    kept.retain(|(extension_type, _)| *extension_type != EXTENSION_END_MLS);
+    assert!(!kept.is_empty());
+    assert_eq!(extensions_besides_era(&mut next), kept);
+    // nor does it change a base without end_mls
+    let base = EraBase::of_conversation(&alice_conversation);
+    assert_eq!(
+        format!("{:?}", base.clone().without_encryption_end()),
+        format!("{:?}", base)
+    );
 }
 
 #[test]

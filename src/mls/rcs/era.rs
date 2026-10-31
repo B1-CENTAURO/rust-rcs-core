@@ -123,6 +123,14 @@ impl EraBase {
             .any(|(extension_type, _)| *extension_type == EXTENSION_END_MLS)
     }
 
+    /// The base of an Era moving the group back to encrypted, which copies
+    /// its GroupContext extensions but end_mls (RCC.16 sections 8.3.1, 11.1)
+    pub fn without_encryption_end(mut self) -> EraBase {
+        self.extensions
+            .retain(|(extension_type, _)| *extension_type != EXTENSION_END_MLS);
+        self
+    }
+
     /// Whether the continuity token kept for the group carries over to the
     /// next Era (RCC.16 section 8.3.1.2), `participants` the tel URIs of the
     /// Participants of the RCS conversation, and `local` the group this
