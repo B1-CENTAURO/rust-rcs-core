@@ -409,18 +409,17 @@ impl MlsClient {
             self,
             group_id.as_slice(),
         )?);
+        rcs::metadata::ensure_continuity_token(self, group_id.as_slice())?;
         self.create_group(group_id, extensions)
     }
 
     /// Creates the group `group_id` with this client as its only member and
-    /// `extensions` in its GroupContext, with the continuity token kept for
-    /// it, or a new one
+    /// `extensions` in its GroupContext
     pub(crate) fn create_group(
         &self,
         group_id: GroupId,
         extensions: Vec<Extension>,
     ) -> Result<MlsConversation> {
-        rcs::metadata::ensure_continuity_token(self, group_id.as_slice())?;
         let extensions = Extensions::from_vec(extensions)
             .map_err(fail("GroupContext extensions", ErrorKind::InvalidState))?;
 

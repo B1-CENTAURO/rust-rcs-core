@@ -2212,6 +2212,7 @@ fn enhanced_self_heal() {
         .process_enhanced_group_info(&bob, &proto::encode(&page))
         .unwrap();
     assert_eq!(healed.progress, SelfHealProgress::NextPage);
+    assert_eq!(healed.latest_epoch, epochs[2]);
     assert_eq!(healed.applied.len(), 2);
     assert_eq!(healed.applied[0].0, "cpim-1");
     assert!(matches!(
@@ -2315,6 +2316,23 @@ fn enhanced_self_heal_falls_back() {
         healed.progress,
         SelfHealProgress::Rejoin(group_info.clone())
     );
+    // the epoch of the GroupInfo, whose continuity token commitment is made
+    // at its epoch authenticator (RCC.16 section 10.5.1)
+    assert_eq!(healed.latest_epoch, latest);
+    assert_eq!(
+        bob.continuity_token_matches(
+            &group_info.group_info,
+            &healed.latest_epoch.epoch_authenticator
+        )
+        .unwrap(),
+        Some(true)
+    );
+    let previous = bob_conversation.epoch_authenticator().to_vec();
+    assert_eq!(
+        bob.continuity_token_matches(&group_info.group_info, &previous)
+            .unwrap(),
+        Some(false)
+    );
 
     // one of them fails: the ones before stay applied
     let mut broken = control_messages("cpim-2", &second);
@@ -2338,6 +2356,7 @@ fn enhanced_self_heal_falls_back() {
         healed.progress,
         SelfHealProgress::Rejoin(group_info.clone())
     );
+    assert_eq!(healed.latest_epoch, alice_conversation.epoch_identifier());
     assert_eq!(healed.applied.len(), 1);
     assert_eq!(bob_conversation.epoch(), 2);
 
@@ -3503,6 +3522,181 @@ fn a_new_era_is_made_from_the_group_info_of_the_focus() {
         alice.group_metadata(&group_id).unwrap().continuity_token,
         token
     );
+}
+
+/// The GroupInfo of `output`, in the MlsGroupInfo of a Conversation Focus,
+/// with the ratchet tree of `conversation`
+fn focus_group_info(output: &CommitOutput, conversation: &MlsConversation) -> MlsGroupInfo {
+    MlsGroupInfo {
+        group_info: output.group_info.clone(),
+        ratchet_tree: conversation.ratchet_tree().unwrap(),
+        pending_proposals: Vec::new(),
+    }
+}
+
+#[test]
+fn a_new_era_asks_the_members_for_what_its_client_misses() {
+    use super::era::EraBase;
+
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let group_id = alice_conversation.group_id().to_vec();
+    let (output, _) = alice_conversation
+        .set_group_icon(&alice, b"icon", "image/png", b"msg-icon")
+        .unwrap();
+    deliver(
+        (&mut alice_conversation, &alice),
+        vec![(&mut bob_conversation, &bob)],
+        &output,
+    );
+    let (output, _) = alice_conversation
+        .set_group_subject(&alice, "Team", b"msg-subject")
+        .unwrap();
+    deliver(
+        (&mut alice_conversation, &alice),
+        vec![(&mut bob_conversation, &bob)],
+        &output,
+    );
+    let kept = alice.group_metadata(&group_id).unwrap();
+    assert!(!kept.continuity_token.is_empty());
+    let base = EraBase::of_group_info(&focus_group_info(&output, &alice_conversation)).unwrap();
+
+    // keeping the key of the subject and the token, nothing is asked for
+    let next = bob.create_next_era(&base, false).unwrap();
+    assert!(!next.group_metadata_keys_requested());
+
+    // keeping neither, the next Era asks for both in its GroupContext, and no
+    // token is made (RCC.16 sections 8.3.1.3, 10.5.2)
+    bob.forget_group_metadata(&group_id).unwrap();
+    let mut next = bob.create_next_era(&base, false).unwrap();
+    assert!(next.group_metadata_keys_requested());
+    assert!(!next.group_metadata_in_sync(&bob).unwrap());
+    assert!(bob
+        .group_metadata(&group_id)
+        .unwrap()
+        .continuity_token
+        .is_empty());
+    let mut asked = extensions_besides_era(&mut alice_conversation);
+    asked.push((
+        EXTENSION_GROUP_METADATA_KEYS_REQUESTED,
+        GROUP_METADATA_KEYS_REQUESTED.to_vec(),
+    ));
+    assert_eq!(extensions_besides_era(&mut next), asked);
+    // nor do its GroupInfos commit to one
+    let key_package = alice.generate_key_package(false).unwrap();
+    let output = next.add_members(&bob, &[&key_package]).unwrap();
+    assert_eq!(
+        alice
+            .continuity_token_matches(&output.group_info, &output.epoch_authenticator)
+            .unwrap(),
+        None
+    );
+    let bundle = accept(&output);
+    next.process_commit_bundle(&bob, &bundle).unwrap();
+
+    // a member joining it, its keys in sync, answers with what it kept
+    // (section 10.5.3)
+    let mut alice_next = alice
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    assert!(alice_next.group_metadata_keys_requested());
+    assert!(alice_next.group_metadata_in_sync(&alice).unwrap());
+    assert_eq!(alice.group_metadata(&group_id).unwrap(), kept);
+    let output = alice_next
+        .send_group_metadata_keys(&alice, b"msg-keys")
+        .unwrap();
+    let events = deliver((&mut alice_next, &alice), vec![(&mut next, &bob)], &output);
+    match events[0].as_slice() {
+        [IncomingMessage::Commit { .. }, IncomingMessage::GroupMetadataKeys {
+            icon,
+            subject,
+            continuity_token_matches,
+            ..
+        }] => {
+            assert!(*icon && *subject);
+            assert_eq!(*continuity_token_matches, Some(true));
+        }
+        _ => panic!("expected a Commit with group metadata keys"),
+    }
+    // which the client of the Era keeps (section 10.5.4)
+    assert!(!next.group_metadata_keys_requested());
+    assert!(next.group_metadata_in_sync(&bob).unwrap());
+    assert_eq!(bob.group_metadata(&group_id).unwrap(), kept);
+
+    // the token alone missing, it alone is asked for; the token renewed, a
+    // new one is made, and nothing is asked for
+    let base = EraBase::of_conversation(&next);
+    let mut metadata = kept.clone();
+    metadata.continuity_token.clear();
+    super::metadata::store(&bob, &group_id, &metadata).unwrap();
+    let renewed = bob.create_next_era(&base, true).unwrap();
+    assert!(!renewed.group_metadata_keys_requested());
+    let token = bob.group_metadata(&group_id).unwrap().continuity_token;
+    assert!(!token.is_empty());
+    assert_ne!(token, kept.continuity_token);
+    super::metadata::store(&bob, &group_id, &metadata).unwrap();
+    let next = bob.create_next_era(&base, false).unwrap();
+    assert!(next.group_metadata_keys_requested());
+    assert!(next.group_metadata_in_sync(&bob).unwrap());
+
+    // the key of the subject or of the icon alone missing, it is asked for,
+    // the token kept going on
+    for missing in ["subject", "icon"] {
+        let mut metadata = kept.clone();
+        let keys = metadata.group_subject_icon_keys.as_mut().unwrap();
+        match missing {
+            "subject" => keys.subject = None,
+            _ => keys.icon = None,
+        }
+        super::metadata::store(&bob, &group_id, &metadata).unwrap();
+        let next = bob.create_next_era(&base, false).unwrap();
+        assert!(next.group_metadata_keys_requested(), "{} missing", missing);
+        assert!(!next.group_metadata_in_sync(&bob).unwrap());
+        assert_eq!(
+            bob.group_metadata(&group_id).unwrap().continuity_token,
+            kept.continuity_token
+        );
+    }
+}
+
+#[test]
+fn a_request_of_the_era_before_is_not_copied() {
+    use super::era::EraBase;
+
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let group_id = alice_conversation.group_id().to_vec();
+    let (output, _) = alice_conversation
+        .set_group_icon(&alice, b"icon", "image/png", b"msg-icon")
+        .unwrap();
+    deliver(
+        (&mut alice_conversation, &alice),
+        vec![(&mut bob_conversation, &bob)],
+        &output,
+    );
+
+    // bob asks for the keys, which alice keeps
+    bob.forget_group_metadata(&group_id).unwrap();
+    let output = bob_conversation.request_group_metadata_keys(&bob).unwrap();
+    deliver(
+        (&mut bob_conversation, &bob),
+        vec![(&mut alice_conversation, &alice)],
+        &output,
+    );
+    assert!(alice_conversation.group_metadata_keys_requested());
+
+    // the next Era alice makes, her keys in sync, asks for nothing
+    let base = EraBase::of_group_info(&focus_group_info(&output, &bob_conversation)).unwrap();
+    let mut next = alice.create_next_era(&base, false).unwrap();
+    assert!(!next.group_metadata_keys_requested());
+    let mut copied = extensions_besides_era(&mut alice_conversation);
+    copied.retain(|(extension_type, _)| *extension_type != EXTENSION_GROUP_METADATA_KEYS_REQUESTED);
+    assert_eq!(extensions_besides_era(&mut next), copied);
+    assert!(copied
+        .iter()
+        .any(|(extension_type, _)| *extension_type == EXTENSION_ICON_COMMITMENT));
 }
 
 #[test]
