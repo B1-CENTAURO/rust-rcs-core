@@ -33,7 +33,7 @@ use super::super::client::MlsClient;
 use super::super::conversation::{CommitExtras, CommitOutput, IncomingMessage, MlsConversation};
 use super::super::{fail, ErrorKind, Result};
 use super::file::{self, EncryptedFile};
-use super::proto::{self, FileInfo, FileMetadata, GroupMetadataKeys};
+use super::proto::{self, FileEncryptionInfo, FileInfo, FileMetadata, GroupMetadataKeys};
 use super::wire::{self, AuthenticatedData, SecretPayload, SecretPayloadType};
 use super::{
     EXTENSION_CONTINUITY_TOKEN, EXTENSION_CONTINUITY_TOKEN_COMMITMENT,
@@ -556,6 +556,31 @@ impl MlsConversation {
         self.set_key(client, Kind::Icon, icon, content_type, message_id)
     }
 
+    /// Commits to a new group icon encrypted beforehand with
+    /// `encrypt_file(icon, GROUP_ICON_FILE_NAME)`, of the type `content_type`
+    /// and encrypted with `encryption_info` (RCC.16 section 9.7.1.4)
+    ///
+    /// This lets the encrypted icon be uploaded to the HTTP Content Server
+    /// before the Commit is made, the URL it is given then going in the CPM
+    /// group data request next to the Commit, in a multipart CPIM message
+    /// with Message-ID `message_id`; and the same upload be committed to
+    /// again if the Commit is not accepted.
+    pub fn commit_group_icon(
+        &mut self,
+        client: &MlsClient,
+        encryption_info: &FileEncryptionInfo,
+        content_type: &str,
+        message_id: &[u8],
+    ) -> Result<CommitOutput> {
+        self.commit_key(
+            client,
+            Kind::Icon,
+            encryption_info,
+            content_type,
+            message_id,
+        )
+    }
+
     /// Encrypts a new group subject and commits to it (RCC.16 section 9.7.1.5)
     ///
     /// The encrypted subject goes Base64 encoded in the CPM group data request
@@ -585,10 +610,28 @@ impl MlsConversation {
         message_id: &[u8],
     ) -> Result<(CommitOutput, EncryptedFile)> {
         let encrypted = file::encrypt_file(content, kind.label())?;
+        let output = self.commit_key(
+            client,
+            kind,
+            &encrypted.encryption_info,
+            content_type,
+            message_id,
+        )?;
+        Ok((output, encrypted))
+    }
+
+    fn commit_key(
+        &mut self,
+        client: &MlsClient,
+        kind: Kind,
+        encryption_info: &FileEncryptionInfo,
+        content_type: &str,
+        message_id: &[u8],
+    ) -> Result<CommitOutput> {
         let key = FileMetadata {
             file_name: kind.label().to_string(),
             content_type: content_type.to_string(),
-            encryption_info: Some(encrypted.encryption_info.clone()),
+            encryption_info: Some(encryption_info.clone()),
         };
         let commitment = key_commitment(client, self.mls_ciphersuite(), kind.label(), &key)?;
 
@@ -602,7 +645,7 @@ impl MlsConversation {
             group_subject_icon_keys: Some(file_info),
         };
 
-        let output = self.update_context_extensions(
+        self.update_context_extensions(
             client,
             |extensions| {
                 remove_extension(extensions, kind.commitment_extension());
@@ -616,8 +659,7 @@ impl MlsConversation {
                 metadata: Some(keys),
                 ..CommitExtras::default()
             },
-        )?;
-        Ok((output, encrypted))
+        )
     }
 
     /// Deletes the encrypted group icon (RCC.16 section 9.7.1.6)
