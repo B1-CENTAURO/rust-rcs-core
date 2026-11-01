@@ -36,8 +36,8 @@ mod certificate_tests;
 mod tests;
 
 pub use certificate::{
-    credential_tel_uris, same_tel_uri, x509_credential, CertificateError, ClientCertificate,
-    ClientIdentity, ParticipantKey, RcsCredentialValidator,
+    credential_tel_uris, participant_keys, same_tel_uri, x509_credential, CertificateError,
+    ClientCertificate, ClientIdentity, ParticipantKey, RcsCredentialValidator,
 };
 pub use messaging::{DecryptedMessage, ResentFailure};
 pub use wire::{ClientFailureReason, SecretPayloadType, VerifiableDerivedContent};
