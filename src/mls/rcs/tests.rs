@@ -1761,6 +1761,79 @@ fn continuity_token() {
 }
 
 #[test]
+fn a_group_icon_encrypted_beforehand_is_committed_to() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    // encrypted, as it is to be uploaded before the Commit is made
+    let icon = b"\x89PNG uploaded first";
+    let encrypted = file::encrypt_file(icon, GROUP_ICON_FILE_NAME).unwrap();
+
+    // a Commit not accepted, the same icon committed to again
+    let output = alice_conversation
+        .commit_group_icon(&alice, &encrypted.encryption_info, "image/png", b"msg-icon")
+        .unwrap();
+    assert!(output.private_message.is_some());
+    alice_conversation.discard_pending_commit(&alice).unwrap();
+    assert!(alice
+        .group_metadata(alice_conversation.group_id())
+        .unwrap()
+        .group_subject_icon_keys
+        .is_none());
+    let output = alice_conversation
+        .commit_group_icon(
+            &alice,
+            &encrypted.encryption_info,
+            "image/png",
+            b"msg-icon-2",
+        )
+        .unwrap();
+
+    let events = deliver(
+        (&mut alice_conversation, &alice),
+        vec![(&mut bob_conversation, &bob)],
+        &output,
+    );
+    assert!(matches!(
+        events[0].as_slice(),
+        [
+            IncomingMessage::Commit { .. },
+            IncomingMessage::GroupMetadataKeys {
+                icon: true,
+                subject: false,
+                ..
+            }
+        ]
+    ));
+    for (conversation, client) in [(&alice_conversation, &alice), (&bob_conversation, &bob)] {
+        assert!(conversation.group_metadata_in_sync(client).unwrap());
+        let key = conversation
+            .group_metadata(client)
+            .unwrap()
+            .group_subject_icon_keys
+            .unwrap()
+            .icon
+            .unwrap();
+        assert_eq!(key.file_name, GROUP_ICON_FILE_NAME);
+        assert_eq!(key.content_type, "image/png");
+        assert_eq!(
+            key.encryption_info.as_ref(),
+            Some(&encrypted.encryption_info)
+        );
+        assert_eq!(
+            file::decrypt_file(
+                &encrypted.ciphertext,
+                GROUP_ICON_FILE_NAME,
+                &key.encryption_info.unwrap()
+            )
+            .unwrap(),
+            icon
+        );
+    }
+}
+
+#[test]
 fn group_icon_and_subject() {
     let alice = client("alice");
     let bob = client("bob");
