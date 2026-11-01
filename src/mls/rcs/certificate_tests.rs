@@ -927,6 +927,14 @@ fn the_continuity_token_carries_over_to_a_new_era_of_the_same_participants() {
     let local = EraBase::of_conversation(&bob_conversation);
     assert!(local.continuity_holds(None, &[ALICE_TEL, BOB_TEL]));
     assert!(!local.continuity_holds(None, &[ALICE_TEL, CAROL_TEL]));
+
+    // without a token kept, it is asked for if the Participants are members,
+    // whatever group the client has (section 8.3.1.3)
+    assert!(base.has_participants(&[ALICE_TEL, BOB_TEL]));
+    assert!(base.has_participants(&[BOB_TEL]));
+    assert!(base.has_participants(&[]));
+    assert!(!base.has_participants(&[ALICE_TEL, CAROL_TEL]));
+    assert!(!base.has_participants(&[CAROL_TEL]));
 }
 
 #[test]

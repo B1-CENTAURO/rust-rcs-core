@@ -19,7 +19,7 @@
 use super::super::client::MlsClient;
 use super::super::conversation::{IncomingMessage, MlsConversation};
 use super::super::{ErrorKind, Result};
-use super::proto::{self, MlsEnhancedGroupInfo, MlsGroupInfo};
+use super::proto::{self, EpochIdentifier, MlsEnhancedGroupInfo, MlsGroupInfo};
 
 /// Where enhanced self-healing stands after a response
 #[derive(Debug, PartialEq)]
@@ -37,6 +37,12 @@ pub enum SelfHealProgress {
 
 pub struct EnhancedSelfHeal {
     pub progress: SelfHealProgress,
+    /// The latest epoch the Conversation Focus knows of, that of the GroupInfo
+    /// to rejoin with: its epoch authenticator is the one the continuity token
+    /// commitment of the GroupInfo is made at, which
+    /// `MlsClient::continuity_token_matches()` checks (RCC.16 sections
+    /// 7.11.12.2, 10.5.1)
+    pub latest_epoch: EpochIdentifier,
     /// What was applied, by the RCS Message-ID of each control message; these
     /// get no IMDN unless delivered over MSRP as well, where they come out as
     /// Duplicate (RCC.16 section 10.1.2)
@@ -74,6 +80,7 @@ impl MlsConversation {
         if latest == self.epoch_identifier() {
             return Ok(EnhancedSelfHeal {
                 progress: SelfHealProgress::UpToDate,
+                latest_epoch: latest,
                 applied,
             });
         }
@@ -83,6 +90,7 @@ impl MlsConversation {
         let Some(paginated) = info.paginated_epoch_identifier.clone() else {
             return Ok(EnhancedSelfHeal {
                 progress: rejoin()?,
+                latest_epoch: latest,
                 applied,
             });
         };
@@ -97,6 +105,7 @@ impl MlsConversation {
                 Err(_) => {
                     return Ok(EnhancedSelfHeal {
                         progress: rejoin()?,
+                        latest_epoch: latest,
                         applied,
                     })
                 }
@@ -110,6 +119,10 @@ impl MlsConversation {
         } else {
             SelfHealProgress::NextPage
         };
-        Ok(EnhancedSelfHeal { progress, applied })
+        Ok(EnhancedSelfHeal {
+            progress,
+            latest_epoch: latest,
+            applied,
+        })
     }
 }

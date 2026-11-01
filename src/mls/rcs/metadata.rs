@@ -284,6 +284,35 @@ pub(crate) fn group_info_extensions(
     )])
 }
 
+/// Whether a key of the icon or subject that `extensions`, GroupContext
+/// extensions, commit to is not kept for `group_id`: the keys kept are then
+/// out of sync (RCC.16 section 10.5.1)
+pub(crate) fn keys_missing(
+    client: &MlsClient,
+    group_id: &[u8],
+    extensions: &[(u16, Vec<u8>)],
+) -> Result<bool> {
+    let keys = load(client, group_id)?;
+    for kind in [Kind::Icon, Kind::Subject] {
+        let Some((_, commitment)) = extensions
+            .iter()
+            .find(|(extension_type, _)| *extension_type == kind.commitment_extension())
+        else {
+            continue;
+        };
+        let kept = match kind.of(&keys) {
+            Some(key) => {
+                key_commitment(client, client.ciphersuite(), kind.label(), key)? == *commitment
+            }
+            None => false,
+        };
+        if !kept {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Keeps what the GroupInfo of a Welcome brought: the keys matching the
 /// commitments of the group, and the continuity token, which replaces the one
 /// kept so far

@@ -21,7 +21,10 @@ use super::super::client::MlsClient;
 use super::super::conversation::MlsConversation;
 use super::super::{fail, ErrorKind, Result};
 use super::certificate::{credential_tel_uris, same_tel_uri};
-use super::{proto, EXTENSION_END_MLS, EXTENSION_ERA};
+use super::{
+    metadata, proto, EXTENSION_END_MLS, EXTENSION_ERA, EXTENSION_GROUP_METADATA_KEYS_REQUESTED,
+    GROUP_METADATA_KEYS_REQUESTED,
+};
 
 /// What the next Era of a group is made from: the group as the GroupInfo of
 /// its Conversation Focus tells it, or else as this client has it (RCC.16
@@ -142,33 +145,48 @@ impl EraBase {
     /// GroupInfo commits to it; but that commitment, made at the epoch
     /// authenticator of the GroupInfo, can only be checked by a client in the
     /// same epoch, whose group then has the same members. Without a group of
-    /// its own to compare with, the token does not carry over: asking the
-    /// members for it (section 8.3.1.3) is not done.
+    /// its own to compare with, the token does not carry over.
+    ///
+    /// Without a token kept, has_participants() tells instead whether it is
+    /// asked of the members (section 8.3.1.3).
     pub fn continuity_holds(&self, local: Option<&MlsConversation>, participants: &[&str]) -> bool {
-        let tel_uris = |members: &[Credential]| -> Vec<String> {
-            members
-                .iter()
-                .flat_map(|member| credential_tel_uris(member).unwrap_or_default())
-                .collect()
-        };
-        let has = |tel_uris: &[String], uri: &str| tel_uris.iter().any(|t| same_tel_uri(t, uri));
-        let members = tel_uris(&self.members);
-        if !participants
-            .iter()
-            .all(|participant| has(&members, participant))
-        {
+        if !self.has_participants(participants) {
             return false;
         }
         if self.local {
             return true;
         }
+        let members = tel_uris(&self.members);
         local
             .filter(|local| local.group_id() == self.group_id.as_slice())
             .is_some_and(|local| {
                 let known = tel_uris(&local.members());
-                members.iter().all(|member| has(&known, member))
+                members.iter().all(|member| has_tel_uri(&known, member))
             })
     }
+
+    /// Whether each of `participants`, the tel URIs of the Participants of
+    /// the RCS conversation, is a member of the group, by MSISDN: a client
+    /// keeping no continuity token for the group then asks the members for it
+    /// in the next Era, rather than making a new one (RCC.16 section 8.3.1.3)
+    pub fn has_participants(&self, participants: &[&str]) -> bool {
+        let members = tel_uris(&self.members);
+        participants
+            .iter()
+            .all(|participant| has_tel_uri(&members, participant))
+    }
+}
+
+/// The tel URIs of `members`
+fn tel_uris(members: &[Credential]) -> Vec<String> {
+    members
+        .iter()
+        .flat_map(|member| credential_tel_uris(member).unwrap_or_default())
+        .collect()
+}
+
+fn has_tel_uri(tel_uris: &[String], uri: &str) -> bool {
+    tel_uris.iter().any(|t| same_tel_uri(t, uri))
 }
 
 impl MlsClient {
@@ -179,9 +197,17 @@ impl MlsClient {
     ///
     /// The continuity token kept for the group goes on in the next Era, unless
     /// `renew_continuity_token`, as continuity_holds() tells (section
-    /// 8.3.1.2). Without a token kept, a new one is made. The keys of the icon
-    /// and subject kept for the group go into the Welcome as for a new group,
-    /// as far as they match the commitments copied.
+    /// 8.3.1.2). The keys of the icon and subject kept for the group go into
+    /// the Welcome as for a new group, as far as they match the commitments
+    /// copied.
+    ///
+    /// The members are asked for the group metadata keys this client misses
+    /// (sections 8.3, 8.3.1.3, 10.5.1, 10.5.2): the GroupContext of the next
+    /// Era has the group_metadata_keys_requested extension if a key of the
+    /// icon or subject that it commits to is not kept, or if no continuity
+    /// token is kept and `renew_continuity_token` is false, as
+    /// has_participants() tells; no token is made then. A request of the Era
+    /// before is not copied.
     pub fn create_next_era(
         &self,
         base: &EraBase,
@@ -194,14 +220,31 @@ impl MlsClient {
         if renew_continuity_token {
             self.renew_continuity_token(&base.group_id)?;
         }
+        let requested = metadata::load(self, &base.group_id)?
+            .continuity_token
+            .is_empty()
+            || metadata::keys_missing(self, &base.group_id, &base.extensions)?;
 
         let mut extensions = vec![Extension::Unknown(
             EXTENSION_ERA,
             UnknownExtension(era.to_be_bytes().to_vec()),
         )];
-        extensions.extend(base.extensions.iter().map(|(extension_type, data)| {
-            Extension::Unknown(*extension_type, UnknownExtension(data.clone()))
-        }));
+        extensions.extend(
+            base.extensions
+                .iter()
+                .filter(|(extension_type, _)| {
+                    *extension_type != EXTENSION_GROUP_METADATA_KEYS_REQUESTED
+                })
+                .map(|(extension_type, data)| {
+                    Extension::Unknown(*extension_type, UnknownExtension(data.clone()))
+                }),
+        );
+        if requested {
+            extensions.push(Extension::Unknown(
+                EXTENSION_GROUP_METADATA_KEYS_REQUESTED,
+                UnknownExtension(GROUP_METADATA_KEYS_REQUESTED.to_vec()),
+            ));
+        }
         self.create_group(GroupId::from_slice(&base.group_id), extensions)
     }
 }
