@@ -2880,6 +2880,42 @@ fn key_updates_by_days_and_messages() {
 }
 
 #[test]
+fn key_updates_wanted_at_once() {
+    let clock = TestClock::new();
+    let start = clock.now();
+    let alice = timed_client("alice", &clock);
+    let bob = timed_client("bob", &clock);
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    assert!(!alice_conversation.key_update_due(&alice).unwrap());
+
+    // as after a message re-sent (RCC.16 section 10.3), until there is one
+    alice_conversation.want_key_update(&alice).unwrap();
+    assert!(alice_conversation.key_update_due(&alice).unwrap());
+    assert!(!bob_conversation.key_update_due(&bob).unwrap());
+    // kept with the rest of the client
+    let restored = MlsClient::restore(
+        &alice.snapshot().unwrap(),
+        MlsConfig::default(),
+        Box::new(AllowAll),
+    )
+    .unwrap();
+    let restored_conversation = restored
+        .load_conversation(alice_conversation.group_id())
+        .unwrap();
+    assert!(restored_conversation.key_update_due(&restored).unwrap());
+
+    clock.set(start + MINUTE);
+    key_update(
+        &alice,
+        &mut alice_conversation,
+        &mut [(&bob, &mut bob_conversation)],
+    );
+    assert!(!alice_conversation.key_update_due(&alice).unwrap());
+    clock.set(start + 30 * DAY + 2 * MINUTE);
+    assert!(alice_conversation.key_update_due(&alice).unwrap());
+}
+
+#[test]
 fn key_updates_after_joining_with_a_last_resort_key_package() {
     use std::time::Duration;
 

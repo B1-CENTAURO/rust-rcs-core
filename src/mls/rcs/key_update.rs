@@ -224,6 +224,19 @@ impl MlsConversation {
         })
     }
 
+    /// Has this client update its keys in the group at once, as after it
+    /// re-sent a message (RCC.16 section 10.3): `key_update_due()` tells so,
+    /// as if its leaf had never been updated, until it does
+    pub fn want_key_update(&self, client: &MlsClient) -> Result<()> {
+        let Some(mut own_leaf) = self.own_leaf(client)? else {
+            return Ok(());
+        };
+        own_leaf.updated = 0;
+        client
+            .provider()
+            .write_value(own_leaf_key(self.group_id()), own_leaf.encode())
+    }
+
     /// Counts a message this client encrypted towards its next key update
     pub(crate) fn count_sent(&self, client: &MlsClient) -> Result<()> {
         let Some(mut own_leaf) = self.own_leaf(client)? else {

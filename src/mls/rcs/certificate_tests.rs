@@ -23,8 +23,8 @@ use super::super::{
     Ciphersuite, Credential, CredentialType, ErrorKind, IncomingMessage, MlsClient, MlsConfig,
 };
 use super::certificate::{
-    check_participant_information, credential_tel_uris, same_tel_uri, x509_credential,
-    CertificateError, ClientIdentity, ParticipantKey, RcsCredentialValidator,
+    check_participant_information, credential_tel_uris, participant_keys, same_tel_uri,
+    x509_credential, CertificateError, ClientIdentity, ParticipantKey, RcsCredentialValidator,
 };
 
 #[allow(dead_code)]
@@ -927,4 +927,38 @@ fn the_continuity_token_carries_over_to_a_new_era_of_the_same_participants() {
     let local = EraBase::of_conversation(&bob_conversation);
     assert!(local.continuity_holds(None, &[ALICE_TEL, BOB_TEL]));
     assert!(!local.continuity_holds(None, &[ALICE_TEL, CAROL_TEL]));
+}
+
+#[test]
+fn the_participant_keys_of_a_client_certificate_are_given() {
+    // the key its ParticipantInformation names, which a renewed certificate
+    // keeps (RCC.16 Annex A.3.8.9)
+    let alice = participant_keys(&credential(&[ALICE, CA])).unwrap();
+    assert_eq!(alice.len(), 1);
+    assert!(!alice[0].ends_with(&bytes(ALICE_PUBLIC_KEY)));
+    assert_eq!(
+        participant_keys(&credential(&[ALICE_RENEWED, CA])).unwrap(),
+        alice
+    );
+    use der::Decode;
+    let leaf = x509_cert::Certificate::from_der(&bytes(ALICE)).unwrap();
+    let (_, participant_key) = check_participant_information(&leaf, time("2026-10-01")).unwrap();
+    assert_eq!(alice[0], participant_key);
+
+    // then the older ones its key rolls vouch for, newest first
+    let bob = participant_keys(&credential(&[BOB, CA])).unwrap();
+    assert_eq!(bob.len(), 3);
+    assert!(bob[0] != bob[1] && bob[1] != bob[2] && bob[0] != bob[2]);
+    assert!(check(&[BOB, CA], BOB_PUBLIC_KEY, "2026-10-01").is_ok());
+
+    // the key of the certificate when it names none
+    let mallory = participant_keys(&credential(&[MALLORY, OTHER_CA])).unwrap();
+    assert_eq!(mallory.len(), 1);
+    assert!(mallory[0].ends_with(&bytes(MALLORY_PUBLIC_KEY)));
+
+    // none of a credential that is not a certificate
+    assert_eq!(
+        participant_keys(&Credential::new(CredentialType::Basic, b"alice".to_vec())),
+        Err(CertificateError::Malformed)
+    );
 }

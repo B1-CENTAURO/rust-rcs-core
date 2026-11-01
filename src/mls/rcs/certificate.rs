@@ -724,6 +724,35 @@ pub fn credential_tel_uris(credential: &Credential) -> Result<Vec<String>> {
     tel_uris(chain.first().ok_or(CertificateError::Malformed)?)
 }
 
+/// The Participant Key of the Client Certificate in `credential`, then the
+/// older keys its key rolls vouch for, newest first, each a DER encoded
+/// SubjectPublicKeyInfo (RCC.16 Annex A.3.8.9)
+///
+/// As the certificate was validated when its leaf joined the group, the
+/// signatures of the key rolls are not checked again.
+pub fn participant_keys(credential: &Credential) -> Result<Vec<Vec<u8>>> {
+    let chain = certificate_chain(credential)?;
+    let leaf = chain.first().ok_or(CertificateError::Malformed)?;
+    let value = raw_extension(leaf, PARTICIPANT_INFORMATION)
+        .ok_or(CertificateError::ParticipantInformation)?;
+    let info = ParticipantInformation::from_der(value)
+        .map_err(|_| CertificateError::ParticipantInformation)?;
+
+    let participant_key = info
+        .participant_key
+        .as_ref()
+        .unwrap_or(&leaf.tbs_certificate.subject_public_key_info);
+    std::iter::once(participant_key)
+        .chain(
+            info.participant_key_rolls
+                .iter()
+                .flatten()
+                .map(|roll| &roll.old_participant_key),
+        )
+        .map(|key| key.to_der().map_err(|_| CertificateError::Malformed))
+        .collect()
+}
+
 /// Whether the tel URIs `uri` and `expected` are of the same number
 pub fn same_tel_uri(uri: &str, expected: &str) -> bool {
     let number = |s: &str| {
