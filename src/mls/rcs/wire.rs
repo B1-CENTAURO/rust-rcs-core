@@ -162,6 +162,11 @@ pub enum DeliveryNotificationStatus {
 ///
 /// RCC.16 v4.0 leaves 4 out of the enum while keeping `<failed-to-decrypt>` in
 /// the XML schema; it keeps its v3.0 value.
+///
+/// Section 9.1.1 has a client refuse a message with `<expired-credential>`,
+/// which neither the enum nor the schema of section 7.7.2.3 has among the
+/// client's reasons; it takes the value after the last, 14, until RCC.16
+/// gives one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TlsSerialize, TlsDeserialize, TlsSize)]
 #[repr(u16)]
 pub enum ClientFailureReason {
@@ -179,11 +184,13 @@ pub enum ClientFailureReason {
     ProposalProcessedInEnhancedSelfHeal = 11,
     ProposalProcessedInSelfHeal = 12,
     ControlMessageFailed = 13,
+    /// A member's credential expired, as the message came (section 9.1.1)
+    ExpiredCredential = 14,
 }
 
 /// XML names of the schema in section 7.7.2.3, then the other spellings found
 /// in RCC.16 v4.0, only recognised
-const CLIENT_FAILURE_REASONS: [(ClientFailureReason, &str); 15] = [
+const CLIENT_FAILURE_REASONS: [(ClientFailureReason, &str); 16] = [
     (
         ClientFailureReason::MessageFromNonMember,
         "message-from-non-member",
@@ -227,6 +234,8 @@ const CLIENT_FAILURE_REASONS: [(ClientFailureReason, &str); 15] = [
         ClientFailureReason::ControlMessageFailed,
         "control-message-failed",
     ),
+    // section 9.1.1
+    (ClientFailureReason::ExpiredCredential, "expired-credential"),
     // sections 6.2.7 and 10.2
     (
         ClientFailureReason::InnerResentMessageFailureToDecrypt,

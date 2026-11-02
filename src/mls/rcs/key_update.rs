@@ -296,6 +296,24 @@ impl MlsConversation {
         })
     }
 
+    /// Whether a member's credential expired, or no longer passes the
+    /// validator otherwise, this client's own too, as this client tells the
+    /// time: a message is then not to be decrypted, and the group fixed with
+    /// a KeyPackage Update (RCC.16 sections 9.1.1, 9.5.4)
+    ///
+    /// Not those leaving, whose self_remove a Commit is to take.
+    pub fn has_expired_member(&self, client: &MlsClient) -> bool {
+        let leaving = self.leaving_members();
+        self.group
+            .members()
+            .filter(|member| !leaving.contains(&member.credential))
+            .any(|member| {
+                !client
+                    .validator()
+                    .validate(&member.credential, &member.signature_key)
+            })
+    }
+
     /// The credentials of the members besides this client and those leaving
     /// that `filter` keeps
     fn others(&self, filter: impl Fn(&Member) -> bool) -> Vec<Credential> {
