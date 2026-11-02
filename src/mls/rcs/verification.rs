@@ -117,18 +117,12 @@ fn hash_to_digits(digit_count: usize, hash: &[u8]) -> String {
         }
     }
 
+    // with leading zeros, which the digits taken or padded with are anyway
     let mut decimal: String = limbs
         .iter()
         .rev()
-        .enumerate()
-        .map(|(i, limb)| match i {
-            0 => limb.to_string(),
-            _ => format!("{:09}", limb),
-        })
+        .map(|limb| format!("{:09}", limb))
         .collect();
-    if decimal.is_empty() {
-        decimal.push('0');
-    }
     match decimal.len() >= digit_count {
         true => decimal.split_off(decimal.len() - digit_count),
         false => format!("{:0>width$}", decimal, width = digit_count),
