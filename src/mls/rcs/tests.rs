@@ -1761,6 +1761,32 @@ fn continuity_token() {
 }
 
 #[test]
+fn members_are_given_with_the_signature_keys_of_their_leaves() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (alice_conversation, _, _) = establish(&alice, &bob);
+
+    let members = alice_conversation.members_with_signature_keys();
+    assert_eq!(members.len(), 2);
+    for (member, expected) in [(&alice, "alice"), (&bob, "bob")] {
+        assert!(
+            members.iter().any(|(credential, signature_key)| {
+                credential == member.credential() && *signature_key == member.signer().public()
+            }),
+            "{}",
+            expected
+        );
+    }
+    assert_eq!(
+        members
+            .into_iter()
+            .map(|(credential, _)| credential)
+            .collect::<Vec<_>>(),
+        alice_conversation.members()
+    );
+}
+
+#[test]
 fn a_group_icon_encrypted_beforehand_is_committed_to() {
     let alice = client("alice");
     let bob = client("bob");

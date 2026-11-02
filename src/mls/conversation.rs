@@ -296,6 +296,15 @@ impl MlsConversation {
             .collect()
     }
 
+    /// The credentials of the members, each with the signature key of its
+    /// leaf, as a credential is validated with
+    pub fn members_with_signature_keys(&self) -> Vec<(Credential, Vec<u8>)> {
+        self.group
+            .members()
+            .map(|member| (member.credential, member.signature_key))
+            .collect()
+    }
+
     pub fn has_pending_commit(&self) -> bool {
         self.group.pending_commit().is_some()
     }
