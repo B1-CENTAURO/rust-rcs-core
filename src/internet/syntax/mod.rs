@@ -254,7 +254,7 @@ pub fn index_with_token_escaping(s: &[u8], b: u8) -> Option<usize> {
 /// let idx = rust_rcs_core::internet::syntax::index_skipping_ows_and_obs_fold(b);
 ///
 /// assert_eq!(idx, 24);
-/// assert_eq!(&b[idx..], b"title=\"Login to \\\"apps\\\"\", Basic realm=\"simple\"");
+/// assert_eq!(&b[idx..], b"title=\"Login to \\\"apps\\\"\", Basic realm=\"simple\"\n");
 /// ```
 pub fn index_skipping_ows_and_obs_fold(s: &[u8]) -> usize {
     let mut i = 0;

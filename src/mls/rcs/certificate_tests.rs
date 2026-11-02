@@ -877,6 +877,54 @@ fn members_whose_certificate_expired_are_to_be_replaced() {
 }
 
 #[test]
+fn a_member_expired_is_told_of_whoever_it_is_but_not_one_leaving() {
+    // as both certificates are valid, Bob's with 30 days left to be added
+    let now = Arc::new(AtomicU64::new(seconds("2026-10-01") + 3600));
+    let timed = |mut client: MlsClient| {
+        let now = now.clone();
+        client.set_clock(Arc::new(move || {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(now.load(Ordering::Relaxed))
+        }));
+        client
+    };
+    // Alice's certificate lasting until December, Bob's until November
+    let alice = timed(x509_client(
+        &[ALICE_RENEWED, CA],
+        ALICE_RENEWED_KEY,
+        ALICE_RENEWED_PUBLIC_KEY,
+        now.clone(),
+    ));
+    let bob = timed(x509_client(
+        &[BOB, CA],
+        BOB_KEY,
+        BOB_PUBLIC_KEY,
+        now.clone(),
+    ));
+    let mut alice_conversation = alice.create_conversation(None, 0).unwrap();
+    let key_package = bob.generate_key_package(false).unwrap();
+    let output = alice_conversation
+        .add_members(&alice, &[&key_package])
+        .unwrap();
+    alice_conversation.merge_pending_commit(&alice).unwrap();
+    let mut bob_conversation = bob
+        .join_conversation(&output.welcome.unwrap(), &output.ratchet_tree.unwrap())
+        .unwrap();
+    assert!(!alice_conversation.has_expired_member(&alice));
+    assert!(!bob_conversation.has_expired_member(&bob));
+
+    // Bob's expired: told of to Alice, and to Bob himself (RCC.16 section
+    // 9.1.1)
+    now.store(seconds("2026-11-02"), Ordering::Relaxed);
+    assert!(alice_conversation.has_expired_member(&alice));
+    assert!(bob_conversation.has_expired_member(&bob));
+
+    // not once he is leaving, his self_remove to be committed
+    let proposal = bob_conversation.leave(&bob).unwrap();
+    alice_conversation.process(&alice, &proposal).unwrap();
+    assert!(!alice_conversation.has_expired_member(&alice));
+}
+
+#[test]
 fn the_continuity_token_carries_over_to_a_new_era_of_the_same_participants() {
     use super::era::EraBase;
     use super::proto::MlsGroupInfo;

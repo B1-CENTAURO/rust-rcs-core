@@ -211,6 +211,21 @@ fn failure_reasons() {
         wire::encode(&ClientFailureReason::ControlMessageFailed).unwrap(),
         [0, 13]
     );
+
+    // the reason section 9.1.1 gives a client, which neither the enum nor the
+    // schema of section 7.7.2.3 has among a client's, after the last
+    assert_eq!(
+        ClientFailureReason::ExpiredCredential.xml_name(),
+        Some("expired-credential")
+    );
+    assert_eq!(
+        ClientFailureReason::from_xml_name(b"expired-credential"),
+        Some(ClientFailureReason::ExpiredCredential)
+    );
+    assert_eq!(
+        wire::encode(&ClientFailureReason::ExpiredCredential).unwrap(),
+        [0, 14]
+    );
 }
 
 #[test]
