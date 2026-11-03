@@ -4036,3 +4036,150 @@ fn a_welcome_takes_the_place_of_a_group_still_active_for_a_later_era_only() {
     assert_eq!(kept(), (Some(3), 2));
     assert!(joined.members().contains(carol.credential()));
 }
+
+#[test]
+fn encrypted_aliases() {
+    use base64::{engine::general_purpose, Engine as _};
+
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+
+    // a PrivateMessage, Base64 URL encoded without padding, as a SIP URI
+    // parameter can carry it (RCC.16 section 9.1.5)
+    let encoded = alice_conversation.encrypt_alias(&alice, "Alice ☺").unwrap();
+    assert!(
+        encoded
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "{}",
+        encoded
+    );
+    let message = general_purpose::URL_SAFE_NO_PAD.decode(&encoded).unwrap();
+    assert!(matches!(
+        MlsMessageIn::tls_deserialize_exact(&message)
+            .unwrap()
+            .extract(),
+        MlsMessageBodyIn::PrivateMessage(_)
+    ));
+
+    // decrypted by the other member, with who encrypted it, once
+    let (sender, alias) = bob_conversation
+        .decrypt_alias(&bob, encoded.as_bytes())
+        .unwrap();
+    assert_eq!(sender.serialized_content(), b"alice");
+    assert_eq!(alias, "Alice ☺");
+    assert!(bob_conversation
+        .decrypt_alias(&bob, encoded.as_bytes())
+        .is_err());
+
+    // padded, or in the standard alphabet RCC.16's example is in
+    for encode in [
+        |message: &[u8]| general_purpose::URL_SAFE.encode(message),
+        |message: &[u8]| general_purpose::STANDARD.encode(message),
+        |message: &[u8]| general_purpose::STANDARD_NO_PAD.encode(message),
+    ] {
+        let encoded = alice_conversation.encrypt_alias(&alice, "Alice").unwrap();
+        let message = general_purpose::URL_SAFE_NO_PAD.decode(&encoded).unwrap();
+        let (_, alias) = bob_conversation
+            .decrypt_alias(&bob, encode(&message).as_bytes())
+            .unwrap();
+        assert_eq!(alias, "Alice");
+    }
+
+    // padded as PADME prescribes: equal lengths within the same PADME range
+    let short = bob_conversation
+        .encrypt_alias(&bob, &"b".repeat(2000))
+        .unwrap();
+    let long = bob_conversation
+        .encrypt_alias(&bob, &"b".repeat(2010))
+        .unwrap();
+    assert_eq!(short.len(), long.len());
+
+    // refused: what is not Base64, nor UTF-8, an alias of another group
+    assert_eq!(
+        bob_conversation.decrypt_alias(&bob, b"not Base64!").err(),
+        Some(ErrorKind::BadFormat)
+    );
+    let not_utf8 = alice_conversation.encrypt(&alice, &[0xff, 0xfe]).unwrap();
+    assert_eq!(
+        bob_conversation
+            .decrypt_alias(
+                &bob,
+                general_purpose::URL_SAFE_NO_PAD.encode(not_utf8).as_bytes()
+            )
+            .err(),
+        Some(ErrorKind::BadFormat)
+    );
+    let (mut other_conversation, _, _) = establish(&alice, &bob);
+    let other = other_conversation.encrypt_alias(&alice, "Alice").unwrap();
+    assert!(bob_conversation
+        .decrypt_alias(&bob, other.as_bytes())
+        .is_err());
+
+    // and a Commit, which is no alias and is left alone
+    let output = alice_conversation.update_keys(&alice).unwrap();
+    assert_eq!(
+        bob_conversation
+            .decrypt_alias(
+                &bob,
+                general_purpose::URL_SAFE_NO_PAD
+                    .encode(&output.commit)
+                    .as_bytes()
+            )
+            .err(),
+        Some(ErrorKind::UnexpectedMessage)
+    );
+    assert_eq!(bob_conversation.epoch(), 1);
+
+    // one made while a Commit of the client is pending is in the epoch
+    // before it, as those in that epoch take it
+    let encoded = alice_conversation.encrypt_alias(&alice, "Alice").unwrap();
+    let (_, alias) = bob_conversation
+        .decrypt_alias(&bob, encoded.as_bytes())
+        .unwrap();
+    assert_eq!(alias, "Alice");
+}
+
+#[test]
+fn encrypted_alias_parameters() {
+    use crate::internet::name_addr::AsNameAddr;
+
+    assert_eq!(
+        alias::encrypted_alias(b"user=phone;encrypted-alias=aGVsbG8gd29ybGQ"),
+        Some(&b"aGVsbG8gd29ybGQ"[..])
+    );
+    assert_eq!(
+        alias::encrypted_alias(b"Encrypted-Alias=abc_-"),
+        Some(&b"abc_-"[..])
+    );
+    for parameters in [
+        &b""[..],
+        b"user=phone",
+        b"encrypted-alias",
+        b"encrypted-alias=",
+        b"encrypted-aliases=abc",
+    ] {
+        assert_eq!(
+            alias::encrypted_alias(parameters),
+            None,
+            "{}",
+            String::from_utf8_lossy(parameters)
+        );
+    }
+
+    // as a name-addr gives them, in angle brackets or not, as RCC.16's
+    // example has them
+    for from in [
+        &b"\"Alice\" <sip:+1234578901@operator.com;user=phone;encrypted-alias=aGVsbG8gd29ybGQ>"[..],
+        b"sip:+1234578901@operator.com;user=phone;encrypted-alias=aGVsbG8gd29ybGQ",
+    ] {
+        let addresses = from.as_name_addresses();
+        let uri_part = addresses[0].uri_part.as_ref().unwrap();
+        assert_eq!(uri_part.uri, b"sip:+1234578901@operator.com");
+        assert_eq!(
+            alias::encrypted_alias(uri_part.uri_parameters),
+            Some(&b"aGVsbG8gd29ybGQ"[..])
+        );
+    }
+}
