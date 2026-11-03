@@ -962,6 +962,88 @@ fn demuxer_aborts_a_message_that_fails_while_being_sent() {
     assert!(rest.len() < 4, "the rest is not sent: {:?}", flags);
 }
 
+/// The messages `chunks` carry, as their bodies, each chunk counted to the
+/// message before it while it has its Message-ID
+fn messages_of(chunks: &[MsrpChunk]) -> Vec<Vec<u8>> {
+    let mut messages: Vec<(String, Vec<u8>)> = Vec::new();
+    for chunk in chunks {
+        let message_id = header_of(chunk, "Message-ID").expect("a Message-ID");
+        let body = match parsed(chunk) {
+            Parsed::Request(_, _, _, body, _) => body.unwrap_or_default(),
+            other => panic!("{:?}", other),
+        };
+        match messages.last_mut() {
+            Some((last, data)) if *last == message_id => data.extend(body),
+            _ => messages.push((message_id, body)),
+        }
+    }
+    messages.into_iter().map(|(_, body)| body).collect()
+}
+
+/// A body to send, and its size
+type SentBody = (Box<dyn Read + Send + Sync>, usize);
+
+/// Starts sending each of `bodies` with `demuxer`, one after the other, from
+/// a task of `rt`, as a chat session does, their chunks queued on `tx`
+fn start_in_a_task(
+    demuxer: &Arc<MsrpDemuxer>,
+    bodies: Vec<SentBody>,
+    tx: mpsc::Sender<MsrpChunk>,
+    rt: &Arc<Runtime>,
+) {
+    let (demuxer, rt_) = (Arc::clone(demuxer), Arc::clone(rt));
+    rt.spawn(async move {
+        for (body, total) in bodies {
+            demuxer.start(
+                ALICE.as_bytes().to_vec(),
+                BOB.as_bytes().to_vec(),
+                Some(b"text/plain".to_vec()),
+                total,
+                body,
+                |_, _| {},
+                tx.clone(),
+                &rt_,
+            );
+        }
+    });
+}
+
+#[test]
+fn messages_go_in_the_order_they_are_started() {
+    // the chunks of each before those of the next, the connection taking
+    // one chunk at a time
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = Arc::new(demuxer());
+    let (tx, mut rx) = mpsc::channel(1);
+    let mut bodies = vec![vec![b'a'; 25 * 1024]];
+    bodies.extend((1..10).map(|i| format!("message {}", i).into_bytes()));
+    let readers = bodies
+        .iter()
+        .map(|body| -> SentBody { (Box::new(std::io::Cursor::new(body.clone())), body.len()) })
+        .collect();
+    start_in_a_task(&demuxer, readers, tx, &rt);
+
+    let chunks = sent_chunks(&rt, &mut rx, 3 + 9);
+    assert_eq!(messages_of(&chunks), bodies);
+}
+
+#[test]
+fn a_message_that_fails_does_not_hold_back_the_next() {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let demuxer = Arc::new(demuxer());
+    let (tx, mut rx) = mpsc::channel(8);
+    let readers: Vec<SentBody> = vec![
+        (Box::new(FailingReader(Some(b"Hello".to_vec()))), 11),
+        (Box::new(std::io::Cursor::new(b"next".to_vec())), 4),
+    ];
+    start_in_a_task(&demuxer, readers, tx, &rt);
+
+    let chunks = sent_chunks(&rt, &mut rx, 2);
+    assert_eq!(messages_of(&chunks), [b"Hello".to_vec(), b"next".to_vec()]);
+    assert_eq!(flag_of(&chunks[0]), '#');
+    assert_eq!(flag_of(&chunks[1]), '$');
+}
+
 #[test]
 fn a_failure_report_fails_the_session() {
     let rt = Arc::new(Runtime::new().unwrap());
