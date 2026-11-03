@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 
 use crate::internet::header::Header;
@@ -95,6 +95,9 @@ pub struct MsrpDemuxer {
     pub from_path: Vec<u8>,
     pub to_path: Vec<u8>,
     waitlist: Waitlist,
+    // the message started last, which the next waits for to have its
+    // chunks queued: told when it has, or has ended
+    last_started: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl MsrpDemuxer {
@@ -103,6 +106,7 @@ impl MsrpDemuxer {
             from_path,
             to_path,
             waitlist: Arc::default(),
+            last_started: Mutex::new(None),
         }
     }
 
@@ -121,6 +125,10 @@ impl MsrpDemuxer {
     /// message that fails while it is being sent is aborted with a chunk
     /// ending in #. Once the session has failed, see `session_failure`, `c`
     /// gets its status and nothing is sent.
+    ///
+    /// Messages go in the order they are started: the chunks of one are all
+    /// queued on `tx` before those of the next. A message that waits for the
+    /// responses to its chunks does not hold back the next.
     pub fn start<R, C>(
         &self,
         from_path: Vec<u8>,
@@ -187,7 +195,17 @@ impl MsrpDemuxer {
         // is dropped inside one of its tasks
         let rt_ = rt.handle().clone();
 
+        // after the message started before it, which tells it once its
+        // chunks are queued, or it has ended, by dropping its sender
+        let (queued_tx, queued_rx) = oneshot::channel::<()>();
+        let previous = self.last_started.lock().unwrap().replace(queued_rx);
+
         rt.spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let _queued = queued_tx;
+
             let message_id = rand::create_raw_alpha_numeric_string(16);
 
             {
