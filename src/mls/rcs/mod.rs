@@ -18,6 +18,7 @@
 //! The interface between a client and its Home KDS is vendor specific
 //! (RCC.16 section 5.1), so fetching and uploading KeyPackages is left to the caller.
 
+pub mod alias;
 pub mod certificate;
 pub mod era;
 pub mod file;
