@@ -58,6 +58,8 @@ pub enum ErrorKind {
     InvalidCredential,
     /// The message failed MLS validation (signature, epoch, membership...)
     Rejected,
+    /// The input was taken before, or is too old to tell whether it was
+    Replayed,
     /// The operation is not allowed in the current group state
     InvalidState,
     /// Key generation or another cryptographic operation failed
