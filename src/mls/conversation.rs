@@ -305,6 +305,19 @@ impl MlsConversation {
             .collect()
     }
 
+    /// The leaf of this client in the ratchet tree
+    pub fn own_leaf_index(&self) -> u32 {
+        self.group.own_leaf_index().u32()
+    }
+
+    /// The leaf of the member holding `credential`, if one does
+    pub fn leaf_index_of(&self, credential: &Credential) -> Option<u32> {
+        self.group
+            .members()
+            .find(|member| &member.credential == credential)
+            .map(|member| member.index.u32())
+    }
+
     pub fn has_pending_commit(&self) -> bool {
         self.group.pending_commit().is_some()
     }
