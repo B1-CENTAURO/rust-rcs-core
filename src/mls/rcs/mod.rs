@@ -29,6 +29,7 @@ pub mod messaging;
 pub mod metadata;
 pub mod proto;
 pub mod resend;
+pub mod sframe;
 pub mod verification;
 pub mod wire;
 
