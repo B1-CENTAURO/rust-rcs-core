@@ -58,6 +58,9 @@ fn headers_are_encoded_and_decoded_as_rfc_9605_has_them() {
         frame.extend_from_slice(b"rest");
         assert_eq!(Header::decode(&frame), Ok((header, encoded.len())));
     }
+    // the largest values the config byte carries, and the smallest it does not
+    assert_eq!(Header { kid: 7, ctr: 7 }.encode(), [0x77]);
+    assert_eq!(Header { kid: 8, ctr: 0 }.encode(), [0x80, 0x08]);
 
     // none, or cut short
     assert_eq!(Header::decode(&[]), Err(ErrorKind::BadFormat));
