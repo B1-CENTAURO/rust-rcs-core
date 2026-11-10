@@ -249,6 +249,18 @@ fn the_members_of_a_group_take_each_others_frames() {
         alices.sframe_base_key(&alice, suite),
         bobs.sframe_base_key(&bob, suite)
     );
+    // exported as RFC 9605 section 5.2 has it, Nk bytes under its label
+    assert_eq!(
+        alices.sframe_base_key(&alice, suite),
+        alices.export_secret(&alice, "SFrame 1.0 Base Key", b"", 16)
+    );
+    assert_eq!(
+        alices
+            .sframe_base_key(&alice, CipherSuite::AesCtr128HmacSha256_80)
+            .unwrap()
+            .len(),
+        48
+    );
     assert_eq!(alices.own_leaf_index(), 0);
     assert_eq!(bobs.own_leaf_index(), 1);
     assert_eq!(alices.leaf_index_of(&bobs.members()[1]), Some(1));
@@ -432,6 +444,22 @@ fn the_keys_of_old_epochs_are_let_go_of() {
     let mut forty = SframeSession::new(suite, DEFAULT_LAYOUT, 0, 1, 40, base_key(40)).unwrap();
     let of_forty = forty.encrypt(b"", b"in epoch 40").unwrap();
     assert_eq!(late.decrypt(b"", &of_forty).unwrap().epoch, 40);
+
+    // the group moving many epochs at once, those before that the Key IDs
+    // no longer tell apart from the latest are let go of, whatever how many
+    // are kept
+    let mut one = SframeSession::new(suite, DEFAULT_LAYOUT, 0, 1, 1, base_key(1)).unwrap();
+    let mut jumping = SframeSession::new(suite, DEFAULT_LAYOUT, 0, 0, 1, base_key(1)).unwrap();
+    jumping.epoch_advanced(2, base_key(2), 0);
+    assert!(jumping.switch_to_new_epoch());
+    let of_one = one.encrypt(b"", b"in epoch 1").unwrap();
+    assert_eq!(jumping.decrypt(b"", &of_one).unwrap().epoch, 1);
+    jumping.epoch_advanced(30, base_key(30), 1);
+    assert_eq!(jumping.decrypt(b"", &of_one), Err(ErrorKind::UnknownMember));
+    assert_eq!(jumping.sending_epoch(), 2);
+    let mut two = SframeSession::new(suite, DEFAULT_LAYOUT, 0, 1, 2, base_key(2)).unwrap();
+    let of_two = two.encrypt(b"", b"in epoch 2").unwrap();
+    assert_eq!(jumping.decrypt(b"", &of_two).unwrap().epoch, 2);
 }
 
 #[test]
