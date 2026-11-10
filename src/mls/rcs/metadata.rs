@@ -471,16 +471,64 @@ pub(crate) fn take_pending_epoch(
     client: &MlsClient,
     group_id: &[u8],
 ) -> Result<Option<PendingEpoch>> {
-    let key = pending_epoch_key(group_id);
-    let pending = match client.provider().read_value(&key)? {
-        Some(value) => Some(
+    let pending = read_pending_epoch(client, group_id)?;
+    client
+        .provider()
+        .remove_value(&pending_epoch_key(group_id))?;
+    Ok(pending)
+}
+
+fn read_pending_epoch(client: &MlsClient, group_id: &[u8]) -> Result<Option<PendingEpoch>> {
+    match client.provider().read_value(&pending_epoch_key(group_id))? {
+        Some(value) => Ok(Some(
             PendingEpoch::tls_deserialize_exact(value.as_slice())
                 .map_err(fail("pending epoch decoding", ErrorKind::Storage))?,
-        ),
-        None => None,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// What is noted of the epoch of `epoch_authenticator` that a pending Commit
+/// of this client leads to, if the note is of that epoch
+fn pending_epoch_of(
+    client: &MlsClient,
+    group_id: &[u8],
+    epoch_authenticator: &[u8],
+) -> Result<Option<PendingEpoch>> {
+    Ok(read_pending_epoch(client, group_id)?
+        .filter(|pending| pending.epoch_authenticator.as_slice() == epoch_authenticator))
+}
+
+/// The key generations used already in the epoch of `epoch_authenticator`
+/// that a pending Commit of this client leads to
+pub(crate) fn used_generations(
+    client: &MlsClient,
+    group_id: &[u8],
+    epoch_authenticator: &[u8],
+) -> Result<u32> {
+    Ok(pending_epoch_of(client, group_id, epoch_authenticator)?
+        .map_or(0, |pending| pending.used_generations))
+}
+
+/// Notes `used_generations` key generations as used in the epoch of
+/// `epoch_authenticator` that a pending Commit of this client leads to,
+/// keeping the GroupMetadataKeys noted for it
+pub(crate) fn set_used_generations(
+    client: &MlsClient,
+    group_id: &[u8],
+    epoch_authenticator: &[u8],
+    used_generations: u32,
+) -> Result<()> {
+    let metadata = pending_epoch_of(client, group_id, epoch_authenticator)?
+        .and_then(|pending| pending.metadata);
+    let pending = PendingEpoch {
+        epoch_authenticator: epoch_authenticator.into(),
+        used_generations,
+        metadata,
     };
-    client.provider().remove_value(&key)?;
-    Ok(pending)
+    client
+        .provider()
+        .write_value(pending_epoch_key(group_id), wire::encode(&pending)?)
 }
 
 impl MlsConversation {

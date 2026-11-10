@@ -1165,6 +1165,40 @@ impl MlsConversation {
             .map_err(fail("staging Commit", ErrorKind::InvalidState))
     }
 
+    /// What `make` makes of the group in the epoch the pending Commit of this
+    /// client leads to: on a copy of the client with the Commit applied, after
+    /// the key generations used in that epoch already, as commit_output() uses
+    /// them; once the Commit is applied to the group itself, it skips those
+    /// `make` used too. InvalidState if no Commit of this client is pending.
+    pub(crate) fn in_next_epoch<T>(
+        &mut self,
+        client: &MlsClient,
+        make: impl FnOnce(&mut MlsConversation, &MlsClient) -> Result<T>,
+    ) -> Result<T> {
+        let epoch_authenticator = self
+            .group
+            .pending_commit()
+            .and_then(|staged_commit| staged_commit.epoch_authenticator())
+            .ok_or(ErrorKind::InvalidState)?
+            .as_slice()
+            .to_vec();
+        let used = metadata::used_generations(client, self.group_id(), &epoch_authenticator)?;
+
+        let fork = client.fork()?;
+        let mut next = fork.load_conversation(self.group_id())?;
+        next.group
+            .merge_pending_commit(fork.provider())
+            .map_err(fail("trying out own Commit", ErrorKind::InvalidState))?;
+        for _ in 0..used {
+            next.encrypt_with_aad(&fork, &[], Vec::new())?;
+        }
+        let made = make(&mut next, &fork)?;
+
+        let used = next.key_generation(&fork)?;
+        metadata::set_used_generations(client, self.group_id(), &epoch_authenticator, used)?;
+        Ok(made)
+    }
+
     /// Collects what the Conversation Focus needs next to a Commit of this client
     ///
     /// The GroupInfo has to commit to the continuity token at the epoch

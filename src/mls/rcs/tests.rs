@@ -4141,6 +4141,103 @@ fn encrypted_aliases() {
     assert_eq!(alias, "Alice");
 }
 
+/// The key generation the next message of `sender` is encrypted with, as
+/// `receiver` takes it
+fn next_key_generation(
+    (sender_conversation, sender): (&mut MlsConversation, &MlsClient),
+    (receiver_conversation, receiver): (&mut MlsConversation, &MlsClient),
+) -> u32 {
+    let message = sender_conversation
+        .encrypt_cpim(sender, b"hi", b"msg-next", b"")
+        .unwrap();
+    match receiver_conversation.process(receiver, &message).unwrap() {
+        IncomingMessage::Application { data, .. } => {
+            wire::decode::<SecretPayload>(&data).unwrap().key_generation
+        }
+        _ => panic!("expected an application message"),
+    }
+}
+
+#[test]
+fn an_alias_is_encrypted_in_the_epoch_a_pending_commit_leads_to() {
+    let alice = client("alice");
+    let bob = client("bob");
+
+    // the first Commit of a group: in the epoch those it adds join in, which
+    // they could not decrypt an alias of the epoch before in
+    let key_package = bob.generate_key_package(false).unwrap();
+    let mut alices = alice.create_conversation(None, 2).unwrap();
+    assert_eq!(
+        alices.encrypt_alias_after_commit(&alice, "Alice").err(),
+        Some(ErrorKind::InvalidState)
+    );
+    let output = alices.add_members(&alice, &[&key_package]).unwrap();
+    let before = alices.encrypt_alias(&alice, "Alice").unwrap();
+    let after = alices.encrypt_alias_after_commit(&alice, "Alice").unwrap();
+    assert_eq!(alices.epoch(), 0);
+    let bundle = accept(&output);
+    let mut bobs = bob
+        .join_conversation(&bundle.welcome, &bundle.ratchet_tree)
+        .unwrap();
+    assert!(bobs.decrypt_alias(&bob, before.as_bytes()).is_err());
+    let (sender, alias) = bobs.decrypt_alias(&bob, after.as_bytes()).unwrap();
+    assert_eq!(sender.serialized_content(), b"alice");
+    assert_eq!(alias, "Alice");
+    // the generation it took skipped once the Commit is applied
+    alices.process_commit_bundle(&alice, &bundle).unwrap();
+    assert_eq!(
+        next_key_generation((&mut alices, &alice), (&mut bobs, &bob)),
+        1
+    );
+
+    // after a PrivateMessage bundled with a Commit, which keeps the keys it
+    // gives once applied
+    let (mut alice_conversation, mut bob_conversation, _) = establish(&alice, &bob);
+    let (output, _) = alice_conversation
+        .set_group_subject(&alice, "Holidays", b"msg-subject")
+        .unwrap();
+    let first = alice_conversation
+        .encrypt_alias_after_commit(&alice, "Alice")
+        .unwrap();
+    let second = alice_conversation
+        .encrypt_alias_after_commit(&alice, "Alice again")
+        .unwrap();
+    let bundle = accept(&output);
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    match bob_conversation
+        .process_commit_bundle(&bob, &bundle)
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { .. }, IncomingMessage::GroupMetadataKeys { subject, .. }] => {
+            assert!(*subject)
+        }
+        _ => panic!("expected a Commit with group metadata keys"),
+    }
+    for (encoded, told) in [(&second, "Alice again"), (&first, "Alice")] {
+        let (_, alias) = bob_conversation
+            .decrypt_alias(&bob, encoded.as_bytes())
+            .unwrap();
+        assert_eq!(alias, told);
+    }
+    assert!(alice_conversation
+        .group_metadata(&alice)
+        .unwrap()
+        .group_subject_icon_keys
+        .unwrap()
+        .subject
+        .is_some());
+    assert_eq!(
+        next_key_generation(
+            (&mut alice_conversation, &alice),
+            (&mut bob_conversation, &bob)
+        ),
+        3
+    );
+}
+
 #[test]
 fn encrypted_alias_parameters() {
     use crate::internet::name_addr::AsNameAddr;

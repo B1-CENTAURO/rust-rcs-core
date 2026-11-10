@@ -64,10 +64,27 @@ impl MlsConversation {
     ///
     /// It takes a generation of the client's keys, as a message does. One
     /// made while a Commit of the client is pending is in the epoch before
-    /// it, which those the Commit adds cannot decrypt.
+    /// it, which those the Commit adds cannot decrypt:
+    /// encrypt_alias_after_commit() makes it in the epoch after.
     pub fn encrypt_alias(&mut self, client: &MlsClient, alias: &str) -> Result<String> {
         let message = self.encrypt(client, alias.as_bytes())?;
         Ok(URL_SAFE.encode(message))
+    }
+
+    /// `alias` encrypted as encrypt_alias() does, in the epoch the pending
+    /// Commit of the client leads to: for the INVITE carrying the first
+    /// Commit of a group, which those it invites join the group in (RCC.16
+    /// section 9.1.5)
+    ///
+    /// It is encrypted as a PrivateMessage bundled with the Commit is, after
+    /// it, and the generation it takes is skipped as well once the Commit is
+    /// applied. InvalidState if no Commit of the client is pending.
+    pub fn encrypt_alias_after_commit(
+        &mut self,
+        client: &MlsClient,
+        alias: &str,
+    ) -> Result<String> {
+        self.in_next_epoch(client, |next, fork| next.encrypt_alias(fork, alias))
     }
 
     /// The alias the `encrypted-alias` parameter `encoded` carries, decrypted
