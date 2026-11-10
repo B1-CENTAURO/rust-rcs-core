@@ -21,7 +21,8 @@
 //! exports a base key, from which every sender derives its own key by its Key
 //! ID, which carries its leaf index in the group and the low bits of the
 //! epoch. An SframeSession keeps those keys, and switches to those of a new
-//! epoch as RCC.16 section 9.8.2 has it, the committer first.
+//! epoch as RCC.16 section 9.8.2 has it, the committer first, and takes each
+//! frame of a sender once (RFC 9605 section 9.3).
 //!
 //! The media themselves, their packetization and their transport, are the
 //! app's: frames are handed in and out as bytes.
@@ -259,6 +260,8 @@ impl SframeKey {
 
     /// The header and the frame that `encrypted` carries, encrypted with this
     /// key, `metadata` authenticated with it; Rejected if it does not open
+    ///
+    /// The frame is not checked against replays, as in an SframeSession.
     pub fn decrypt(&self, metadata: &[u8], encrypted: &[u8]) -> Result<(Header, Vec<u8>)> {
         let (header, header_len) = Header::decode(encrypted)?;
         let frame = self.decrypt_after(&header, header_len, metadata, encrypted)?;
@@ -472,12 +475,79 @@ pub struct DecryptedFrame {
     pub frame: Vec<u8>,
 }
 
+/// How many counters before the latest of a Key ID an SframeSession still
+/// takes frames of, each once (RFC 9605 section 9.3)
+pub const REPLAY_WINDOW: u64 = 128;
+
+/// The counters of the frames taken under a Key ID: the latest, and which of
+/// the REPLAY_WINDOW before it
+#[derive(Default)]
+struct ReplayWindow {
+    latest: Option<u64>,
+    /// Bit `i` set if the counter `latest - i` was taken
+    taken: u128,
+}
+
+impl ReplayWindow {
+    /// Whether a frame of the counter `ctr` may be taken: one after the
+    /// latest, or one of the window not taken yet
+    fn admits(&self, ctr: u64) -> bool {
+        let Some(latest) = self.latest else {
+            return true;
+        };
+        if ctr > latest {
+            return true;
+        }
+        let behind = latest - ctr;
+        behind < REPLAY_WINDOW && self.taken & 1 << behind == 0
+    }
+
+    /// Takes the counter `ctr`, of a frame that opened
+    fn take(&mut self, ctr: u64) {
+        match self.latest {
+            Some(latest) if ctr <= latest => {
+                let behind = latest - ctr;
+                if behind < REPLAY_WINDOW {
+                    self.taken |= 1 << behind;
+                }
+            }
+            Some(latest) => {
+                let ahead = ctr - latest;
+                let kept = if ahead < REPLAY_WINDOW {
+                    self.taken << ahead
+                } else {
+                    0
+                };
+                self.taken = kept | 1;
+                self.latest = Some(ctr);
+            }
+            None => {
+                self.taken = 1;
+                self.latest = Some(ctr);
+            }
+        }
+    }
+}
+
 /// The keys of an epoch
 struct EpochKeys {
     epoch: u64,
     base_key: Vec<u8>,
     /// Those derived, by Key ID
     derived: HashMap<u64, SframeKey>,
+    /// The counters taken, by Key ID
+    replays: HashMap<u64, ReplayWindow>,
+}
+
+impl EpochKeys {
+    fn new(epoch: u64, base_key: Vec<u8>) -> EpochKeys {
+        EpochKeys {
+            epoch,
+            base_key,
+            derived: HashMap::new(),
+            replays: HashMap::new(),
+        }
+    }
 }
 
 impl EpochKeys {
@@ -502,7 +572,12 @@ impl EpochKeys {
 /// once a frame of the committer in the new epoch comes. A committer sending
 /// no media sends an empty frame then, for the others to switch.
 ///
-/// Frames are not checked against replays.
+/// The frames of each Key ID are taken once each: one of a counter taken
+/// already, or more than REPLAY_WINDOW behind the latest taken, is Replayed
+/// (RFC 9605 section 9.3). A session made again for a leaf, in an epoch it
+/// sent in already, is to send under another `context_id`: its counter
+/// starts again at 0, a counter is never to be used twice with the same key,
+/// and the others would take its frames as replayed.
 pub struct SframeSession {
     suite: CipherSuite,
     layout: KidLayout,
@@ -537,11 +612,7 @@ impl SframeSession {
             layout,
             context_id,
             leaf_index,
-            epochs: VecDeque::from([EpochKeys {
-                epoch,
-                base_key,
-                derived: HashMap::new(),
-            }]),
+            epochs: VecDeque::from([EpochKeys::new(epoch, base_key)]),
             sending: epoch,
             next_ctr: 0,
             pending: None,
@@ -596,11 +667,7 @@ impl SframeSession {
         {
             return;
         }
-        self.epochs.push_back(EpochKeys {
-            epoch,
-            base_key,
-            derived: HashMap::new(),
-        });
+        self.epochs.push_back(EpochKeys::new(epoch, base_key));
         self.pending = Some((epoch, committer));
         self.let_go_of_old_epochs();
     }
@@ -678,7 +745,9 @@ impl SframeSession {
 
     /// The frame that `encrypted` carries, `metadata` authenticated with it,
     /// in the epoch of those kept its Key ID tells (RFC 9605 section 4.4.4);
-    /// UnknownMember if no epoch kept is its, Rejected if it does not open
+    /// UnknownMember if no epoch kept is its, Replayed if its counter was
+    /// taken already or is too old to tell (section 9.3), Rejected if it does
+    /// not open
     ///
     /// A frame of the committer in the epoch to switch to has the session
     /// send in it from now on (RCC.16 section 9.8.2).
@@ -694,9 +763,18 @@ impl SframeSession {
             .find(|keys| (keys.epoch & mask) == parts.epoch_bits)
             .ok_or(ErrorKind::UnknownMember)?;
         let epoch = keys.epoch;
+        if keys
+            .replays
+            .get(&header.kid)
+            .is_some_and(|window| !window.admits(header.ctr))
+        {
+            return Err(ErrorKind::Replayed);
+        }
         let frame = keys
             .key(suite, header.kid)?
             .decrypt_after(&header, header_len, metadata, encrypted)?;
+        // only once it opened, so that a forged header takes no counter
+        keys.replays.entry(header.kid).or_default().take(header.ctr);
         if self.pending == Some((epoch, parts.leaf_index)) && parts.leaf_index != self.leaf_index {
             self.switch_to_new_epoch();
         }

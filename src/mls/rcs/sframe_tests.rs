@@ -22,6 +22,7 @@ use super::super::super::{
 };
 use super::{
     open, seal, CipherSuite, Header, KidLayout, KidParts, SframeKey, SframeSession, DEFAULT_LAYOUT,
+    REPLAY_WINDOW,
 };
 
 const VECTORS: &str = include_str!("testdata/sframe-test-vectors.json");
@@ -308,6 +309,12 @@ fn the_members_of_a_group_take_each_others_frames() {
     let (carols, _) = alice_and_bob(&carol, &dave);
     let mut carols_video = session(&carols, &carol);
     let elsewhere = carols_video.encrypt(b"", b"frame of carol").unwrap();
+    // under the Key ID of Alice, of a counter of hers taken already
+    assert_eq!(
+        bobs_video.decrypt(b"", &elsewhere),
+        Err(ErrorKind::Replayed)
+    );
+    let elsewhere = carols_video.encrypt(b"", b"frame of carol").unwrap();
     assert_eq!(
         bobs_video.decrypt(b"", &elsewhere),
         Err(ErrorKind::Rejected)
@@ -335,6 +342,7 @@ fn a_new_epoch_is_sent_in_once_the_committer_switches_to_it() {
     assert_eq!(alices_video.sending_epoch(), 1);
     assert_eq!(bobs_video.sending_epoch(), 1);
     let old = alices_video.encrypt(b"", b"in epoch 1").unwrap();
+    let late = alices_video.encrypt(b"", b"late in epoch 1").unwrap();
     assert_eq!(bobs_video.decrypt(b"", &old).unwrap().epoch, 1);
     let old_of_bob = bobs_video.encrypt(b"", b"bob in epoch 1").unwrap();
     assert_eq!(alices_video.decrypt(b"", &old_of_bob).unwrap().epoch, 1);
@@ -361,8 +369,12 @@ fn a_new_epoch_is_sent_in_once_the_committer_switches_to_it() {
     assert_eq!(alices_video.pending_epoch(), None);
     let newer = alices_video.encrypt(b"", b"in epoch 2").unwrap();
     assert_eq!(bobs_video.decrypt(b"", &newer).unwrap().epoch, 2);
-    // the frames of the epoch before still taken
-    assert_eq!(bobs_video.decrypt(b"", &old).unwrap().frame, b"in epoch 1");
+    // the frames of the epoch before still taken, once
+    assert_eq!(
+        bobs_video.decrypt(b"", &late).unwrap().frame,
+        b"late in epoch 1"
+    );
+    assert_eq!(bobs_video.decrypt(b"", &old), Err(ErrorKind::Replayed));
 }
 
 #[test]
@@ -393,9 +405,10 @@ fn a_frame_of_another_than_the_committer_does_not_switch_to_the_new_epoch() {
     alices_video.epoch_advanced(2, base_key(9), 0);
     alices_video.epoch_advanced(1, base_key(9), 0);
     assert_eq!(alices_video.pending_epoch(), Some(2));
+    let again = bobs_video.encrypt(b"", b"bob in epoch 2 again").unwrap();
     assert_eq!(
-        alices_video.decrypt(b"", &of_bob).unwrap().frame,
-        b"bob in epoch 2"
+        alices_video.decrypt(b"", &again).unwrap().frame,
+        b"bob in epoch 2 again"
     );
 }
 
@@ -405,6 +418,7 @@ fn the_keys_of_old_epochs_are_let_go_of() {
     let base_key = |epoch: u64| vec![epoch as u8; 16];
     let mut sender = SframeSession::new(suite, DEFAULT_LAYOUT, 0, 1, 1, base_key(1)).unwrap();
     let mut receiver = SframeSession::new(suite, DEFAULT_LAYOUT, 0, 0, 1, base_key(1)).unwrap();
+    // a frame of each epoch for later
     let mut frames = vec![sender.encrypt(b"", b"in epoch 1").unwrap()];
     for epoch in 2..=6 {
         sender.epoch_advanced(epoch, base_key(epoch), 1);
@@ -414,7 +428,7 @@ fn the_keys_of_old_epochs_are_let_go_of() {
         // the receiver switching with each frame of the committer
         assert_eq!(receiver.decrypt(b"", &frame).unwrap().epoch, epoch);
         assert_eq!(receiver.sending_epoch(), epoch);
-        frames.push(frame);
+        frames.push(sender.encrypt(b"", b"later").unwrap());
     }
     // so keeping the 3 epochs before the one it sends in, 6
     assert_eq!(
@@ -460,6 +474,70 @@ fn the_keys_of_old_epochs_are_let_go_of() {
     let mut two = SframeSession::new(suite, DEFAULT_LAYOUT, 0, 1, 2, base_key(2)).unwrap();
     let of_two = two.encrypt(b"", b"in epoch 2").unwrap();
     assert_eq!(jumping.decrypt(b"", &of_two).unwrap().epoch, 2);
+}
+
+#[test]
+fn the_frames_of_a_sender_are_taken_once() {
+    let suite = CipherSuite::AesGcm128Sha256;
+    let base_key = |epoch: u64| vec![epoch as u8; 16];
+    let mut sender = SframeSession::new(suite, DEFAULT_LAYOUT, 0, 1, 1, base_key(1)).unwrap();
+    let mut receiver = SframeSession::new(suite, DEFAULT_LAYOUT, 0, 0, 1, base_key(1)).unwrap();
+    let frames: Vec<Vec<u8>> = (0..300)
+        .map(|_| sender.encrypt(b"", b"frame").unwrap())
+        .collect();
+    let take = |receiver: &mut SframeSession, ctr: usize| {
+        receiver
+            .decrypt(b"", &frames[ctr])
+            .map(|decrypted| decrypted.frame)
+    };
+    let taken = Ok(b"frame".to_vec());
+    let replayed = Err(ErrorKind::Replayed);
+
+    // once each, those coming late too (RFC 9605 section 9.3)
+    assert_eq!(take(&mut receiver, 0), taken);
+    assert_eq!(take(&mut receiver, 0), replayed);
+    assert_eq!(take(&mut receiver, 5), taken);
+    assert_eq!(take(&mut receiver, 5), replayed);
+    assert_eq!(take(&mut receiver, 3), taken);
+    assert_eq!(take(&mut receiver, 3), replayed);
+    assert_eq!(take(&mut receiver, 4), taken);
+    // as long as they are within REPLAY_WINDOW of the latest
+    assert_eq!(REPLAY_WINDOW, 128);
+    assert_eq!(take(&mut receiver, 133), taken);
+    assert_eq!(take(&mut receiver, 133), replayed);
+    assert_eq!(take(&mut receiver, 5), replayed);
+    assert_eq!(take(&mut receiver, 6), taken);
+    assert_eq!(take(&mut receiver, 6), replayed);
+    // those taken moving down the window as later ones come
+    assert_eq!(take(&mut receiver, 140), taken);
+    assert_eq!(take(&mut receiver, 133), replayed);
+    assert_eq!(take(&mut receiver, 6), replayed);
+    assert_eq!(take(&mut receiver, 134), taken);
+    // a later one past the window
+    assert_eq!(take(&mut receiver, 299), taken);
+    assert_eq!(take(&mut receiver, 171), replayed);
+    assert_eq!(take(&mut receiver, 172), taken);
+    assert_eq!(take(&mut receiver, 298), taken);
+    assert_eq!(take(&mut receiver, 299), replayed);
+
+    // a frame that does not open takes no counter, so that one forged keeps
+    // none out
+    let mut forged = frames[250].clone();
+    *forged.last_mut().unwrap() ^= 1;
+    assert_eq!(receiver.decrypt(b"", &forged), Err(ErrorKind::Rejected));
+    assert_eq!(take(&mut receiver, 250), taken);
+
+    // nor are the counters of another sender, or of another epoch, those of
+    // this one
+    let mut other = SframeSession::new(suite, DEFAULT_LAYOUT, 0, 2, 1, base_key(1)).unwrap();
+    let of_other = other.encrypt(b"", b"of another").unwrap();
+    assert_eq!(receiver.decrypt(b"", &of_other).unwrap().leaf_index, 2);
+    sender.epoch_advanced(2, base_key(2), 1);
+    assert!(sender.switch_to_new_epoch());
+    receiver.epoch_advanced(2, base_key(2), 1);
+    let in_new_epoch = sender.encrypt(b"", b"in epoch 2").unwrap();
+    assert_eq!(Header::decode(&in_new_epoch).unwrap().0.ctr, 0);
+    assert_eq!(receiver.decrypt(b"", &in_new_epoch).unwrap().epoch, 2);
 }
 
 #[test]
