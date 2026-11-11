@@ -4183,8 +4183,12 @@ fn an_alias_is_encrypted_in_the_epoch_a_pending_commit_leads_to() {
     let (sender, alias) = bobs.decrypt_alias(&bob, after.as_bytes()).unwrap();
     assert_eq!(sender.serialized_content(), b"alice");
     assert_eq!(alias, "Alice");
-    // the generation it took skipped once the Commit is applied
+    // the generation it took skipped once the Commit is applied, nothing
+    // left noted of it then
     alices.process_commit_bundle(&alice, &bundle).unwrap();
+    assert!(metadata::take_pending_epoch(&alice, alices.group_id())
+        .unwrap()
+        .is_none());
     assert_eq!(
         next_key_generation((&mut alices, &alice), (&mut bobs, &bob)),
         1
@@ -4236,6 +4240,44 @@ fn an_alias_is_encrypted_in_the_epoch_a_pending_commit_leads_to() {
         ),
         3
     );
+}
+
+#[test]
+fn what_is_noted_of_another_epoch_is_not_taken_for_the_one_a_commit_leads_to() {
+    let alice = client("alice");
+    let group_id = b"group";
+    let keys = proto::GroupMetadataKeys::default();
+
+    // as one left of a Commit not applied: neither its generations nor its
+    // keys
+    metadata::set_pending_epoch(&alice, group_id, b"another epoch", 5, Some(&keys)).unwrap();
+    assert_eq!(
+        metadata::used_generations(&alice, group_id, b"this epoch").unwrap(),
+        0
+    );
+    metadata::set_used_generations(&alice, group_id, b"this epoch", 1).unwrap();
+    let noted = metadata::take_pending_epoch(&alice, group_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(noted.epoch_authenticator.as_slice(), b"this epoch");
+    assert_eq!(noted.used_generations, 1);
+    assert!(noted.metadata.is_none());
+
+    // that of the same epoch taken, with its keys
+    metadata::set_pending_epoch(&alice, group_id, b"this epoch", 2, Some(&keys)).unwrap();
+    assert_eq!(
+        metadata::used_generations(&alice, group_id, b"this epoch").unwrap(),
+        2
+    );
+    metadata::set_used_generations(&alice, group_id, b"this epoch", 3).unwrap();
+    let noted = metadata::take_pending_epoch(&alice, group_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(noted.used_generations, 3);
+    assert!(noted.metadata.is_some());
+    assert!(metadata::take_pending_epoch(&alice, group_id)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
