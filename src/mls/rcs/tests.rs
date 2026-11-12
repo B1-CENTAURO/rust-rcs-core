@@ -883,6 +883,16 @@ fn a_self_heal_asks_for_the_group_metadata_keys_with_its_external_commit() {
         })
         .unwrap();
 
+    // not for a Commit other than the External Commit bob applied
+    let alices = alice_conversation.update_keys(&alice).unwrap();
+    assert_eq!(
+        bob_conversation
+            .request_group_metadata_keys_with(&bob, &alices)
+            .err(),
+        Some(ErrorKind::InvalidState)
+    );
+    alice_conversation.discard_pending_commit(&alice).unwrap();
+
     // asked for in the CommitList of the External Commit, after it (RCC.16
     // section 10.5.2)
     let output = bob_conversation
@@ -923,16 +933,23 @@ fn a_self_heal_asks_for_the_group_metadata_keys_with_its_external_commit() {
 
     // bob's request applied as the Focus accepts the CommitList in the
     // epoch his External Commit was made in, known by its Era and epoch
-    let other_era = EpochIdentifier {
-        era_id: healed_from.era_id + 1,
-        ..healed_from.clone()
-    };
-    assert_eq!(
-        bob_conversation
-            .process_server_message(&bob, &accepted_in(other_era))
-            .err(),
-        Some(ErrorKind::UnexpectedMessage)
-    );
+    for other in [
+        EpochIdentifier {
+            era_id: healed_from.era_id + 1,
+            ..healed_from.clone()
+        },
+        EpochIdentifier {
+            epoch_id: healed_from.epoch_id + 5,
+            ..healed_from.clone()
+        },
+    ] {
+        assert_eq!(
+            bob_conversation
+                .process_server_message(&bob, &accepted_in(other))
+                .err(),
+            Some(ErrorKind::UnexpectedMessage)
+        );
+    }
     let unknown_authenticator = EpochIdentifier {
         epoch_authenticator: b"not known to bob".to_vec(),
         ..healed_from
@@ -1059,6 +1076,44 @@ fn a_request_in_the_commit_list_of_an_external_commit_is_taken_as_accepted_in_it
             .as_slice(),
         [IncomingMessage::Commit { .. }]
     ));
+
+    // nor once another member's Commit made it void
+    let (mut eves, franks, group_info) = establish(&alice, &bob);
+    franks.delete(&bob).unwrap();
+    let (mut franks, rejoined) = bob
+        .rejoin_conversation(&MlsGroupInfo {
+            group_info,
+            ratchet_tree: eves.ratchet_tree().unwrap(),
+            pending_proposals: Vec::new(),
+        })
+        .unwrap();
+    let healed_from = EpochIdentifier {
+        epoch_id: franks.epoch() - 1,
+        ..franks.epoch_identifier()
+    };
+    franks
+        .request_group_metadata_keys_with(&bob, &rejoined)
+        .unwrap();
+    eves.process_commit_bundle(
+        &alice,
+        &ServerCommitBundle {
+            commit_list: wire::encode_message_list(&[&rejoined.commit]).unwrap(),
+            ..ServerCommitBundle::default()
+        },
+    )
+    .unwrap();
+    let output = eves.update_keys(&alice).unwrap();
+    let bundle = accept(&output);
+    eves.process_commit_bundle(&alice, &bundle).unwrap();
+    franks.process_commit_bundle(&bob, &bundle).unwrap();
+    assert!(!franks.has_pending_commit());
+    franks.update_keys(&bob).unwrap();
+    assert_eq!(
+        franks
+            .process_server_message(&bob, &accepted_in(healed_from))
+            .err(),
+        Some(ErrorKind::UnexpectedMessage)
+    );
 }
 
 #[test]
