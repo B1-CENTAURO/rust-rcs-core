@@ -766,6 +766,33 @@ impl MlsConversation {
         )
     }
 
+    /// Asks the other clients for the group metadata keys this client misses,
+    /// as request_group_metadata_keys() does, in the CommitList of the
+    /// External Commit `rejoined` it just self-healed with (RCC.16 section
+    /// 10.5.2): the External Commit first, then the Commit adding the
+    /// group_metadata_keys_requested extension, which the Conversation Focus
+    /// accepts together
+    ///
+    /// InvalidState if `rejoined` is not the External Commit this client
+    /// applied last, or if the group asks for the keys already.
+    pub fn request_group_metadata_keys_with(
+        &mut self,
+        client: &MlsClient,
+        rejoined: &CommitOutput,
+    ) -> Result<CommitOutput> {
+        if self.applied_commit.as_deref() != Some(rejoined.commit.as_slice()) {
+            return Err(ErrorKind::InvalidState);
+        }
+        let made_in = (
+            self.era().ok_or(ErrorKind::InvalidState)?,
+            self.epoch().checked_sub(1).ok_or(ErrorKind::InvalidState)?,
+        );
+        let mut output = self.request_group_metadata_keys(client)?;
+        output.preceding = vec![rejoined.commit.clone()];
+        self.list_epoch = Some(made_in);
+        Ok(output)
+    }
+
     /// Answers a request for the group metadata keys with the keys of the icon
     /// and subject and the continuity token (RCC.16 section 10.5.3)
     ///
