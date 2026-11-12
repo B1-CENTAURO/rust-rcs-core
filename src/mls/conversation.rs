@@ -109,6 +109,10 @@ pub struct CommitOutput {
     /// reconstructs it from later Commits (RCC.16 sections 7.9.2, 7.9.3).
     pub ratchet_tree: Option<Vec<u8>>,
     pub(crate) first_in_era: bool,
+    /// Commits of this client the CommitList carries before `commit`, as the
+    /// External Commit of a self-heal asking for group metadata keys (RCC.16
+    /// section 10.5.2)
+    pub(crate) preceding: Vec<Vec<u8>>,
 }
 
 impl CommitOutput {
@@ -119,7 +123,13 @@ impl CommitOutput {
     /// it adds no one, as that of an Unencrypted Singleton Era (section
     /// 11.2.1): its Welcome is then empty.
     pub fn to_client_message(&self) -> Result<Vec<u8>> {
-        let commit_list = wire::encode_message_list(&[&self.commit])?;
+        let commits: Vec<&[u8]> = self
+            .preceding
+            .iter()
+            .chain(std::iter::once(&self.commit))
+            .map(Vec::as_slice)
+            .collect();
+        let commit_list = wire::encode_message_list(&commits)?;
 
         let payload = if self.welcome.is_some() || self.first_in_era {
             client_mls_rcs_message::Payload::WelcomeCommitBundle(proto::WelcomeCommitBundle {
@@ -202,6 +212,10 @@ pub struct MlsConversation {
     pub(crate) applied_commit: Option<Vec<u8>>,
     /// Pending Commit of this client, as sent
     pending_commit: Option<Vec<u8>>,
+    /// The Era and epoch the CommitList carrying the pending Commit was sent
+    /// in, when a Commit of this client applied already comes first in it, as
+    /// the External Commit of a self-heal does
+    pub(crate) list_epoch: Option<(u32, u64)>,
 }
 
 impl MlsConversation {
@@ -210,6 +224,7 @@ impl MlsConversation {
             group,
             applied_commit: None,
             pending_commit: None,
+            list_epoch: None,
         }
     }
 
@@ -640,6 +655,7 @@ impl MlsConversation {
             .merge_pending_commit(client.provider())
             .map_err(fail("merging own Commit", ErrorKind::InvalidState))?;
         self.applied_commit = self.pending_commit.take();
+        self.list_epoch = None;
         if updated {
             self.own_leaf_updated(client, false)?;
         }
@@ -663,6 +679,7 @@ impl MlsConversation {
     /// Conversation Focus rejected it
     pub fn discard_pending_commit(&mut self, client: &MlsClient) -> Result<()> {
         self.pending_commit = None;
+        self.list_epoch = None;
         metadata::take_pending_epoch(client, self.group_id())?;
         self.group
             .clear_pending_commit(client.provider().storage())
@@ -850,6 +867,12 @@ impl MlsConversation {
     /// Without a pending Commit, what was accepted needs no handling. Having a
     /// ProposalList accepted while a Commit of the same epoch is pending is not
     /// told apart, as the Message-ID of each is unknown here.
+    ///
+    /// A CommitList carrying an External Commit of this client before the
+    /// pending Commit is taken as accepted in the epoch the External Commit
+    /// was made in, which the acceptance is of, as in the pending Commit's
+    /// own; by its Era and epoch alone, as a client joining from a GroupInfo
+    /// does not know the epoch authenticator before its External Commit.
     pub fn process_accepted(
         &mut self,
         client: &MlsClient,
@@ -863,7 +886,10 @@ impl MlsConversation {
             .previous_epoch_identifier
             .as_ref()
             .ok_or(ErrorKind::BadFormat)?;
-        if accepted_epoch != &self.epoch_identifier() {
+        let of_list = self.list_epoch.is_some_and(|(era, epoch)| {
+            accepted_epoch.era_id == era && accepted_epoch.epoch_id == epoch
+        });
+        if accepted_epoch != &self.epoch_identifier() && !of_list {
             return Err(ErrorKind::UnexpectedMessage);
         }
 
@@ -1064,6 +1090,7 @@ impl MlsConversation {
 
                 // a Commit of this client still pending is void now
                 self.pending_commit = None;
+                self.list_epoch = None;
                 metadata::take_pending_epoch(client, self.group_id())?;
                 if !self_removed {
                     metadata::drop_stale_keys(self, client)?;
@@ -1309,6 +1336,7 @@ impl MlsConversation {
             private_message,
             ratchet_tree,
             first_in_era,
+            preceding: Vec::new(),
         })
     }
 

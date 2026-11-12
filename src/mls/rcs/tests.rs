@@ -852,6 +852,215 @@ fn self_heal() {
     );
 }
 
+/// The ServerMlsRcsMessage accepting a ClientMlsRcsMessage sent in `epoch`
+fn accepted_in(epoch: EpochIdentifier) -> Vec<u8> {
+    proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::AcceptedMlsRcsMessage(
+            AcceptedMlsRcsMessage {
+                message_id: "cpim-1".to_string(),
+                previous_epoch_identifier: Some(epoch),
+            },
+        )),
+    })
+}
+
+#[test]
+fn a_self_heal_asks_for_the_group_metadata_keys_with_its_external_commit() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (mut alice_conversation, bob_conversation, group_info) = establish(&alice, &bob);
+    let group_id = bob_conversation.group_id().to_vec();
+    let healed_from = alice_conversation.epoch_identifier();
+
+    // bob's state of the group lost, his continuity token with it
+    bob_conversation.delete(&bob).unwrap();
+    bob.forget_group_metadata(&group_id).unwrap();
+    let (mut bob_conversation, rejoined) = bob
+        .rejoin_conversation(&MlsGroupInfo {
+            group_info,
+            ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+            pending_proposals: Vec::new(),
+        })
+        .unwrap();
+
+    // asked for in the CommitList of the External Commit, after it (RCC.16
+    // section 10.5.2)
+    let output = bob_conversation
+        .request_group_metadata_keys_with(&bob, &rejoined)
+        .unwrap();
+    let message: ClientMlsRcsMessage = proto::decode(&output.to_client_message().unwrap()).unwrap();
+    match message.payload {
+        Some(client_mls_rcs_message::Payload::CommitBundle(bundle)) => {
+            assert_eq!(
+                wire::decode_message_list(&bundle.commit_list).unwrap(),
+                [rejoined.commit.clone(), output.commit.clone()]
+            );
+            assert_eq!(bundle.epoch_authenticator, output.epoch_authenticator);
+        }
+        _ => panic!("expected a CommitBundle"),
+    }
+    // not twice, nor for another Commit than the External Commit applied
+    assert_eq!(
+        bob_conversation
+            .request_group_metadata_keys_with(&bob, &output)
+            .err(),
+        Some(ErrorKind::InvalidState)
+    );
+
+    // alice takes both, and is asked for the keys
+    let bundle = accept(&output);
+    assert!(matches!(
+        alice_conversation
+            .process_commit_bundle(&alice, &bundle)
+            .unwrap()
+            .as_slice(),
+        [
+            IncomingMessage::Commit { .. },
+            IncomingMessage::Commit { .. }
+        ]
+    ));
+    assert!(alice_conversation.group_metadata_keys_requested());
+
+    // bob's request applied as the Focus accepts the CommitList in the
+    // epoch his External Commit was made in, known by its Era and epoch
+    let other_era = EpochIdentifier {
+        era_id: healed_from.era_id + 1,
+        ..healed_from.clone()
+    };
+    assert_eq!(
+        bob_conversation
+            .process_server_message(&bob, &accepted_in(other_era))
+            .err(),
+        Some(ErrorKind::UnexpectedMessage)
+    );
+    let unknown_authenticator = EpochIdentifier {
+        epoch_authenticator: b"not known to bob".to_vec(),
+        ..healed_from
+    };
+    assert!(matches!(
+        bob_conversation
+            .process_server_message(&bob, &accepted_in(unknown_authenticator.clone()))
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Commit { .. }]
+    ));
+    assert_eq!(
+        bob_conversation.epoch_authenticator(),
+        alice_conversation.epoch_authenticator()
+    );
+    assert!(bob_conversation.group_metadata_keys_requested());
+    // and that epoch no more once it is applied
+    assert!(matches!(
+        bob_conversation
+            .process_server_message(&bob, &accepted_in(unknown_authenticator))
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Own]
+    ));
+
+    // alice answers with the keys, which bob takes
+    let output = alice_conversation
+        .send_group_metadata_keys(&alice, b"msg-keys")
+        .unwrap();
+    let bundle = accept(&output);
+    alice_conversation
+        .process_commit_bundle(&alice, &bundle)
+        .unwrap();
+    assert!(matches!(
+        bob_conversation
+            .process_commit_bundle(&bob, &bundle)
+            .unwrap()
+            .as_slice(),
+        [
+            IncomingMessage::Commit { .. },
+            IncomingMessage::GroupMetadataKeys { .. }
+        ]
+    ));
+    assert_eq!(
+        bob.group_metadata(&group_id).unwrap().continuity_token,
+        alice.group_metadata(&group_id).unwrap().continuity_token
+    );
+    assert!(!bob_conversation.group_metadata_keys_requested());
+}
+
+#[test]
+fn a_request_in_the_commit_list_of_an_external_commit_is_taken_as_accepted_in_its_own_epoch_too() {
+    let alice = client("alice");
+    let bob = client("bob");
+    let (alice_conversation, bob_conversation, group_info) = establish(&alice, &bob);
+    bob_conversation.delete(&bob).unwrap();
+    let (mut bob_conversation, rejoined) = bob
+        .rejoin_conversation(&MlsGroupInfo {
+            group_info,
+            ratchet_tree: alice_conversation.ratchet_tree().unwrap(),
+            pending_proposals: Vec::new(),
+        })
+        .unwrap();
+    bob_conversation
+        .request_group_metadata_keys_with(&bob, &rejoined)
+        .unwrap();
+
+    // as a Focus may tell the epoch the request itself was made in
+    let own_epoch = bob_conversation.epoch_identifier();
+    assert!(matches!(
+        bob_conversation
+            .process_server_message(&bob, &accepted_in(own_epoch))
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Commit { .. }]
+    ));
+    assert!(bob_conversation.group_metadata_keys_requested());
+
+    // and once applied, its External Commit's epoch takes the acceptance of
+    // no later Commit
+    let listed = bob_conversation.epoch_identifier();
+    let list_epoch = EpochIdentifier {
+        epoch_id: listed.epoch_id - 2,
+        ..listed
+    };
+    bob_conversation.update_keys(&bob).unwrap();
+    assert_eq!(
+        bob_conversation
+            .process_server_message(&bob, &accepted_in(list_epoch))
+            .err(),
+        Some(ErrorKind::UnexpectedMessage)
+    );
+
+    // nor once discarded
+    let (carols, daves, group_info) = establish(&alice, &bob);
+    daves.delete(&bob).unwrap();
+    let (mut daves, rejoined) = bob
+        .rejoin_conversation(&MlsGroupInfo {
+            group_info,
+            ratchet_tree: carols.ratchet_tree().unwrap(),
+            pending_proposals: Vec::new(),
+        })
+        .unwrap();
+    let healed_from = EpochIdentifier {
+        epoch_id: daves.epoch() - 1,
+        ..daves.epoch_identifier()
+    };
+    daves
+        .request_group_metadata_keys_with(&bob, &rejoined)
+        .unwrap();
+    daves.discard_pending_commit(&bob).unwrap();
+    daves.update_keys(&bob).unwrap();
+    assert_eq!(
+        daves
+            .process_server_message(&bob, &accepted_in(healed_from))
+            .err(),
+        Some(ErrorKind::UnexpectedMessage)
+    );
+    let current = daves.epoch_identifier();
+    assert!(matches!(
+        daves
+            .process_server_message(&bob, &accepted_in(current))
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Commit { .. }]
+    ));
+}
+
 #[test]
 fn leaving_through_proposal_list() {
     let alice = client("alice");

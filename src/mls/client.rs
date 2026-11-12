@@ -651,6 +651,7 @@ impl MlsClient {
             private_message: None,
             ratchet_tree: None,
             first_in_era: false,
+            preceding: Vec::new(),
         };
         conversation.applied_commit = Some(commit);
         conversation.own_leaf_updated(self, false)?;
